@@ -20,7 +20,7 @@ from torch.nn import functional as F
 from sklearn.utils.class_weight import compute_class_weight
 # from get_cls_map import get_cls_map, classification_map, list_to_colormap, get_classification_map
 import wandb
-from improved_GCPE import (
+from LoLA_hsViT import (
     EnhancedPEFTHyperspectralGCViT,
     analyze_model_efficiency,
     create_enhanced_model,
