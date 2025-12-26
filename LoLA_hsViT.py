@@ -1,4 +1,4 @@
-# improved_GCPE.py defines model + its components.
+# LoLA_hsViT.py defines model + its components.
 import math
 import torch
 import torch.nn as nn
