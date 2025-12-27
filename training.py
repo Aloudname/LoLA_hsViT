@@ -11,6 +11,9 @@ from torch.cuda.amp import GradScaler
 from torch.cuda.amp.autocast_mode import autocast
 from operator import truediv
 import time
+from torch.utils.data import Dataset
+from typing import Tuple, Dict, Any, Optional, List
+from abc import ABC, abstractmethod
 from tqdm import tqdm
 import math
 import matplotlib.pyplot as plt
@@ -20,6 +23,7 @@ from torch.nn import functional as F
 from sklearn.utils.class_weight import compute_class_weight
 # from get_cls_map import get_cls_map, classification_map, list_to_colormap, get_classification_map
 import wandb
+from repo import *
 from LoLA_hsViT import (
     EnhancedPEFTHyperspectralGCViT,
     analyze_model_efficiency,
@@ -40,234 +44,527 @@ warnings.filterwarnings("ignore")
 # Set environment variable for wandb
 os.environ["WANDB_API_KEY"] = "b68375e4a0cbcbc284700f0627c966e5d78181b6"
 
-# ADDING MISSING DATA PROCESSING FUNCTIONS FROM ORIGINAL
-def loadData(dataset_name="LongKou"):
+from abc import ABC, abstractmethod
+from typing import Tuple, Dict, Any, Optional, List
+
+
+class AbstractHyperspectralDataset(ABC, Dataset):
     """
-    Load hyperspectral data and labels with explicit dataset selection
-    
-    Args:
-        dataset_name (str): Dataset to load. Options:
-            - "LongKou": WHU-Hi-LongKou dataset (9 classes)
-            - "IndianPines": Indian Pines dataset (16 classes)
-            - "PaviaU": Pavia University dataset (9 classes)
-            - "PaviaC": Pavia Center dataset (9 classes)
-            - "Salinas": Salinas dataset (16 classes)
-            - "HongHu": WHU-Hi-HongHu dataset (22 classes)
-            - "auto": Automatically detect available datasets
-    
-    Returns:
-        tuple: (data, labels, dataset_info)
+    Abstract Base Class for different types of hyperspectral data.
+
+    NOTE: ``_load_data`` & ``_preprocess_data`` are abstract methods,
+         which means re-implementation in inherit classes are necessary.
     """
-
-    # Register first if using custom dataset. Pay attention to:
-    # 'dataset_path','label_path','data_key','label_key'.
-    # 2 paths and 2 keys whose values are from .hdr.
-    dataset_configs = {
-        "LongKou": {
-            "data_path": "/data/chenhaoran/WHUhypspec/data/WHU-Hi-LongKou.mat",
-            "label_path": "/data/chenhaoran/WHUhypspec/data/WHU-Hi-LongKou_gt.mat",
-            "data_key": "hyperspectral_data",
-            "label_key": "hyperspectral_data",
-            "num_classes": 9,
-            "target_names": ['Corn', 'Cotton', 'Sesame', 'Broad-leaf soybean',
-                           'Narrow-leaf soybean', 'Rice', 'Water',
-                           'Roads and houses', 'Mixed weed'],
-            "description": "WHU-Hi-LongKou dataset with 9 crop classes"
-        },
-        "IndianPines": {
-            "data_path": "Indian_pines_corrected.mat",
-            "label_path": "Indian_pines_gt.mat",
-            "data_key": "indian_pines_corrected",
-            "label_key": "indian_pines_gt",
-            "num_classes": 16,
-            "target_names": ['Alfalfa', 'Corn-notill', 'Corn-mintill', 'Corn',
-                           'Grass-pasture', 'Grass-trees', 'Grass-pasture-mowed',
-                           'Hay-windrowed', 'Oats', 'Soybean-notill', 'Soybean-mintill',
-                           'Soybean-clean', 'Wheat', 'Woods', 'Buildings-Grass-Trees-Drives',
-                           'Stone-Steel-Towers'],
-            "description": "Indian Pines dataset with 16 land cover classes"
-        },
-        "PaviaU": {
-            "data_path": "PaviaU.mat",
-            "label_path": "PaviaU_gt.mat",
-            "data_key": "paviaU",
-            "label_key": "paviaU_gt",
-            "num_classes": 9,
-            "target_names": ['Asphalt', 'Meadows', 'Gravel', 'Trees', 'Painted metal sheets',
-                           'Bare Soil', 'Bitumen', 'Self-Blocking Bricks', 'Shadows'],
-            "description": "Pavia University dataset with 9 urban classes"
-        },
-        "PaviaC": {
-            "data_path": "PaviaC.mat",
-            "label_path": "PaviaC_gt.mat",
-            "data_key": "paviaC",
-            "label_key": "paviaC_gt",
-            "num_classes": 9,
-            "target_names": ['Water', 'Trees', 'Asphalt', 'Self-Blocking Bricks', 'Bitumen',
-                           'Tiles', 'Shadows', 'Meadows', 'Bare Soil'],
-            "description": "Pavia Center dataset with 9 urban classes"
-        },
-        "Salinas": {
-            "data_path": "data/Salinas_corrected.mat",
-            "label_path": "data/Salinas_gt.mat",
-            "data_key": "salinas_corrected",
-            "label_key": "salinas_gt",
-            "num_classes": 16,
-            "target_names": ['Brocoli_green_weeds_1', 'Brocoli_green_weeds_2', 'Fallow',
-                           'Fallow_rough_plow', 'Fallow_smooth', 'Stubble', 'Celery',
-                           'Grapes_untrained', 'Soil_vinyard_develop', 'Corn_senesced_green_weeds',
-                           'Lettuce_romaine_4wk', 'Lettuce_romaine_5wk', 'Lettuce_romaine_6wk',
-                           'Lettuce_romaine_7wk', 'Vinyard_untrained', 'Vinyard_vertical_trellis'],
-            "description": "Salinas dataset with 16 agricultural classes"
-        },
-        "HongHu": {
-            "data_path": "/data/chenhaoran/WHUhypspec/data/WHU-Hi-HongHu.mat",
-            "label_path": "/data/chenhaoran/WHUhypspec/data/WHU-Hi-HongHu_gt.mat",
-            "data_key": "WHU_Hi_HongHu",
-            "label_key": "WHU_Hi_HongHu_gt",
-            "num_classes": 22,
-            "target_names": ['Red roof', 'Road', 'Bare soil', 'Red roof 2', 'Red roof 3',
-                           'Gray roof', 'Red roof 4', 'White roof', 'Bright roof', 'Trees',
-                           'Grass', 'Red roof 5', 'Red roof 6', 'Red roof 7', 'Red roof 8',
-                           'Red roof 9', 'Red roof 10', 'Red roof 11', 'Red roof 12', 'Red roof 13',
-                           'Red roof 14', 'Red roof 15'],
-            "description": "WHU-Hi-HongHu dataset with 22 urban classes"
-        },
-        "Qingyun": {
-            "data_path": "data/QUH-Qingyun.mat",
-            "label_path": "data/QUH-Qingyun_GT.mat", 
-            "data_key": "Chengqu",
-            "label_key": "ChengquGT",
-            "num_classes": 6,
-            "target_names": ["Trees", "Concrete building", "Car", "Ironhide building",
-                           "Plastic playground", "Asphalt road"],
-            "description": "Qingyun dataset with 6 urban classes"
-        }
-    }
     
-    if dataset_name == "auto":
-        # Try to automatically detect available datasets
-        available_datasets = []
-        for name, config in dataset_configs.items():
-            try:
-                sio.loadmat(config["data_path"])
-                sio.loadmat(config["label_path"])
-                available_datasets.append(name)
-                print(f"✓ Found {name} dataset")
-            except FileNotFoundError:
-                print(f"✗ {name} dataset not found")
+    def __init__(self, 
+                 data_path: str,
+                 label_path: str,
+                 num_classes: int,
+                 target_names: List[str],
+                 patch_size: int = 15,
+                 transform: Optional[Any] = None,
+                 test_rate: float = 0.2,
+                 pca_component: int =15,
+                 **kwargs: Any) -> None:
+        """
+        Initialize the hyperspectral dataset.
         
-        if not available_datasets:
-            raise FileNotFoundError("No datasets found! Please ensure dataset files are in the correct location.")
-        
-        # Use the first available dataset
-        dataset_name = available_datasets[0]
-        print(f"Auto-selected dataset: {dataset_name}")
-    
-    if dataset_name not in dataset_configs:
-        raise ValueError(f"Unknown dataset: {dataset_name}. Available options: {list(dataset_configs.keys())}")
-    
-    config = dataset_configs[dataset_name]
-    
-    try:
-        data = sio.loadmat(config["data_path"])[config["data_key"]]
-        labels = sio.loadmat(config["label_path"])[config["label_key"]]
-
-        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
-        data = np.clip(data, a_min=np.percentile(data, 1), a_max=np.percentile(data, 99))
-        
-        print(f"✓ Successfully loaded {dataset_name} dataset")
-        print(f"  - Data shape: {data.shape}")
-        print(f"  - Labels shape: {labels.shape}")
-        print(f"  - Number of classes: {config['num_classes']}")
-        print(f"  - Description: {config['description']}")
-        
-        return data, labels, config
-        
-    except FileNotFoundError as e:
-        print(f"✗ Error loading {dataset_name} dataset: {e}")
-        print(f"Please ensure the following files exist:")
-        print(f"  - {config['data_path']}")
-        print(f"  - {config['label_path']}")
-        raise
-
-def padWithZeros(X, margin=2):
-    """Pad the hyperspectral data with zeros"""
-    newX = np.zeros((X.shape[0] + 2 * margin, X.shape[1] + 2* margin, X.shape[2]))
-    x_offset = margin
-    y_offset = margin
-    newX[x_offset:X.shape[0] + x_offset, y_offset:X.shape[1] + y_offset, :] = X
-    return newX
-
-def createImageCubes(X, y, windowSize=15, removeZeroLabels=True):
-    """Create image cubes for hyperspectral data processing with memory-efficient approach"""
-    margin = int((windowSize - 1) / 2)
-    zeroPaddedX = padWithZeros(X, margin=margin)
-    
-    # PROFESSIONAL FIX: Use lists to collect only valid patches, avoiding massive pre-allocation
-    patches_list = []
-    labels_list = []
-    
-    print(f"Creating patches for {X.shape[0]}x{X.shape[1]} image with {windowSize}x{windowSize} window...")
-    
-    for r in range(margin, zeroPaddedX.shape[0] - margin):
-        for c in range(margin, zeroPaddedX.shape[1] - margin):
-            # Get the original position in the unpadded image
-            orig_r = r - margin
-            orig_c = c - margin
-            label = y[orig_r, orig_c]
+        Args:
+            data_path: Path to the main hyperspectral data file
+            label_path: Path to the label file
+            num_classes: Number of classes in the dataset
+            target_names: List of class names
+            patch_size: Size of spatial patches to extract (must be odd)
+            transform: Optional transform to apply to samples
+            test_rate: test rate for split test dataset
+            pca_component: how many dims (main features) picked for pca.
+           ** kwargs: Additional format-specific parameters
+        """
+        if patch_size % 2 == 0:
+            raise ValueError(f"patch_size must be odd, got {patch_size}")
             
-            # Only collect patches with non-zero labels (if removeZeroLabels=True)
-            if not removeZeroLabels or label > 0:
-                patch = zeroPaddedX[r - margin:r + margin + 1, c - margin:c + margin + 1]
-                patches_list.append(patch)
-                labels_list.append(label)
-    
-    # Convert to numpy arrays only after filtering
-    patchesData = np.array(patches_list, dtype=np.float32)
-    patchesLabels = np.array(labels_list, dtype=np.int32)
-    
-    if removeZeroLabels:
-        # Labels are already filtered, just convert to 0-based indexing
-        patchesLabels -= 1
-    
-    # Validate label range
-    min_label = np.min(patchesLabels)
-    max_label = np.max(patchesLabels)
-    num_classes = len(np.unique(patchesLabels))
-    print(f"Created {len(patchesData)} patches")
-    print(f"Label range: [{min_label}, {max_label}], Number of classes: {num_classes}")
-    
-    # Check for non-finite values
-    assert np.isfinite(patchesData).all(), "Patch data contains non-finite values"
-    
-    return patchesData, patchesLabels
+        self.data_path = data_path
+        self.label_path = label_path
+        self.num_classes = num_classes
+        self.target_names = target_names
+        self.patch_size = patch_size
+        self.margin = (patch_size - 1) // 2  # Calculate padding margin
+        self.transform = transform
+        self.kwargs = kwargs
+        self.test_rate = test_rate
+        self.pca_component = pca_component
+        
+        # Core data structures to be populated by subclasses
+        self.raw_data: np.ndarray = None  # Original hyperspectral data (H, W, C)
+        self.raw_labels: np.ndarray = None  # Original labels (H, W)
+        self.processed_data: np.ndarray = None  # Preprocessed data (e.g., after PCA)
+        self.patches: np.ndarray = None  # Extracted image patches
+        self.patch_labels: np.ndarray = None  # Labels corresponding to patches
+        
+        # Load and process data
+        self._load_data()
+        self._validate_raw_data()
+        self._preprocess_data()
+        self._create_patches()
 
-def splitTrainTestSet(X, y, testRatio = 0.2, randomState=345):
-    """Split data into train and test sets"""
-    X_train, X_test, y_train, y_test = train_test_split(X, y,
-                                                       test_size=testRatio,
-                                                       random_state=randomState,
-                                                       stratify=y)
-    
-    # Validate split results
-    assert len(np.unique(y_train)) == len(np.unique(y)), "Training set missing some classes"
-    assert len(np.unique(y_test)) == len(np.unique(y)), "Test set missing some classes"
-    
-    return X_train, X_test, y_train, y_test
+    @abstractmethod
+    def _load_data(self) -> None:
+        """
+        Load raw hyperspectral data and labels from files.
+        
+        This method must be implemented by subclasses to handle specific
+        file formats. It should populate self.raw_data and self.raw_labels.
+        """
+        pass
 
-class EnhancedHyperspectralDataset:
-    def __init__(self, hyperspectral_data, labels, pretrained_transform=None):
+    def _validate_raw_data(self) -> None:
+        """
+        Validate the loaded raw data and labels.
+        
+        Ensures consistent shape alignment and valid label range.
+        """
+        # Check data and label spatial dimensions match
+        if self.raw_data.shape[:2] != self.raw_labels.shape[:2]:
+            raise ValueError(
+                f"Spatial dimensions mismatch: data {self.raw_data.shape[:2]}, "
+                f"labels {self.raw_labels.shape[:2]}"
+            )
+            
+        # Check for non-finite values in data
+        if not np.isfinite(self.raw_data).all():
+            raise ValueError("Raw data contains non-finite values (NaN/inf)")
+            
+        # Validate label range
+        unique_labels = np.unique(self.raw_labels)
+        if not np.all((unique_labels >= 0) & (unique_labels <= self.num_classes)):
+            raise ValueError(
+                f"Labels contain values outside valid range [0, {self.num_classes}]"
+            )
+
+    @abstractmethod
+    def _preprocess_data(self) -> None:
+        """
+        Preprocess raw data (e.g., PCA, normalization, denoising).
+        
+        This method should populate self.processed_data with preprocessed data
+        in (H, W, C) format where C is the number of channels after preprocessing.
+        """
+        pass
+
+    def _create_patches(self) -> None:
+        """
+        Extract spatial patches from preprocessed data.
+        
+        Patches are extracted with zero-padding at image boundaries. Only patches
+        with non-zero labels are included (background/zero labels are excluded).
+        """
+        # Add zero padding around the image
+        padded_data = self._pad_with_zeros(self.processed_data, self.margin)
+        
+        # Collect valid patches
+        patches_list = []
+        labels_list = []
+        
+        # Iterate over all spatial positions in original image
+        for r in range(self.margin, padded_data.shape[0] - self.margin):
+            for c in range(self.margin, padded_data.shape[1] - self.margin):
+                # Get corresponding position in original (unpadded) image
+                orig_r = r - self.margin
+                orig_c = c - self.margin
+                label = self.raw_labels[orig_r, orig_c]
+                
+                # Skip background (zero labels)
+                if label > 0:
+                    # Extract patch (patch_size x patch_size x C)
+                    patch = padded_data[
+                        r - self.margin : r + self.margin + 1,
+                        c - self.margin : c + self.margin + 1,
+                        :
+                    ]
+                    patches_list.append(patch)
+                    labels_list.append(label - 1)  # Convert to 0-based index
+        
+        # Convert to numpy arrays
+        self.patches = np.array(patches_list, dtype=np.float32)
+        self.patch_labels = np.array(labels_list, dtype=np.int32)
+        
+        # Validate patch creation
+        if len(self.patches) == 0:
+            raise RuntimeError("No valid patches created - check label data")
+        
+        print(f"Created {len(self.patches)} patches of size {self.patch_size}x{self.patch_size}")
+
+    @staticmethod
+    def _pad_with_zeros(x: np.ndarray, margin: int) -> np.ndarray:
+        """
+        Add zero padding to hyperspectral data.
+        
+        Args:
+            x: Input data with shape (H, W, C)
+            margin: Number of zeros to add on each side
+            
+        Returns:
+            Padded data with shape (H + 2*margin, W + 2*margin, C)
+        """
+        if margin < 0:
+            raise ValueError(f"Margin must be non-negative, got {margin}")
+            
+        padded = np.zeros(
+            (x.shape[0] + 2 * margin, 
+             x.shape[1] + 2 * margin, 
+             x.shape[2]),
+            dtype=x.dtype
+        )
+        padded[margin:-margin, margin:-margin, :] = x
+        return padded
+
+    def _create_cube(self, x: np.ndarray, y: np.ndarray, windowSize=15, removeZeroLabels=True):
+        """Create image cubes for hyperspectral data processing with memory-efficient approach"""
+        margin = int((windowSize -1) / 2)
+        zeroPaddedX = self._pad_with_zeros(x, margin=margin)
+
+        patches_list, labels_list = [], []
+
+        print(f"Creating patches for {x.shape[0]}x{x.shape[1]} image with {windowSize}x{windowSize} window...")
+    
+        for r in range(margin, zeroPaddedX.shape[0] - margin):
+            for c in range(margin, zeroPaddedX.shape[1] - margin):
+                # Get the original position in the unpadded image
+                orig_r = r - margin
+                orig_c = c - margin
+                label = y[orig_r, orig_c]
+            
+                # Only collect patches with non-zero labels (if removeZeroLabels=True)
+                if not removeZeroLabels or label > 0:
+                    patch = zeroPaddedX[r - margin:r + margin + 1, c - margin:c + margin + 1]
+                    patches_list.append(patch)
+                    labels_list.append(label)
+    
+        # Convert to numpy arrays only after filtering
+        patchesData = np.array(patches_list, dtype=np.float32)
+        patchesLabels = np.array(labels_list, dtype=np.int32)
+    
+        if removeZeroLabels:
+            # Labels are already filtered, just convert to 0-based indexing
+            patchesLabels -= 1
+    
+        # Validate label range
+        min_label = np.min(patchesLabels)
+        max_label = np.max(patchesLabels)
+        num_classes = len(np.unique(patchesLabels))
+        print(f"Created {len(patchesData)} patches")
+        print(f"Label range: [{min_label}, {max_label}], Number of classes: {num_classes}")
+    
+        # Check for non-finite values
+        assert np.isfinite(patchesData).all(), "Patch data contains non-finite values"
+        return patchesData, patchesLabels
+    
+
+    def splitTrainTestDataset(self, X, y, randomState=350234):
+        """
+            Splitter for test and training dataloader.
+        """
+        X_train, X_test, y_train, y_test = train_test_split(X, y,
+                                                    test_size=self.test_rate,
+                                                    random_state=randomState,
+                                                    stratify=y)
+        # Validate split results
+        assert len(np.unique(y_train)) == len(np.unique(y)), "Training set missing some classes"
+        assert len(np.unique(y_test)) == len(np.unique(y)), "Test set missing some classes"
+    
+        return X_train, X_test, y_train, y_test
+    
+    # Magic methods.
+    def __len__(self) -> int:
+        """Return number of patches in dataset"""
+        return len(self.patches)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get a single sample from the dataset.
+        
+        Args:
+            idx: Index of the sample to retrieve
+            
+        Returns:
+            Tuple containing:
+                - patch: Tensor of shape (C, H, W)
+                - label: Tensor containing class index
+        """
+        patch = self.patches[idx]
+        label = self.patch_labels[idx]
+        
+        # Convert to (C, H, W) format for PyTorch
+        patch = np.transpose(patch, (2, 0, 1))
+        
+        # Apply transforms if specified
+        if self.transform:
+            patch = self.transform(patch)
+        
+        return torch.FloatTensor(patch), torch.LongTensor([label]).squeeze()
+
+    def get_class_distribution(self) -> Dict[int, int]:
+        """
+        Get distribution of classes in the dataset.
+        
+        Returns:
+            Dictionary mapping class indices to their counts
+        """
+        unique, counts = np.unique(self.patch_labels, return_counts=True)
+        return dict(zip(unique, counts))
+
+    def get_metadata(self) -> Dict[str, Any]:
+        """
+        Get dataset metadata.
+        
+        Returns:
+            Dictionary containing dataset metadata
+        """
+        return {
+            "data_path": self.data_path,
+            "label_path": self.label_path,
+            "num_classes": self.num_classes,
+            "target_names": self.target_names,
+            "patch_size": self.patch_size,
+            "raw_data_shape": self.raw_data.shape,
+            "processed_data_shape": self.processed_data.shape,
+            "num_patches": len(self),
+            "class_distribution": self.get_class_distribution()
+        }
+
+
+class MatHyperspectralDataset(AbstractHyperspectralDataset):
+    """
+    Hyperspectral dataset loader for .mat file format.
+    
+    Handles datasets stored in MATLAB .mat files, commonly used for
+    hyperspectral image datasets.
+    """
+    
+    def __init__(self, 
+                 data_path: str,
+                 label_path: str,
+                 num_classes: int,
+                 target_names: List[str],
+                 data_key: str,
+                 label_key: str,
+                 patch_size: int = 15,
+                 transform: Optional[Any] = None,
+                 test_rate: float = 0.2,
+                 pca_components: int = 15,** kwargs: Any) -> None:
+        """
+        Initialize a MATLAB format hyperspectral dataset.
+        
+        Args:
+            data_key: Key in .mat file for hyperspectral data
+            label_key: Key in .mat file for label data
+            pca_components: Number of PCA components for dimensionality reduction
+            See parent class for other parameters
+        """
+        self.data_key = data_key
+        self.label_key = label_key
+        self.pca_components = pca_components
+        super().__init__(data_path, label_path, num_classes, target_names, 
+                         patch_size, transform, test_rate, pca_components, **kwargs)
+
+    def _load_data(self) -> None:
+        """Load data from .mat files using scipy.io"""
+        import scipy.io as sio
+        
+        try:
+            # Load data and labels from .mat files
+            data_mat = sio.loadmat(self.data_path)
+            label_mat = sio.loadmat(self.label_path)
+            
+            # Extract data using specified keys
+            self.raw_data = data_mat[self.data_key]
+            self.raw_labels = label_mat[self.label_key]
+
+            # Execute a clip from min 1% to max 99%.
+            self.raw_data = np.nan_to_num(self.raw_data, nan=0.0, posinf=0.0, neginf=0.0)
+            self.raw_data = np.clip(self.raw_data, a_min=np.percentile(self.raw_data, 1), a_max=np.percentile(self.raw_data, 99))
+            
+            # Handle possible singleton dimensions
+            if self.raw_labels.ndim == 3 and self.raw_labels.shape[-1] == 1:
+                self.raw_labels = self.raw_labels.squeeze(-1)
+                
+            print(f"Loaded .mat data: {self.raw_data.shape}, labels: {self.raw_labels.shape}")
+            
+        except KeyError as e:
+            raise ValueError(f"Missing key in .mat file: {e}")
+        except Exception as e:
+            raise RuntimeError(f"Error loading .mat files: {e}")
+
+    def _preprocess_data(self):
+        """
+        Preprocess data with PCA dimensionality reduction and normalization.
+        """
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import StandardScaler
+        
+        # Reshape data for PCA (flatten spatial dimensions)
+        h, w, c = self.raw_data.shape
+        flat_data = self.raw_data.reshape(-1, c)
+        
+        # Handle outliers and normalization
+        scaler = StandardScaler()
+        scaled_data = scaler.fit_transform(flat_data)
+        
+        # Apply PCA
+        pca = PCA(n_components=self.pca_components, random_state=42)
+        pca_data = pca.fit_transform(scaled_data)
+        
+        # Reshape back to original spatial dimensions
+        self.processed_data = pca_data.reshape(h, w, self.pca_components)
+        return self.processed_data, pca
+
+    def create_data_loader(self, test_rate=0.2, batch_size=32):
+        """
+            Create enhanced data loaders with comprehensive processing
+        
+        Args:
+            batch_size (int): Batch size for data loaders
+            test_rate (float): Ratio of data to use for testing (0.02 = 2% test, 98% train)
+            patch_size (int): Size of image patches
+            dataset_name (str): Dataset to use (see loadData for options)
+    
+        Returns:
+            tuple: (train_loader, test_loader, all_loader, y_all, pca_components, dataset_info)
+        """
+        x_pca = self.processed_data  # (H, W, C)
+        y = self.raw_labels  # (H, W)
+        
+        print('Hyperspectral data shape after PCA: ', x_pca.shape)
+        print('Label shape: ', y.shape)
+        print('Original label range:', np.min(y), 'to', np.max(y))
+        print('Unique labels:', np.unique(y))
+        
+        x_patches, y_all = self._create_cube(x_pca, y, windowSize=self.patch_size)
+        print('Data cube X shape: ', x_patches.shape)
+        print('Processed label range:', np.min(y_all), 'to', np.max(y_all))
+        print('Unique processed labels:', np.unique(y_all))
+        
+        Xtrain, Xtest, ytrain, ytest = self.splitTrainTestDataset(x_patches, y_all, randomState=350234)
+        print('Xtrain shape: ', Xtrain.shape)
+        print('Xtest shape: ', Xtest.shape)
+        
+        X = x_patches.reshape(-1, self.patch_size, self.patch_size, self.pca_components, 1)
+        Xtrain = Xtrain.reshape(-1, self.patch_size, self.patch_size, self.pca_components, 1)
+        Xtest = Xtest.reshape(-1, self.patch_size, self.patch_size, self.pca_components, 1)
+        
+        X = X.transpose(0, 4, 3, 1, 2).squeeze(1)
+        Xtrain = Xtrain.transpose(0, 4, 3, 1, 2).squeeze(1)
+        Xtest = Xtest.transpose(0, 4, 3, 1, 2).squeeze(1)
+        
+        # temp container.
+        trainset = dataset(Xtrain, ytrain)
+        testset = dataset(Xtest, ytest)
+        allset = dataset(X, y_all)
+        
+        train_loader = torch.utils.data.DataLoader(
+            trainset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False
+        )
+        test_loader = torch.utils.data.DataLoader(
+            testset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False
+        )
+        all_loader = torch.utils.data.DataLoader(
+            allset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False
+        )
+        
+        dataset_info = {
+            'num_classes': self.num_classes,
+            'target_names': self.target_names,
+            'data_shape': self.raw_data.shape,
+            'processed_shape': self.processed_data.shape,
+            'patch_size': self.patch_size
+        }
+        return train_loader, test_loader, all_loader, y_all, self.pca_components, dataset_info
+
+class TiffHyperspectralDataset(AbstractHyperspectralDataset):
+    """
+    Hyperspectral dataset loader for TIFF file format.
+    
+    Handles datasets stored in multi-band TIFF files, another common format
+    for hyperspectral imagery.
+    """
+    
+    def __init__(self, 
+                 data_path: str,
+                 label_path: str,
+                 num_classes: int,
+                 target_names: List[str],
+                 patch_size: int = 15,
+                 transform: Optional[Any] = None,
+                 spectral_subset: Optional[List[int]] = None,** kwargs: Any) -> None:
+        """
+        Initialize a TIFF format hyperspectral dataset.
+        
+        Args:
+            spectral_subset: Optional list of band indices to select
+            See parent class for other parameters
+        """
+        self.spectral_subset = spectral_subset
+        super().__init__(data_path, label_path, num_classes, target_names, 
+                         patch_size, transform, **kwargs)
+
+    def _load_data(self) -> None:
+        """Load data from TIFF files using rasterio"""
+        try:
+            import rasterio
+        except ImportError:
+            raise ImportError("rasterio is required for TIFF datasets. Install with: pip install rasterio")
+        
+        try:
+            # Load hyperspectral data (multi-band TIFF)
+            with rasterio.open(self.data_path) as src:
+                # Read all bands (C, H, W)
+                data = src.read()
+                # Transpose to (H, W, C) format
+                self.raw_data = np.transpose(data, (1, 2, 0))
+                
+            # Load label data (single-band TIFF)
+            with rasterio.open(self.label_path) as src:
+                # Read label band and squeeze to (H, W)
+                self.raw_labels = src.read(1).squeeze()
+                
+            print(f"Loaded TIFF data: {self.raw_data.shape}, labels: {self.raw_labels.shape}")
+            
+        except Exception as e:
+            raise RuntimeError(f"Error loading TIFF files: {e}")
+
+    def _preprocess_data(self) -> None:
+        """
+        Preprocess data with band selection and normalization.
+        """
+        from sklearn.preprocessing import StandardScaler
+        
+        # Select specific spectral bands if requested
+        if self.spectral_subset is not None:
+            self.processed_data = self.raw_data[..., self.spectral_subset]
+            print(f"Selected spectral bands: {self.spectral_subset}")
+        else:
+            self.processed_data = self.raw_data.copy()
+        
+        # Normalize each band to zero mean and unit variance
+        h, w, c = self.processed_data.shape
+        flat_data = self.processed_data.reshape(-1, c)
+        
+        scaler = StandardScaler()
+        scaled_data = scaler.fit_transform(flat_data)
+        
+        self.processed_data = scaled_data.reshape(h, w, c)
+        print(f"Preprocessed TIFF data: {self.processed_data.shape}")
+
+
+class dataset:
+    """
+        A simple container for temporary storage.
+        Before data & labels are split into dataLoaders.
+    """
+    def __init__(self, hyperspectral_data, labels):
         self.hyperspectral_data = hyperspectral_data
         self.labels = labels
-        self.pretrained_transform = pretrained_transform or self._get_default_transform()
-        
-    def _get_default_transform(self):
-        """Get default transform for hyperspectral data (15 channels)"""
-        # For hyperspectral data, we'll use a simple normalization
-        # No need for RGB-specific transforms since we're using hyperspectral directly
-        return None  # We'll handle normalization in the model forward pass
-    
+
     def __len__(self):
         return len(self.hyperspectral_data)
     
@@ -319,363 +616,11 @@ class EnhancedHyperspectralDataset:
         label = self.labels[idx]
         
         return torch.FloatTensor(hyperspectral), pretrained_input, torch.LongTensor([label]).squeeze()
-    
-    
-def applyPCA(X, numComponents=15):
-    """
-    Apply PCA to reduce dimensionality to exactly 15 components for hyperspectral data
-    This ensures consistent input size for the model architecture.
-    
-    Args:
-        X: Input hyperspectral data (H, W, C) where C is original number of bands
-        numComponents: Number of PCA components (fixed at 15 for model consistency)
-    
-    Returns:
-        numpy.ndarray: PCA-transformed data with shape (H, W, 15)
-    """
-    print(f"\nApplying PCA to reduce from {X.shape[2]} bands to {numComponents} components...")
-    
-    if len(X.shape) == 3:
-        h, w, c = X.shape
-        newX = X.reshape((h * w, c))
-    else:
-        newX = X.copy()
-
-    newX = np.nan_to_num(newX, nan=0.0, posinf=np.finfo(np.float32).max, neginf=np.finfo(np.float32).min)
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(newX)
-    outlier_mask = np.abs(X_scaled) > 3
-    for band in range(newX.shape[1]):
-        band_mean = np.mean(newX[~outlier_mask[:, band], band])
-        newX[outlier_mask[:, band], band] = band_mean
-
-    if np.any(np.isnan(newX)) or np.any(np.isinf(newX)):
-        newX = np.where(np.isnan(newX), np.nanmean(newX, axis=0), newX)
-        newX = np.where(np.isinf(newX), np.nanmean(newX, axis=0), newX)
-
-    newX = scaler.fit_transform(newX)
-
-    pca = PCA(n_components=numComponents, random_state=42)
-    newX = pca.fit_transform(newX)
-
-    if len(X.shape) == 3:
-        newX = newX.reshape((h, w, numComponents))
-
-    return newX, pca
-
-def create_enhanced_data_loader(batch_size=64, test_ratio=0.20, patch_size=15, dataset_name="LongKou"):
-    """
-    Create enhanced data loaders with comprehensive processing
-    
-    Args:
-        batch_size (int): Batch size for data loaders
-        test_ratio (float): Ratio of data to use for testing (0.02 = 2% test, 98% train)
-        patch_size (int): Size of image patches
-        dataset_name (str): Dataset to use (see loadData for options)
-    
-    Returns:
-        tuple: (train_loader, test_loader, all_loader, y_all, pca_components, dataset_info)
-    """
-    # Load and validate raw data
-    X, y, dataset_info = loadData(dataset_name)
-    print('Hyperspectral data shape: ', X.shape)
-    print('Label shape: ', y.shape)
-    print('Original label range:', np.min(y), 'to', np.max(y))
-    print('Unique labels:', np.unique(y))
-    
-    # Apply PCA to reduce to exactly 15 components (standard for hyperspectral)
-    X_pca, PCA_model = applyPCA(X, numComponents=15)
-    pca_components = 15
-    print('Data shape after PCA: ', X_pca.shape)
-    
-    # Create image cubes and validate labels
-    X_pca, y_all = createImageCubes(X_pca, y, windowSize=patch_size)
-    print('Data cube X shape: ', X_pca.shape)
-    print('Processed label range:', np.min(y_all), 'to', np.max(y_all))
-    print('Unique processed labels:', np.unique(y_all))
-    
-    # Split dataset
-    Xtrain, Xtest, ytrain, ytest = splitTrainTestSet(X_pca, y_all, test_ratio)
-    print('Xtrain shape: ', Xtrain.shape)
-    print('Xtest shape: ', Xtest.shape)
-    
-    # Reshape data for processing (FIXED to match working model exactly)
-    X = X_pca.reshape(-1, patch_size, patch_size, pca_components, 1)
-    Xtrain = Xtrain.reshape(-1, patch_size, patch_size, pca_components, 1)
-    Xtest = Xtest.reshape(-1, patch_size, patch_size, pca_components, 1)
-    
-    X = X.transpose(0, 4, 3, 1, 2).squeeze(1)
-    Xtrain = Xtrain.transpose(0, 4, 3, 1, 2).squeeze(1)
-    Xtest = Xtest.transpose(0, 4, 3, 1, 2).squeeze(1)
-    
-    # Create enhanced datasets
-    trainset = EnhancedHyperspectralDataset(Xtrain, ytrain)
-    testset = EnhancedHyperspectralDataset(Xtest, ytest)
-    allset = EnhancedHyperspectralDataset(X, y_all)
-    
-    # Create data loaders with memory-optimized settings (per MEMORY_OPTIMIZATION_CHANGES.md)
-    train_loader = torch.utils.data.DataLoader(
-        trainset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False
-    )
-    test_loader = torch.utils.data.DataLoader(
-        testset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False
-    )
-    all_loader = torch.utils.data.DataLoader(
-        allset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False
-    )
-    
-    return train_loader, test_loader, all_loader, y_all, pca_components, dataset_info
-
-# ADDING MISSING EVALUATION AND SAVING FUNCTIONS
-def AA_andEachClassAccuracy(confusion_matrix):
-    """Calculate average accuracy and per-class accuracy"""
-    list_diag = np.diag(confusion_matrix)
-    list_raw_sum = np.sum(confusion_matrix, axis=1)
-    each_acc = np.nan_to_num(truediv(list_diag, list_raw_sum))
-    average_acc = np.mean(each_acc)
-    return each_acc, average_acc
-
-def acc_reports(y_test, y_pred_test, dataset_name="LongKou"):
-    """Generate comprehensive accuracy reports with target names"""
-    dataset_configs = {
-        "LongKou": {
-            "target_names": ['Corn', 'Cotton', 'Sesame', 'Broad-leaf soybean',
-                           'Narrow-leaf soybean', 'Rice', 'Water',
-                           'Roads and houses', 'Mixed weed'],
-            "num_classes": 9
-        },
-        "IndianPines": {
-            "target_names": ['Alfalfa', 'Corn-notill', 'Corn-mintill', 'Corn',
-                           'Grass-pasture', 'Grass-trees', 'Grass-pasture-mowed',
-                           'Hay-windrowed', 'Oats', 'Soybean-notill', 'Soybean-mintill',
-                           'Soybean-clean', 'Wheat', 'Woods', 'Buildings-Grass-Trees-Drives',
-                           'Stone-Steel-Towers'],
-            "num_classes": 16
-        },
-        "PaviaU": {
-            "target_names": ['Asphalt', 'Meadows', 'Gravel', 'Trees', 'Painted metal sheets',
-                           'Bare Soil', 'Bitumen', 'Self-Blocking Bricks', 'Shadows'],
-            "num_classes": 9
-        },
-        "PaviaC": {
-            "target_names": ['Water', 'Trees', 'Asphalt', 'Self-Blocking Bricks', 'Bitumen',
-                           'Tiles', 'Shadows', 'Meadows', 'Bare Soil'],
-            "num_classes": 9
-        },
-        "Salinas": {
-            "target_names": ['Brocoli_green_weeds_1', 'Brocoli_green_weeds_2', 'Fallow',
-                           'Fallow_rough_plow', 'Fallow_smooth', 'Stubble', 'Celery',
-                           'Grapes_untrained', 'Soil_vinyard_develop', 'Corn_senesced_green_weeds',
-                           'Lettuce_romaine_4wk', 'Lettuce_romaine_5wk', 'Lettuce_romaine_6wk',
-                           'Lettuce_romaine_7wk', 'Vinyard_untrained', 'Vinyard_vertical_trellis'],
-            "num_classes": 16
-        },
-        "HongHu": {
-            "target_names": ['Red roof', 'Road', 'Bare soil', 'Red roof 2', 'Red roof 3',
-                           'Gray roof', 'Red roof 4', 'White roof', 'Bright roof', 'Trees',
-                           'Grass', 'Red roof 5', 'Red roof 6', 'Red roof 7', 'Red roof 8',
-                           'Red roof 9', 'Red roof 10', 'Red roof 11', 'Red roof 12', 'Red roof 13',
-                           'Red roof 14', 'Red roof 15'],
-            "num_classes": 22
-        },
-        "Qingyun": {
-            "target_names": ["Trees", "Concrete building", "Car", "Ironhide building",
-                           "Plastic playground", "Asphalt road"],
-            "num_classes": 6
-            }
-    }
-    
-    if dataset_name in dataset_configs:
-        target_names = dataset_configs[dataset_name]["target_names"]
-    else:
-        # Fallback for unknown datasets
-        target_names = [f'Class_{i}' for i in range(len(np.unique(y_test)))]
-    
-    classification = classification_report(y_test, y_pred_test, digits=4, target_names=target_names, zero_division=0)
-    oa = accuracy_score(y_test, y_pred_test)
-    confusion = confusion_matrix(y_test, y_pred_test)
-    each_acc, aa = AA_andEachClassAccuracy(confusion)
-    kappa = cohen_kappa_score(y_test, y_pred_test)
-    return classification, oa*100, confusion, each_acc*100, aa*100, kappa*100, target_names
-
-@torch.no_grad()
-def test(device, model, test_loader):
-    """Test model and get predictions"""
-    model.eval()
-    count = 0
-    y_pred_test = 0
-    y_test = 0
-    
-    for hyperspectral, pretrained, labels in test_loader:
-        hyperspectral = hyperspectral.to(device)
-        pretrained = pretrained.to(device)
-        labels = labels.squeeze().to(device)
-        
-        # FIXED: Ensure correct tensor format for hyperspectral data
-        # Input should be [B, C, H, W] where C is the number of channels (15 for hyperspectral)
-        if hyperspectral.dim() == 4 and hyperspectral.shape[-1] == 15:  # [B, H, W, C]
-            # [B, H, W, C] -> [B, C, H, W]
-            hyperspectral = hyperspectral.permute(0, 3, 1, 2)
-        
-        # Normalize inputs (FIXED to match working model exactly)
-        hyperspectral = (hyperspectral - hyperspectral.mean(dim=(2,3), keepdim=True)) / (hyperspectral.std(dim=(2,3), keepdim=True) + 1e-8)
-        
-        outputs = model(hyperspectral)
-        outputs = np.argmax(outputs.detach().cpu().numpy(), axis=1)
-        
-        if count == 0:
-            y_pred_test = outputs
-            y_test = labels.cpu().numpy()
-            count = 1
-        else:
-            y_pred_test = np.concatenate((y_pred_test, outputs))
-            y_test = np.concatenate((y_test, labels.cpu().numpy()))
-    
-    return y_pred_test, y_test
-
-def plot_enhanced_training_curves(train_losses, train_accuracies, eval_accuracies, epoch):
-    """Plot enhanced training curves"""
-    plt.figure(figsize=(15, 5))
-    
-    # Plot losses
-    plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='Training Loss')
-    plt.title('Enhanced Training Loss Over Time')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
-    
-    # Plot accuracies
-    plt.subplot(1, 2, 2)
-    plt.plot(train_accuracies, label='Training Accuracy')
-    plt.plot(eval_accuracies, label='Validation Accuracy')
-    plt.title('Enhanced Accuracy Over Time')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy (%)')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.tight_layout()
-    os.makedirs('enhanced_plots', exist_ok=True)
-    plt.savefig(f'enhanced_plots/enhanced_training_curves_{epoch}.png')
-    plt.close()
-
-def save_enhanced_results(model, config, best_acc, best_epoch, training_time, test_time, 
-                         classification, oa, confusion, each_acc, aa, kappa, target_names,
-                         pretrained_model_name, efficiency_results):
-    """Save comprehensive enhanced results"""
-    os.makedirs('enhanced_cls_result', exist_ok=True)
-    file_name = f"enhanced_cls_result/classification_report_enhanced_{pretrained_model_name.replace('/', '_')}.txt"
-    
-    with open(file_name, 'w') as x_file:
-        x_file.write(f'Enhanced Model Configuration:\n')
-        x_file.write(f'Pretrained Model: {pretrained_model_name}\n')
-        x_file.write(f'LoRA rank (r): 16\n')
-        x_file.write(f'LoRA alpha: 32\n')
-        x_file.write(f'Learning rate: {config["learning_rate"]}\n')
-        x_file.write(f'Batch size: {config["batch_size"]}\n')
-        x_file.write(f'Parameter reduction: {efficiency_results["parameter_reduction_percent"]:.2f}%\n\n')
-        
-        x_file.write(f'Training Time (s): {training_time:.2f}\n')
-        x_file.write(f'Test Time (s): {test_time:.2f}\n')
-        x_file.write(f'Best epoch: {best_epoch}\n\n')
-        
-        x_file.write(f'Enhanced Performance Metrics:\n')
-        x_file.write(f'Overall Accuracy (%): {oa:.2f}\n')
-        x_file.write(f'Average Accuracy (%): {aa:.2f}\n')
-        x_file.write(f'Kappa Score (%): {kappa:.2f}\n\n')
-        
-        x_file.write(f'Per-Class Accuracies (%):\n')
-        for name, acc in zip(target_names, each_acc):
-            x_file.write(f'{name}: {acc:.2f}\n')
-        x_file.write(f'\nDetailed Classification Report:\n{classification}\n')
-        x_file.write(f'\nConfusion Matrix:\n{confusion}\n')
-    
-    print(f"\nEnhanced results saved to {file_name}")
-    return file_name
-
-def save_enhanced_model(model, config, best_acc, kappa, training_time, test_time, 
-                       best_epoch, each_acc, confusion, pretrained_model_name, efficiency_results):
-    """Save enhanced model with comprehensive metadata"""
-    os.makedirs('enhanced_peft_checkpoints', exist_ok=True)
-    
-    torch.save({
-        'state_dict': model.state_dict(),
-        'config': config,
-        'performance': {
-            'accuracy': best_acc,
-            'kappa': kappa,
-            'training_time': training_time,
-            'test_time': test_time,
-            'best_epoch': best_epoch,
-            'per_class_accuracy': each_acc.tolist(),
-            'confusion_matrix': confusion.tolist()
-        },
-        'model_config': {
-            'pretrained_model': pretrained_model_name,
-            'lora_rank': 16,
-            'lora_alpha': 32,
-            'dim': 96,
-            'depths': [3, 4, 19],
-            'num_heads': [4, 8, 16],
-            'window_size': [7, 7, 7]
-        },
-        'efficiency_results': efficiency_results
-    }, f'enhanced_peft_checkpoints/enhanced_final_model_{pretrained_model_name.replace("/", "_")}.pth')
-    
-    print(f"Enhanced model saved with comprehensive metadata")
-
-def generate_cam_plot(model, input_tensor, target_class=None, device='cuda'):
-    """
-    Generate Class Activation Map (CAM) using the model's built-in generate_cam method.
-    This works with EnhancedPEFTHyperspectralGCViT model's existing CAM implementation.
-    
-    Args:
-        model: model with ``generate_cam()`` method.
-        input_tensor: Input tensor ``[B, C, H, W]``.
-        target_class: Specific class index to visualize (``None`` for all class).
-        device: Device to run on (``cuda`` / ``cpu``).
-    
-    Returns:
-        cam_image: CAM visualization array normalized to ``[0, 255]``.
-        pred_class: Predicted class index.
-        true_cam: Raw CAM tensor from model.
-    """
-
-    model.eval()
-    input_tensor = input_tensor.to(device)
-    
-    with torch.no_grad():
-        # Get model predictions AND CAM (using your model's built-in method)
-        outputs, cams = model(input_tensor, return_cam=True)  # FIXED: Use your model's forward method with return_cam
-        pred_class = torch.argmax(outputs, dim=1).item()
-        
-        if len(cams.shape) != 4:
-            raise ValueError(f"CAM has invalid shape {cams.shape}, expected [B, num_classes, H, W].")
-
-        # Select target class for CAM (use predicted if not specified)
-        cam_class = target_class if target_class is not None else pred_class
-
-        num_classes = cams.shape[1]
-        if cam_class >= num_classes:
-            cam_class = 0    # fallback to 1st class if invalid.
-
-        true_cam = cams[0, cam_class, :, :].cpu().numpy()  # Take first batch item, target class
-        
-        # Normalize CAM to [0, 255] for visualization
-        cam_image = (true_cam - true_cam.min()) / (true_cam.max() - true_cam.min() + 1e-8)
-        cam_image = (cam_image * 255).astype(np.uint8)
-        
-        # Resize to match input spatial dimensions (keep aspect ratio)
-        h, w = input_tensor.shape[2], input_tensor.shape[3]
-        cam_image = cv2.resize(cam_image, (w, h), interpolation=cv2.INTER_LINEAR)
-    
-    return cam_image, pred_class, true_cam
 
 class EnhancedTrainer:
-    def __init__(self, config):
+    def __init__(self, config:dict, dataLoader:MatHyperspectralDataset):
         self.config = config
+        self.dataLoader = dataLoader
         
         # FORCE CUDA USAGE - bypass torch.cuda.is_available() check
         try:
@@ -725,17 +670,17 @@ class EnhancedTrainer:
     def load_data(self):
         """Load and preprocess hyperspectral data"""
         print("Loading hyperspectral data...")
-        # Use enhanced data loader with comprehensive processing - MEMORY OPTIMIZED
-        self.train_loader, self.test_loader, self.all_loader, self.y_all, self.pca_components, self.dataset_info = create_enhanced_data_loader(
-            batch_size=self.config['batch_size'],
-            test_ratio=self.config['test_ratio'],
-            patch_size=self.config['patch_size'],
-            dataset_name=self.config['dataset_name']
-        )
+        self.train_loader, self.test_loader, \
+        all_loader, y_all, pca_components, self.dataset_info \
+            = self.dataLoader.create_data_loader(
+                    batch_size=self.config['batch_size'],
+                    test_rate=self.config['test_rate']
+                    )
+
         print(f"Training samples: {len(self.train_loader.dataset)}")
         print(f"Test samples: {len(self.test_loader.dataset)}")
-        print(f"Total samples: {len(self.all_loader.dataset)}")
-        print(f"PCA components: {self.pca_components}")
+        print(f"Total samples: {len(all_loader.dataset)}")
+        print(f"PCA components: {pca_components}")
         print(f"Dataset: {self.config['dataset_name']} ({self.dataset_info['num_classes']} classes)")
         
     def create_model(self):
@@ -1126,9 +1071,9 @@ class EnhancedTrainer:
             else:
                 test_loss, test_acc, kappa = None, None, None
             
-            # Save CAM every 10 epochs
-            if (epoch + 1) % 1 == 0:  # +1 because epochs are 0-indexed
-                self.visualize_cam(epoch=epoch+1, save_path=f'./outputs/CAM')  # Use 1-indexed for display
+            # Save CAM every 5 epochs
+            if (epoch + 1) % 5 == 0:  # +1 because epochs are 0-indexed
+                self.visualize_cam(epoch=epoch+1, save_path=f'/home/chenhaoran/LoLA-SpecViT-Model-main/outputs/CAM')  # Use 1-indexed for display
             
             print(f'Epoch {epoch+1}: Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
             if should_eval:
@@ -1281,7 +1226,7 @@ def main():
     parser.add_argument('--dataset', type=str, default='LongKou', 
                        choices=['LongKou', 'IndianPines', 'PaviaU', 'PaviaC', 'Salinas', 'HongHu', 'Qingyun'],
                        help='Dataset to use for training/evaluation')
-    parser.add_argument('--epoch', type=int, default=10,
+    parser.add_argument('--epoch', type=int, default=30,
                        help='Total epoch for training.')
     parser.add_argument('--model', type=str, default=None,
                        help='Backbone Hugging Face model to use (e.g., nvidia/GCViT, nvidia/GCViT-Tiny)')
@@ -1322,10 +1267,26 @@ def main():
         'fast_eval': False,                # Evaluate on full test set during training
         'eval_batch_size': 32,             # Smaller eval batch size
         'gradient_accumulation_steps': 2,   # Reduced for CPU training
-        'test_ratio': 0.2,                  # 20% for test dataset
+        'test_rate': 0.2,                  # 20% for test dataset
         'patch_size': 15                     #Size of image patches
-    }
-    
+        }
+
+    target_names = ['Corn', 'Cotton', 'Sesame', 'Broad-leaf soybean',
+                           'Narrow-leaf soybean', 'Rice', 'Water',
+                           'Roads and houses', 'Mixed weed']
+    # Create trainer
+    dataLoader = MatHyperspectralDataset(
+        data_path= '/data/chenhaoran/WHUhypspec/data/WHU-Hi-LongKou.mat',
+        label_path= '/data/chenhaoran/WHUhypspec/data/WHU-Hi-LongKou_gt.mat',
+        data_key='hyperspectral_data', label_key='hyperspectral_data', 
+        num_classes=9, target_names=target_names, patch_size=15,
+        test_rate=0.2, pca_components=15 
+        )
+
+    trainer = EnhancedTrainer(config, dataLoader)
+    trainer.train()
+    return trainer
+
     # Create trainer
     trainer = EnhancedTrainer(config)
     
@@ -1391,42 +1352,23 @@ def main():
         best_acc, best_epoch = trainer.train()
 
 def dt():
-    config = {
-        'num_epochs': 60,                  # Reduced for faster training
-        'batch_size': 32,                  # Smaller batch size for stability
-        'learning_rate': 2e-5,
-        'weight_decay': 0.01,
-        'dataset_name': 'LongKou',         # corresponding for dict in line 436.
-        'hf_backbone': 'nvidia/GCViT',
-        'skip_pretrained': True,
-        'lora_rank': 16,
-        'lora_alpha': 32,
-        'merge_lora_for_inference': False,
-        'eval_interval': 5,                # Evaluate every epoch
-        'use_amp': True,                   # Will be disabled for CPU automatically
-        'label_smoothing': 0.1,
-        'patience': 15,                    # More patience for CPU training
-        'use_wandb': False,                # Disabled by default for stability
-        'scheduler': {
-            'T_0': 10,                     # Shorter warm restarts
-            'T_mult': 2,
-            'eta_min': 1e-6
-        },
-        'warmup_epochs': 5,                # Reduced warmup
-        'grad_clip': 0.5,
-        'lora_dropout': 0.2,
-        'fast_eval': True,                # Evaluate on full test set during training
-        'eval_batch_size': 32,             # Smaller eval batch size
-        'gradient_accumulation_steps': 2,   # Reduced for CPU training
-        'test_ratio': 0.2,                  # 20% for test dataset
-        'patch_size': 15                     #Size of image patches
-    }
-    
+    from configs import config
+    target_names= ['Corn', 'Cotton', 'Sesame', 'Broad-leaf soybean',
+                           'Narrow-leaf soybean', 'Rice', 'Water',
+                           'Roads and houses', 'Mixed weed']
     # Create trainer
-    trainer = EnhancedTrainer(config)
+    dataLoader = MatHyperspectralDataset(
+        data_path= '/data/chenhaoran/WHUhypspec/data/WHU-Hi-LongKou.mat',
+        label_path= '/data/chenhaoran/WHUhypspec/data/WHU-Hi-LongKou_gt.mat',
+        data_key='hyperspectral_data', label_key='hyperspectral_data', 
+        num_classes=9, target_names=target_names, patch_size=15,
+        test_rate=0.2, pca_components=15 
+        )
+
+    trainer = EnhancedTrainer(config, dataLoader)
     trainer.train()
     return trainer
 
 if __name__ == "__main__":
-    trainer = dt()
+    trainer = main()
     pass
