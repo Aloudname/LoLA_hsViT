@@ -117,7 +117,7 @@ def test(device, model, test_loader):
     
     return y_pred_test, y_test
 
-def plot_enhanced_training_curves(train_losses, train_accuracies, eval_accuracies, epoch):
+def plt_curves(train_losses, train_accuracies, eval_accuracies, epoch):
     """Plot enhanced training curves"""
     plt.figure(figsize=(15, 5))
     
@@ -145,7 +145,7 @@ def plot_enhanced_training_curves(train_losses, train_accuracies, eval_accuracie
     plt.savefig(f'enhanced_plots/enhanced_training_curves_{epoch}.png')
     plt.close()
 
-def save_enhanced_results(model, config, best_acc, best_epoch, training_time, test_time, 
+def save_results(model, config, best_acc, best_epoch, training_time, test_time, 
                          classification, oa, confusion, each_acc, aa, kappa, target_names,
                          pretrained_model_name, efficiency_results):
     """Save comprehensive enhanced results"""
@@ -179,7 +179,7 @@ def save_enhanced_results(model, config, best_acc, best_epoch, training_time, te
     print(f"\nEnhanced results saved to {file_name}")
     return file_name
 
-def save_enhanced_model(model, config, best_acc, kappa, training_time, test_time, 
+def save_model(model, config, best_acc, kappa, training_time, test_time, 
                        best_epoch, each_acc, confusion, pretrained_model_name, efficiency_results):
     """Save enhanced model with comprehensive metadata"""
     os.makedirs('enhanced_peft_checkpoints', exist_ok=True)
