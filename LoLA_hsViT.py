@@ -113,8 +113,9 @@ class EnhancedLoRALinear(nn.Module):
         In LoRA, update weight matrix using:
             ``W_eff = W + ΔW = W + scale * (B @ A)``
         
-        Therefore a merge can be performed to fold LoRA weights into base weights.
-        Exact merge only if gate/residual disabled. Residual (if present) is always foldable.
+        Therefore, merge to fold LoRA weights into base weights.
+        Exact merge only if gate disabled.
+        Residual (if present) is always foldable.
         """
         with torch.no_grad():
             # Merge residual if available
@@ -129,7 +130,7 @@ class EnhancedLoRALinear(nn.Module):
                 self.lora_down.weight.zero_()
                 self.lora_up.weight.zero_()
 
-# FIXED: Adaptive Squeeze-and-Excitation that handles both 2D and 3D tensors
+# Adaptive Squeeze-and-Excitation handles both 2D and 3D tensors
 class AdaptiveSqueezeExcitation(nn.Module):
     r"""
     Squeeze-and-Excitation sub-block used in down-sampling blocks.
@@ -173,7 +174,7 @@ class AdaptiveSqueezeExcitation(nn.Module):
             y = self.fc(y).view(b, c, 1, 1)
             return x * y.expand_as(x)
         else:
-            raise ValueError(f"Unsupported tensor dimension: {x.dim()}. Expected 4D(batch, channel, height, width) or 5D(batch, channel, depth, height, width) tensor.")
+            raise ValueError(f"Unsupported tensor shape: {x.dim()}. Expected [B, C, H, W] or [B, C, D, H, W].")
 
 # (Pretrained model and cross-attention modules removed for submission)
 
@@ -205,7 +206,7 @@ class BandDropout(nn.Module):
 
 # Local(Window) Attention with LoRA-replace and relative position bias.
 class EnhancedPEFTWindowAttention(nn.Module):
-    """
+    r"""
         Describes a window-based multi-head self attention (W-MSA) module.
         
         This local-attention module features:
@@ -272,7 +273,7 @@ class EnhancedPEFTWindowAttention(nn.Module):
            - ``B\_``: B\_ = B * num_Windows.
            - ``N``: tokens in a window (W^2).
            - ``C``: number of channels.
-        - ``mask``: (0/-inf) mask with shape of ``(num_windows, N, N)`` or None.
+        - ``mask``: (0/-inf) mask with shape of ``(num_windows, N, N)`` or ``None``.
         """
 
         # get q, k, v by linear projection (LoRA replaced linear).
@@ -526,26 +527,27 @@ class LoLA_hsViT(nn.Module):
         - Local Attention for more efficient.
         - Note: Without cross-attention.
 
-    parameters initialization seen in ``__init__`` method.
+    See parameters initialization in ``__init__`` method.
 
     Structure of the module:
-        (1) Feature extract of ``[B, C, H, W] -> [B, 64, H, W]``:
+        (1) Feature extract of ``[B, C, H, W] -> [B, dim, H, W]``:
                 input ``x`` --( Conv3d + BN3d + Swish ) *3 --> ``X'``
                 ``X'`` --( BandDropout + SE + Avepool(C) ) --> ``X_1``
 
-        (2) Patch & positional embedding of ``[B, 64, H, W] -> [B, HW/4, d]``:
+        (2) Patch & positional embedding of ``[B, dim, H, W] -> [B, HW/4, dim]``:
                 ``X_1`` --( Conv2d + BN2d + Swish )--> ``patch_embedded_X``
                 ``patch_embedded_X`` + ( ``zeros[1, H, W, C]`` )--> ``pos_embedded_X``
                 ``pos_embedded_X`` --( Dropout )--> ``X_2``
 
-        (3) Main LAViT Blocks of ``[B, HW/4, d] -> [B, HW/64, 4d]``:
-                ``X_2`` --( LAViT + down-sampling ) *2 --> ``X'``
-                ``X'`` --( LAViT )--> ``X_3``
+        (3) Main LAViT Blocks of ``[B, HW/4, dim] -> [B, HW/64, 4dim]``:
+                ``X_2`` --( LAViT *depth[0] + down-sampling )--> ``X' ``
+                ``X' `` --( LAViT *depth[1] + down-sampling )--> ``X''``
+                ``X''`` --( LAViT *depth[2] )--> ``X_3``
 
-        (4) Classification Head of ``[B, HW/64, 4d] -> [B, K]``:
+        (4) Classification Head of ``[B, HW/64, 4dim] -> [B, K]``:
                 ``X_3`` --(Flatten + LN + AvePool + LoRA)--> output ``Y``
     """
-    def __init__(self, in_channels=15, num_classes=9, dim=96, depths=[3, 4, 19],
+    def __init__(self, in_channels=15, num_classes=9, dim=96, depths=[3, 4, 5],
                  num_heads=[4, 8, 16], window_size=[7, 7, 7], mlp_ratio=4.,
                  drop_path_rate=0.2, spatial_size=15, r=16, lora_alpha=32):
         """
@@ -565,7 +567,7 @@ class LoLA_hsViT(nn.Module):
         
         super().__init__()
         self.in_channels = in_channels
-        print(f"Model initialized with {in_channels} input channels.")
+        print(f"Model initialized with {in_channels} input channels and {depths} depths.")
         
         # Block1: Spectral processing.
         self.spectral_conv = nn.Sequential(
@@ -1390,7 +1392,7 @@ def create_model(spatial_size=15, num_classes=6, in_channels=15, lora_rank=16, l
         in_channels=in_channels,  # Now properly configurable
         num_classes=num_classes,
         dim=96,
-        depths=[3, 4, 19],
+        depths=[3, 4, 5],
         num_heads=[4, 8, 16],
         window_size=window_sizes,  # Use original window sizes
         mlp_ratio=4.,

@@ -10,7 +10,6 @@ target_names = [ 'Corn', 'Cotton', 'Sesame', 'Broad-leaf soybean',
                     'Roads and houses', 'Mixed weed']
 
 config = {
-        'num_epochs': 60,                  # Reduced for faster training
         'batch_size': 32,                  # Smaller batch size for stability
         'learning_rate': 2e-5,
         'weight_decay': 0.01,
@@ -21,7 +20,6 @@ config = {
         'lora_alpha': 32,
         'merge_lora_for_inference': False,
         'eval_interval': 5,                # Evaluate every epoch
-        'use_amp': True,                   # Will be disabled for CPU automatically
         'label_smoothing': 0.1,
         'patience': 15,                    # More patience for CPU training
         'use_wandb': False,                # Disabled by default for stability
@@ -36,9 +34,15 @@ config = {
         'fast_eval': True,                # Evaluate on full test set during training
         'eval_batch_size': 32,             # Smaller eval batch size
         'gradient_accumulation_steps': 2,   # Reduced for CPU training
-        'test_rate': 0.2,                  # 20% for test dataset
-        'patch_size': 15,                     #Size of image patches
-        'pca_components': 15
+        'test_rate': 0.2,
+        'patch_size': 15,                     # Pixel size of image patches.
+        'pca_components': 15,
+
+        # memory and processor settings.
+        'use_amp': True,                   # disable for CPU.
+        'pin_memory': False,               # pin weights in memory down.
+        'num_workers': 2,                  # multi-processor settings.
+        'max_workers': 4
     }
 
 # Store only for references, without any application in program.
