@@ -31,7 +31,7 @@ from LoLA_hsViT import (
     prepare_model_for_lora_finetuning,
     merge_lora_for_inference,
 )
-import os
+
 import timm
 from torchvision import transforms
 import warnings
