@@ -61,8 +61,8 @@ class AbstractHyperspectralDataset(ABC, Dataset):
     NOTE: ``_load_data`` & ``_preprocess_data`` are abstract methods,
          which means re-implementation in inherit classes are necessary.
     """
-    
-    def __init__(self, 
+
+    def __init__(self,
                  data_path: str,
                  label_path: str,
                  num_classes: int,
@@ -74,7 +74,7 @@ class AbstractHyperspectralDataset(ABC, Dataset):
                  **kwargs: Any) -> None:
         """
         Initialize the hyperspectral dataset.
-        
+
         Args:
             data_path: Path to the main hyperspectral data file
             label_path: Path to the label file
@@ -88,7 +88,7 @@ class AbstractHyperspectralDataset(ABC, Dataset):
         """
         if patch_size % 2 == 0:
             raise ValueError(f"patch_size must be odd, got {patch_size}")
-            
+
         self.data_path = data_path
         self.label_path = label_path
         self.num_classes = num_classes
@@ -99,14 +99,14 @@ class AbstractHyperspectralDataset(ABC, Dataset):
         self.kwargs = kwargs
         self.test_rate = test_rate
         self.pca_component = pca_component
-        
+
         # Core data structures to be populated by subclasses
         self.raw_data: np.ndarray = None  # Original hyperspectral data (H, W, C)
         self.raw_labels: np.ndarray = None  # Original labels (H, W)
         self.processed_data: np.ndarray = None  # Preprocessed data (e.g., after PCA)
         self.patches: np.ndarray = None  # Extracted image patches
         self.patch_labels: np.ndarray = None  # Labels corresponding to patches
-        
+
         # Load and process data
         self._load_data()
         self._validate_raw_data()
