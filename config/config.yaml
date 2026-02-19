@@ -36,7 +36,7 @@ memory:
 path:
   data: '/data/chenhaoran/WHUhypspec/data/WHU-Hi-LongKou.mat'
   label: '/data/chenhaoran/WHUhypspec/data/WHU-Hi-LongKou_gt.mat'
-  output: '/home/chenhaoran/LoLA-hsViT/outputs'
+  output: '/home/chenhaoran/LoLA_hsViT/outputs'
 key: # keys to access data and label in .mat files.
   data: 'hyperspectral_data'
   label: 'hyperspectral_data'
