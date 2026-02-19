@@ -353,7 +353,7 @@ class hsTrainer:
                         'kappa': kappa
                     }
                     self._save_model()
-                    print(f"  Best model saved (Acc: {eval_acc:.2f}%)")
+                    print(f"  Best model saved (Acc: {eval_acc:.2f}%) at {os.path.join(self.output, 'models', f'{self.model_name}_best.pth')}")
                 else:
                     # early stopping check
                     if epoch - self.best_epoch > self.patience:

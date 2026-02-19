@@ -1,28 +1,25 @@
-# common_vit.py defines model + its components.
+"""
+Standard ViT.
+"""
+
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.layers import trunc_normal_, DropPath
 
+
 class Swish(nn.Module):
-    """
-    Leveled up to ``SwiGLU`` in next class.
-    """
-    def __init__(self, beta = 1):
+    def __init__(self, beta=1):
         super().__init__()
         self.beta = beta
     
     def forward(self, x):
         return x * torch.sigmoid(self.beta * x)
 
+
 class SwiGLU(nn.Module):
-    r"""
-    The activation function mainly utilized in the LoRA blocks of the model.
-
-    ``SwiGLU(x) = Swish(W1*x) @ σ(W2*x)``, Hadamard product.
-
-    Figure of SwiGLU seen by running as ``__main__``.
-    """
+    """SwiGLU for MLP"""
     def __init__(self, in_features, hidden_features=None, out_features=None, drop=0.):
         super().__init__()
         hidden_features = hidden_features or in_features
@@ -36,63 +33,172 @@ class SwiGLU(nn.Module):
         gate = F.silu(self.w1(x))
         return self.W(self.drop(gate * self.w2(x)))
 
-# Final implementation of CommonViT.
-class CommonViT(nn.Module):
-    r"""
-    CommonViT model for hyperspectral image classification.
-        - Note: Without cross-attention.
+class AdaptiveSqueezeExcitation(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.channels = channels
+        self.reduction = reduction
         
-    See parameters initialization in ``__init__`` method.
+        self.adaptive_pool_2d = nn.AdaptiveAvgPool2d(1)
+        self.adaptive_pool_3d = nn.AdaptiveAvgPool3d(1)
+        
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
 
-    Structure of the module:
-        (1) Feature extract of ``[B, C, H, W] -> [B, dim, H, W]``:
-                input ``x`` --( Conv3d + BN3d + Swish ) *3 --> ``X'``
-                ``X'`` --( BandDropout + SE + Avepool(C) ) --> ``X_1``
+    def forward(self, x):
+        if x.dim() == 5:  # 3D: (B, C, D, H, W)
+            b, c, d, h, w = x.size()
+            y = self.adaptive_pool_3d(x).view(b, c)
+            y = self.fc(y).view(b, c, 1, 1, 1)
+            return x * y.expand_as(x)
+        elif x.dim() == 4:  # 2D: (B, C, H, W)
+            b, c, h, w = x.size()
+            y = self.adaptive_pool_2d(x).view(b, c)
+            y = self.fc(y).view(b, c, 1, 1)
+            return x * y.expand_as(x)
+        else:
+            raise ValueError(f"Unsupported tensor shape: {x.dim()}")
 
-        (2) Patch & positional embedding of ``[B, dim, H, W] -> [B, HW/4, dim]``:
-                ``X_1`` --( Conv2d + BN2d + Swish )--> ``patch_embedded_X``
-                ``patch_embedded_X`` + ( ``zeros[1, H, W, C]`` )--> ``pos_embedded_X``
-                ``pos_embedded_X`` --( Dropout )--> ``X_2``
 
-        (3) Main LAViT Blocks of ``[B, HW/4, dim] -> [B, HW/64, 4dim]``:
-                ``X_2`` --( LAViT *depth[0] + down-sampling )--> ``X' ``
-                ``X' `` --( LAViT *depth[1] + down-sampling )--> ``X''``
-                ``X''`` --( LAViT *depth[2] )--> ``X_3``
+class BandDropout(nn.Module):
+    """Dropout for spectral bands C"""
+    def __init__(self, drop_rate=0.1):
+        super().__init__()
+        self.drop_rate = drop_rate
 
-        (4) Classification Head of ``[B, HW/64, 4dim] -> [B, K]``:
-                ``X_3`` --(Flatten + LN + AvePool + LoRA)--> output ``Y``
+    def forward(self, x):
+        if not self.training or self.drop_rate == 0:
+            return x
+            
+        if x.dim() == 5:  # (b, c, d, h, w)
+            b, c, d, h, w = x.shape
+            mask = torch.bernoulli(torch.ones(b, c, d, 1, 1, device=x.device) * (1 - self.drop_rate))
+        elif x.dim() == 4:  # (b, c, h, w)
+            b, c, h, w = x.shape
+            mask = torch.bernoulli(torch.ones(b, c, 1, 1, device=x.device) * (1 - self.drop_rate))
+        else:
+            return x
+        
+        x = x * mask / (1 - self.drop_rate)
+        return x
+
+
+class StandardMultiHeadAttention(nn.Module):
     """
+    Standard multi-head self-attention without windowing.
+    """
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+class TransformerBlock(nn.Module):
+    """
+    Standard Transformer
+    
+    Includes:
+    - LayerNorm + multihead self-attention
+    - LayerNorm + MLP
+    - residual connection + DropPath
+    """
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False,
+                 drop=0., attn_drop=0., drop_path=0., 
+                 act_layer=Swish, norm_layer=nn.LayerNorm):
+        super().__init__()
+        
+        self.norm1 = norm_layer(dim)
+        self.attn = StandardMultiHeadAttention(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias,
+            attn_drop=attn_drop, proj_drop=drop
+        )
+        
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            SwiGLU(mlp_hidden_dim, mlp_hidden_dim, mlp_hidden_dim),
+            nn.Dropout(drop),
+            nn.Linear(mlp_hidden_dim, dim),
+            nn.Dropout(drop)
+        )
+
+    def forward(self, x):
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+
+class CommonViT(nn.Module):
+    """
+    Standard, common ViT for hyperspectral image classification.
+    Same API and params with LoLA are remaining.
+    """
+    
     def __init__(self, in_channels=15, num_classes=9, dim=96, depths=[3, 4, 5],
                  num_heads=[4, 8, 16], window_size=[7, 7, 7], mlp_ratio=4.,
                  drop_path_rate=0.2, spatial_size=15, r=16, lora_alpha=32):
         """
-        Args:
-            ``in_channels``: Number of input channels (spectral bands).
-            ``num_classes``: Number of output classes for classification.
-            ``dim``: Base dimension for model.
-            ``depths``: List of depths for each LoLA_hsViT block.
-            ``num_heads``: List of number of attention heads for each LoLA_hsViT block.
-            ``window_size``: List of window sizes for each LoLA_hsViT block.
-            ``mlp_ratio``: Ratio for MLP hidden dimension.
-            ``drop_path_rate``: Stochastic depth rate.
-            ``spatial_size``: Spatial size.
-            ``r``: LoRA rank.
-            ``lora_alpha``: LoRA scaling factor.
-        """
+        Standard, common ViT for hyperspectral image classification.
         
+        params:
+            in_channels (int): 15 default.
+            num_classes (int): 9 default.
+            dim (int): dim of feature maps, 96 default.
+            depths (list): num of transformer blocks, [3, 4, 5] default.
+            num_heads (list): attention head for layers, [4, 8, 16] default.
+            window_size (list): only for compatibility.
+            mlp_ratio (float): num of MLP hidden layes, 4 default.
+            drop_path_rate (float): drop path rate, 0.2 default.
+            spatial_size (int): input spatial size (pixel), 15 default.
+            r (int): only for compatibility.
+            lora_alpha (float): only for compatibility.
+        """
         super().__init__()
         self.in_channels = in_channels
-        print(f"Model initialized with {in_channels} input channels and {depths} depths.")
+        self.num_classes = num_classes
+        self.dim = dim
+        self.depths = depths
+        self.num_heads = num_heads
+        self.spatial_size = spatial_size
         
-        # Block1: Spectral processing.
+        print(f"StandardHSITransformer initialized with {in_channels} input channels, "
+              f"{num_classes} classes, depths {depths}")
+        
+        # preprocessing layers.
         self.spectral_conv = nn.Sequential(
-            nn.Conv3d(1, 32, kernel_size=(7,3,3), padding=(3,1,1)),
+            nn.Conv3d(1, 32, kernel_size=(7, 3, 3), padding=(3, 1, 1)),
             nn.BatchNorm3d(32),
             Swish(),
-            nn.Conv3d(32, 64, kernel_size=(5,3,3), padding=(2,1,1)),
+            nn.Conv3d(32, 64, kernel_size=(5, 3, 3), padding=(2, 1, 1)),
             nn.BatchNorm3d(64),
             Swish(),
-            nn.Conv3d(64, dim, kernel_size=(3,3,3), padding=(1,1,1)),
+            nn.Conv3d(64, dim, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
             nn.BatchNorm3d(dim),
             Swish()
         )
@@ -100,261 +206,250 @@ class CommonViT(nn.Module):
         self.band_dropout = BandDropout(drop_rate=0.1)
         self.spectral_attention = AdaptiveSqueezeExcitation(dim)
         
-        # Store LoRA layers for CLR updates
-        self.lora_layers = []
         
-
-        # Block2: Patch embedding.
+        # patch & pos embedding
         self.patch_embed = nn.Sequential(
             nn.Conv2d(dim, dim, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(dim),
             Swish()
         )
         
-        # Position embedding
         self.patch_resolution = spatial_size // 2
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_resolution, 
-                                                 self.patch_resolution, dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_resolution,
+                                                   self.patch_resolution, dim))
         self.pos_drop = nn.Dropout(p=0.1)
         
-        # Track dimensions through network
-        self.dims = [dim]
-        for i in range(1, len(depths)):
-            self.dims.append(self.dims[-1] * 2)
         
-
-        # Main part: LAViT backbone with PEFT and self-attention.
+        # transformer main blocks
+        self.dims = [dim * (2 ** i) for i in range(len(depths))]
+        
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
-        self.levels = nn.ModuleList()
-        curr_idx = 0
         
-        for i in range(len(depths)):
-            # Create downsample layer if not last level
-            downsample = None if i == len(depths) - 1 else EnhancedReduceSize(self.dims[i])
+        self.transformer_levels = nn.ModuleList()
+        curr_dpr_idx = 0
+        
+        for level_idx in range(len(depths)):
+            current_dim = self.dims[level_idx]
+            current_depth = depths[level_idx]
+            current_num_heads = num_heads[level_idx]
             
-            # Create blocks for current LEVEL.
-            level = nn.ModuleList()
-            for j in range(depths[i]):
-                block = PEFTLoLA_hsViTBlock(
-                    dim=self.dims[i],
-                    num_heads=num_heads[i],
-                    window_size=window_size[i],
+            blocks = nn.ModuleList()
+            for block_idx in range(current_depth):
+                drop_path_prob = dpr[curr_dpr_idx]
+                curr_dpr_idx += 1
+                
+                block = TransformerBlock(
+                    dim=current_dim,
+                    num_heads=current_num_heads,
                     mlp_ratio=mlp_ratio,
                     qkv_bias=True,
-                    qk_scale=None,
-                    drop=0.0,
-                    attn_drop=0.0,
-                    drop_path=dpr[curr_idx + j],
-                    norm_layer=nn.LayerNorm,
-                    r=r,
-                    lora_alpha=lora_alpha
+                    drop=0.1,
+                    attn_drop=0.1,
+                    drop_path=drop_path_prob,
+                    act_layer=Swish,
+                    norm_layer=nn.LayerNorm
                 )
-                level.append(block)
-            curr_idx += depths[i]
+                blocks.append(block)
             
-            # Add downsampling if needed
-            if downsample is not None:
-                level.append(downsample)
+            self.transformer_levels.append(blocks)
             
-            self.levels.append(level)
+            # down-sampling except for the last level
+            if level_idx < len(depths) - 1:
+                # down-sampling by 2x2 conv
+                self.register_module(
+                    f'downsample_{level_idx}',
+                    nn.Sequential(
+                        nn.Conv2d(current_dim, self.dims[level_idx + 1], 
+                                kernel_size=3, stride=2, padding=1),
+                        nn.BatchNorm2d(self.dims[level_idx + 1]),
+                        Swish()
+                    )
+                )
         
-        # layers in final block.
-        # register a buffer of final feature map for CAM.
+        
+        # clsf heads      
         self.register_buffer('final_feature_map', torch.zeros(1))
         self.norm = nn.LayerNorm(self.dims[-1])
         self.avgpool = nn.AdaptiveAvgPool1d(1)
-        self.head = LoRALinear(
-            self.dims[-1], num_classes, r=r, 
-            lora_alpha=lora_alpha, enable_gate_residual=False)
-        self.lora_layers.append(self.head)
+        self.head = nn.Linear(self.dims[-1], num_classes)
         
-        
-        # Initialize weights
         self.apply(self._init_weights)
         trunc_normal_(self.pos_embed, std=.02)
         
-        # Collect all LoRA layers for CLR updates
-        self._collect_lora_layers()
-        
-        print(f"LoLA_hsViT initialized.")
+        print(f"StandardHSITransformer initialized successfully.")
 
     def _init_weights(self, m):
-        if isinstance(m, (nn.Linear, LoRALinear)):
-            if isinstance(m, LoRALinear):
-                trunc_normal_(m.linear.weight, std=.02)
-                if m.linear.bias is not None:
-                    nn.init.constant_(m.linear.bias, 0)
-            else:
-                trunc_normal_(m.weight, std=.02)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
         elif isinstance(m, (nn.LayerNorm, nn.BatchNorm2d, nn.BatchNorm3d)):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-            
-    def _collect_lora_layers(self):
-        """Collect all LoRA layers for CLR updates"""
-        self.lora_layers = []
-        for module in self.modules():
-            if isinstance(module, LoRALinear):
-                self.lora_layers.append(module)
 
     def freeze_all_but_lora(self):
-        # First, freeze everything
-        for p in self.parameters():
-            p.requires_grad_(False)
-
-        # Then, enable only LoRA adapter parameters (keep base linear frozen)
-        for module in self.modules():
-            if isinstance(module, LoRALinear):
-                module.linear.requires_grad_(False)
-                for p in module.lora_down.parameters():
-                    p.requires_grad_(True)
-                for p in module.lora_up.parameters():
-                    p.requires_grad_(True)
-                if hasattr(module, 'lora_gate'):
-                    for p in module.lora_gate.parameters():
-                        p.requires_grad_(True)
-                if hasattr(module, 'lora_residual'):
-                    for p in module.lora_residual.parameters():
-                        p.requires_grad_(True)
+        """
+        False name. This method actually freezes
+        all parameters except the cls head and norm layers.
+        """
+        # 冻除分类头外的所有参数
+        for name, param in self.named_parameters():
+            if 'head' not in name and 'norm' not in name:
+                param.requires_grad = False
 
     def merge_all_lora_into_linear(self):
-        for module in self.modules():
-            if isinstance(module, LoRALinear):
-                module.merge_into_linear_()
-                
-    def update_lora_scale(self, factor):
-        """Update scaling factor for all LoRA layers based on CLR cycle"""
-        for layer in self.lora_layers:
-            if hasattr(layer, 'set_cycle_factor'):
-                layer.set_cycle_factor(factor)
+        """
+        Null compatible with LoLA interface.
+        """
+        pass
 
     def generate_cam(self, class_idx=None):
         """
-        Generate Class Activation Map (CAM) for the last forward pass.
-        
-        Args:
-            class_idx: Index of target class (``None`` for all classes).
-        
-        Returns:
-            cam: Tensor of shape [B, num_classes, H, W] (or [B, 1, H, W] if ``class_idx`` is specified)
+        Return:
+            ``cam`` of [B, num_classes, H, W] or [B, 1, H, W] if class_idx
         """
-        # Get weights from classification head
-        weights = self.head.linear.weight  # [num_classes, C]
+        # weights of classification heads: [num_classes, C]
+        weights = self.head.weight  
         
-        # Feature map shape: [B, C, H, W]
+        # shape of last feat. map: [B, C, H, W]
         feature_map = self.final_feature_map
-        B, C_feat, H, W = feature_map.shape    # C_feat = feature channels(384).
-        C_weights, _ =weights.shape  # C_weights = num_classes(9).
+        B, C_feat, H, W = feature_map.shape
         
-        # Compute CAM: weights @ feature_map -> [B, num_classes, H, W]
-        cam = torch.einsum('kc, bchw -> bkhw', weights, feature_map)  # Matrix multiplication over channels
+        # CAM: weights @ feature_map -> [B, num_classes, H, W]
+        cam = torch.einsum('kc, bchw -> bkhw', weights, feature_map)
         
-        # Normalize CAM to [0, 1] per class
+        # norm to [0, 1]
         cam_min = cam.min(dim=-1, keepdim=True)[0].min(dim=-2, keepdim=True)[0]
         cam_max = cam.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0]
-        cam = (cam - cam_min) / (cam - cam_min + 1e-8)
+        cam = (cam - cam_min) / (cam_max - cam_min + 1e-8)
         
-        # Return specific class if requested.
         if class_idx is not None:
-            cam = cam[:, class_idx:class_idx+1]  # [B, 1, H, W]
+            cam = cam[:, class_idx:class_idx + 1]
+        
         return cam
 
     def forward_features(self, x):
+        """        
+        input shape: [B, C, H, W]
         """
-        Forward pass with proper tensor handling.
-        Expected input: [B, C, H, W] where C is the number of channels.
-        """
-        # FIXED: Handle input tensor properly for hyperspectral data
         if x.dim() == 4:  # [B, C, H, W]
             B, C, H, W = x.shape
-            # Reshape to add spectral dimension: [B, 1, C, H, W] for 3D conv
             x = x.unsqueeze(1)  # [B, 1, C, H, W]
-            
-        # Enhanced spectral processing with 3D convolution
+        
         x = self.spectral_conv(x)  # [B, dim, D, H, W]
-        
         x = self.band_dropout(x)
-        x = self.spectral_attention(x)  # Now uses adaptive attention
+        x = self.spectral_attention(x)
         
-        # Average over spectral dimension -> [B, dim, H, W]
+        # ave pooling to dim.C -> [B, dim, H, W]
         x = x.mean(dim=2)
         
-
-        # Patch embedding
         x = self.patch_embed(x)  # [B, dim, H/2, W/2]
         x = x.permute(0, 2, 3, 1)  # [B, H/2, W/2, dim]
         
-        # Add position embedding and dropout
         x = x + self.pos_embed
         x = self.pos_drop(x)
         
-        # Process through LoLA_hsViT backbone.
-        for i, level in enumerate(self.levels):
-            for j, block in enumerate(level):
-                if isinstance(block, EnhancedReduceSize):
-                    x = x.permute(0, 3, 1, 2)  # [B, C, H, W]
-                    x = block(x)
-                    x = x.permute(0, 2, 3, 1)  # [B, H, W, C]
-                else:
-                    x = block(x)
+        current_spatial_size = self.patch_resolution
         
-        # Final norm
+        for level_idx, blocks in enumerate(self.transformer_levels):
+            B, H, W, C = x.shape
+            
+            # reshape to [B, N, C]
+            x_seq = x.view(B, H * W, C)
+            
+            # block stacking
+            for block in blocks:
+                x_seq = block(x_seq)
+            
+            # reshape to [B, H, W, C]
+            x = x_seq.view(B, H, W, C)
+            
+            # downsampling except for the last level
+            if level_idx < len(self.transformer_levels) - 1:
+                # to [B, C, H, W] for downsampling
+                x_conv = x.permute(0, 3, 1, 2)
+                downsample = getattr(self, f'downsample_{level_idx}')
+                x_conv = downsample(x_conv)  # [B, 2*C, H/2, W/2]
+                
+                # to [B, H', W', 2*C]
+                x = x_conv.permute(0, 2, 3, 1)
+                current_spatial_size = current_spatial_size // 2
+        
+        # final norm
         B, H, W, C = x.shape
-        x = x.reshape(B, H * W, C)
+        x = x.view(B, H * W, C)
         x = self.norm(x)
 
-        # Reshape back to spatial dims as final feature map.
-        self.final_feature_map = x.reshape(B, H, W, C).permute(0, 3, 1, 2).detach()  # [B, C, H, W]
+        self.final_feature_map = x.view(B, H, W, C).permute(0, 3, 1, 2).detach()
+        
         return x
 
     def forward(self, x, pretrained_input=None, return_cam=False):
         """
-        FIXED: Forward pass with proper input validation for hyperspectral data
+        前向传播
+        
+        Args:
+            x: input [B, C, H, W]
+            pretrained_input: Optional pretrained input.
+            return_cam: if True, return CAM
+        
+        Return:
+            output: classification [B, num_classes]
+            or
+            (output, cam) if return_cam.
         """
-        # Validate input shape
         if x.dim() != 4:
-            raise ValueError(f"Expected 4D input [B, C, H, W], got {x.dim()}D tensor with shape {x.shape}")
+            raise ValueError(f"Expected 4D input [B, C, H, W], got {x.dim()}D tensor")
         
         B, C, H, W = x.shape
         
-        # Check if input channels match expected
         if C != self.in_channels:
             print(f"WARNING: Input has {C} channels, but model expects {self.in_channels}")
-            print("This might cause issues if the number of channels is significantly different.")
         
-        # Original LoLA_hsViT forward pass
         x = self.forward_features(x)
         
-        # Global pooling
+        # global ave pooling
         x = x.permute(0, 2, 1)  # [B, C, N]
-        x = self.avgpool(x)  # [B, C, 1]
-        x = x.flatten(1)  # [B, C]
+        x = self.avgpool(x)     # [B, C, 1]
+        x = x.flatten(1)        # [B, C]
         
-        # Original classification path (pretrained and cross-attention removed)
+        # classification head
         output = self.head(x)
-
+        
         if return_cam:
             cam = self.generate_cam()
             return output, cam
+        
         return output
 
+
 if __name__ == "__main__":
-    # Example usage and testing of the model and scheduler.
-    model = LoLA_hsViT(in_channels=15, num_classes=9, dim=96, depths=[3, 4, 5],
-                       num_heads=[4, 8, 16], window_size=[7, 7, 7], mlp_ratio=4.,
-                       drop_path_rate=0.2, spatial_size=15, r=16, lora_alpha=32)
+    model = CommonViT(
+        in_channels=15, 
+        num_classes=9, 
+        dim=96, 
+        depths=[3, 4, 5],
+        num_heads=[4, 8, 16], 
+        window_size=[7, 7, 7],
+        mlp_ratio=4.,
+        drop_path_rate=0.2, 
+        spatial_size=15, 
+        r=16, 
+        lora_alpha=32
+    )
     
-    # Create dummy input for testing
     dummy_input = torch.randn(2, 15, 15, 15)  # [B, C, H, W]
-    
-    # Test forward pass
     output = model(dummy_input)
-    print(f"Output shape: {output.shape}")  # Expected: [B, num_classes]
+    print(f"✓ Output shape: {output.shape}")  # Expected: [2, 9]
     
-    # Test CAM generation
     output_with_cam = model(dummy_input, return_cam=True)
     if isinstance(output_with_cam, tuple):
         output, cam = output_with_cam
-        print(f"CAM shape: {cam.shape}")  # Expected: [B, num_classes, H', W']
+        print(f"✓ CAM shape: {cam.shape}")  # Expected: [2, 9, H', W']
+    
+    model.freeze_all_but_lora()
+    print(f"✓ Model parameters frozen (except head and norm)")
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"✓ Total parameters: {total_params:,}")
+    print(f"✓ Trainable parameters: {trainable_params:,}")
