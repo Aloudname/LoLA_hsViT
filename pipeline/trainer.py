@@ -25,12 +25,12 @@ from torch.nn import Module
 from tqdm import tqdm
 from munch import Munch
 
-from pipeline.dataset import AbstractHyperspectralDataset
+from pipeline.dataset import AbstractHSDataset
 
 warnings.filterwarnings("ignore")
 
 
-class HyperspectralTrainer:
+class hsTrainer:
     """
     Trainer for hyperspectral dataset.
     """
@@ -38,18 +38,20 @@ class HyperspectralTrainer:
     def __init__(
         self,
         config: Munch = None,
-        dataLoader: AbstractHyperspectralDataset = None,
+        dataLoader: AbstractHSDataset = None,
         epochs: int = 20,
-        model_fn: Callable[..., Module] = None,
+        model: Callable[..., Module] = None,
         model_name: str = "model",
+        debug_mode: bool = False
     ):
         
         self.config = config
         self.dataLoader = dataLoader
         self.epochs = epochs
-        self.model_fn = model_fn
+        self.model = model
         self.model_name = model_name
         self.output = config.path.output
+        self.debug_mode = debug_mode
         
         os.makedirs(self.output, exist_ok=True)
         os.makedirs(os.path.join(self.output, 'CAM'), exist_ok=True)
@@ -99,7 +101,7 @@ class HyperspectralTrainer:
         print("Loading data and creating data loaders with:")
         try:
             self.train_loader, self.test_loader = self.dataLoader.create_data_loader(
-                num_workers=self.config.get('num_workers', 4)
+                num_workers=self.config.memory.num_workers,
             )
             print(f"  training set: {len(self.train_loader)} batches")
             print(f"  test set: {len(self.test_loader)} batches")
@@ -110,7 +112,7 @@ class HyperspectralTrainer:
         """create model and print parameter count"""
         print("Creating model with:")
         try:
-            self.model = self.model_fn()
+            self.model = self.model()
             self.model.to(self.device)
             
             # stats for model parameter count
@@ -127,8 +129,8 @@ class HyperspectralTrainer:
         print("Initializing training components with:")
         
         # Optimizer
-        lr = self.config.get('common', {}).get('lr', 1e-4)
-        weight_decay = self.config.get('common', {}).get('weight_decay', 1e-5)
+        lr = self.config.common.lr
+        weight_decay = self.config.common.weight_decay
         
         self.optimizer = optim.AdamW(
             self.model.parameters(),
@@ -138,10 +140,10 @@ class HyperspectralTrainer:
         print(f"  optimizer: AdamW (lr={lr}, weight_decay={weight_decay})")
         
         # lr scheduler (Cosine Annealing with Warm Restarts)
-        scheduler_config = self.config.get('common', {}).get('scheduler', {})
-        T_0 = scheduler_config.get('T_0', 10)
-        T_mult = scheduler_config.get('T_mult', 2)
-        eta_min = scheduler_config.get('eta_min', 1e-6)
+        scheduler_config = self.config.common.scheduler
+        T_0 = scheduler_config.T_0 if hasattr(scheduler_config, 'T_0') else 10
+        T_mult = scheduler_config.T_mult if hasattr(scheduler_config, 'T_mult') else 2
+        eta_min = scheduler_config.eta_min if hasattr(scheduler_config, 'eta_min') else 1e-6
         
         self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
@@ -152,22 +154,22 @@ class HyperspectralTrainer:
         print(f"  lr scheduler: CosineAnnealingWarmRestarts (T_0={T_0}, T_mult={T_mult}, eta_min={eta_min})")
         
         # loss function
-        label_smoothing = self.config.get('common', {}).get('label_smoothing', 0.1)
+        label_smoothing = self.config.common.label_smoothing if hasattr(self.config.common, 'label_smoothing') else 0.1
         self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         print(f"  loss function: CrossEntropyLoss (label_smoothing={label_smoothing})")
         
         # mixed precision training on GPU
-        use_amp = self.config.get('common', {}).get('use_amp', True) and self.device.type == 'cuda'
+        use_amp = self.config.common.use_amp and self.device.type == 'cuda'
         self.scaler = GradScaler() if use_amp else None
         self.use_amp = use_amp
         if use_amp:
             print(f"  mixed precision training enabled with GradScaler")
         
         # other hyperparameters
-        self.grad_clip = self.config.get('common', {}).get('grad_clip', 1.0)
-        self.warmup_epochs = self.config.get('common', {}).get('warmup_epochs', 5)
-        self.patience = self.config.get('common', {}).get('patience', 20)
-        self.eval_interval = self.config.get('common', {}).get('eval_interval', 1)
+        self.grad_clip = self.config.common.grad_clip if hasattr(self.config.common, 'grad_clip') else 1.0
+        self.warmup_epochs = self.config.common.warmup_epochs if hasattr(self.config.common, 'warmup_epochs') else 5
+        self.patience = self.config.common.patience if hasattr(self.config.common, 'patience') else 20
+        self.eval_interval = self.config.common.eval_interval if hasattr(self.config.common, 'eval_interval') else 1
 
     
     def train_epoch(self, epoch: int) -> Tuple[float, float]:
@@ -184,7 +186,7 @@ class HyperspectralTrainer:
         # lr warm-up
         if epoch < self.warmup_epochs:
             warmup_factor = (epoch + 1) / self.warmup_epochs
-            lr = self.config.get('common', {}).get('lr', 1e-4) * warmup_factor
+            lr = self.config.common.lr * warmup_factor
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lr
         
@@ -262,7 +264,7 @@ class HyperspectralTrainer:
         predictions = []
         targets = []
         
-        eval_batch_size = self.config.get('common', {}).get('eval_batch_size', 64)
+        eval_batch_size = self.config.common.eval_batch_size if hasattr(self.config.common, 'eval_batch_size') else 64
         if self.device.type == 'cpu':
             eval_batch_size = min(eval_batch_size, 16)
         
@@ -270,7 +272,7 @@ class HyperspectralTrainer:
             self.test_loader.dataset,
             batch_size=eval_batch_size,
             shuffle=False,
-            num_workers=self.config.get('num_workers', 4),
+            num_workers=self.config.memory.num_workers,
             pin_memory=False
         )
         
@@ -304,7 +306,7 @@ class HyperspectralTrainer:
         
         return loss, acc, kappa, predictions, targets
     
-    def train(self, debug_mode: bool = False) -> Dict[str, float]:
+    def train(self) -> Dict[str, float]:
         """
         training for epochs.
         
@@ -315,6 +317,8 @@ class HyperspectralTrainer:
             Dict[``str``, ``float``] of final results.
         """
         print(f"\n{'='*60}")
+        if self.debug_mode:
+            print(f"Debug mode enabled: CAM and Eval enabled every epoch.")
         print(f"Training ({self.model_name})")
         print(f"{'='*60}\n")
         
@@ -329,7 +333,7 @@ class HyperspectralTrainer:
             # validating
             should_eval = ((epoch + 1) % self.eval_interval == 0) or (epoch + 1 == self.epochs)
             
-            if should_eval:
+            if should_eval or self.debug_mode:
                 eval_loss, eval_acc, kappa, pred, target = self.evaluate()
                 self.eval_losses.append(eval_loss)
                 self.eval_accs.append(eval_acc)
@@ -359,7 +363,7 @@ class HyperspectralTrainer:
                 print(f"[Epoch {epoch+1:3d}] Train Loss: {train_loss:.4f} Acc: {train_acc:6.2f}%", end='')
             
             # generate CAM for debug mode or every 5 epochs
-            if debug_mode or (should_eval and (epoch + 1) % 5 == 0):
+            if self.debug_mode or (should_eval and (epoch + 1) % 5 == 0):
                 try:
                     self._generate_cam(epoch)
                 except Exception as e:
@@ -391,7 +395,7 @@ class HyperspectralTrainer:
             'final_accuracy': final_acc,
             'final_kappa': final_kappa,
             'training_time': training_time,
-            'model_path': os.path.join(self.output_dir, 'models', f'{self.model_name}_best.pth')
+            'model_path': os.path.join(self.output, 'models', f'{self.model_name}_best.pth')
         }
         
         return results
@@ -454,7 +458,7 @@ class HyperspectralTrainer:
             plt.suptitle(f'Epoch {epoch+1} - Sample Visualization', fontsize=14, fontweight='bold')
             plt.tight_layout()
             
-            cam_path = os.path.join(self.output_dir, 'CAM', f'epoch_{epoch+1:03d}.png')
+            cam_path = os.path.join(self.output, 'CAM', f'epoch_{epoch+1:03d}.png')
             plt.savefig(cam_path, dpi=100, bbox_inches='tight')
             plt.close()
             
@@ -490,7 +494,7 @@ class HyperspectralTrainer:
         axes[1].grid(True, alpha=0.3)
         
         plt.tight_layout()
-        path = os.path.join(self.output_dir, 'training_curves.png')
+        path = os.path.join(self.output, 'training_curves.png')
         plt.savefig(path, dpi=150, bbox_inches='tight')
         plt.close()
         print(f"  Curve saved to {path}")
@@ -516,7 +520,7 @@ class HyperspectralTrainer:
         plt.colorbar(im, ax=ax)
         plt.tight_layout()
         
-        path = os.path.join(self.output_dir, 'confusion_matrix.png')
+        path = os.path.join(self.output, 'confusion_matrix.png')
         plt.savefig(path, dpi=150, bbox_inches='tight')
         plt.close()
         print(f"  Confusion matrix saved to {path}")
@@ -553,11 +557,11 @@ class HyperspectralTrainer:
         if self.best_model_state is None:
             return
         
-        model_path = os.path.join(self.output_dir, 'models', f'{self.model_name}_best.pth')
+        model_path = os.path.join(self.output, 'models', f'{self.model_name}_best.pth')
         torch.save(self.best_model_state['model_state'], model_path)
     
     def load_best_model(self) -> Module:
-        model_path = os.path.join(self.output_dir, 'models', f'{self.model_name}_best.pth')
+        model_path = os.path.join(self.output, 'models', f'{self.model_name}_best.pth')
         if os.path.exists(model_path):
             self.model.load_state_dict(torch.load(model_path, map_location=self.device))
             print(f"  Loaded best model from: {model_path}")

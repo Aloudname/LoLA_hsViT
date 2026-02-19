@@ -34,7 +34,8 @@ def check_form(config: Munch = None) -> bool:
     return True
     # Add more checks as needed
 
-config = load_config()
-common = config.common
-memory = config.memory
-check_form(config)
+if __name__ == "__main__":
+    config = load_config('config.yaml')
+    common = config.common
+    memory = config.memory
+    check_form(config)

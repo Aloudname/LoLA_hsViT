@@ -38,8 +38,8 @@ class SwiGLU(nn.Module):
         gate = F.silu(self.w1(x))
         return self.W(self.drop(gate * self.w2(x)))
 
-# Enhanced LoRA Linear Layer with gating and residual mechanisms
-class EnhancedLoRALinear(nn.Module):
+# LoRA Linear Layer with gating and residual mechanisms
+class LoRALinear(nn.Module):
     r"""
     Block conducts low rank adaptation(LoRA) for param efficient fine-tuning (PEFT).
     Can be used to replace standard linear layers as enhanced ones in models.
@@ -203,7 +203,7 @@ class BandDropout(nn.Module):
         return x
 
 # Local(Window) Attention with LoRA-replace and relative position bias.
-class EnhancedPEFTWindowAttention(nn.Module):
+class PEFTWindowAttention(nn.Module):
     r"""
         Describes a window-based multi-head self attention (W-MSA) module.
         
@@ -238,10 +238,10 @@ class EnhancedPEFTWindowAttention(nn.Module):
         self.scale = qk_scale or head_dim ** -0.5
 
         # Linear layer for QKV generation replaced by LoRA.
-        self.qkv = EnhancedLoRALinear(dim, dim * 3, r=r, lora_alpha=lora_alpha, bias=qkv_bias)
+        self.qkv = LoRALinear(dim, dim * 3, r=r, lora_alpha=lora_alpha, bias=qkv_bias)
         
         # Linear layer for output generation replaced by LoRA.
-        self.proj = EnhancedLoRALinear(dim, dim, r=r, lora_alpha=lora_alpha)
+        self.proj = LoRALinear(dim, dim, r=r, lora_alpha=lora_alpha)
         
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -305,13 +305,13 @@ class EnhancedPEFTWindowAttention(nn.Module):
         return x
 
 # Enhanced PEFT LoLA_hsViT Block.
-class EnhancedPEFTLoLA_hsViTBlock(nn.Module):
+class PEFTLoLA_hsViTBlock(nn.Module):
     r"""
         Core block of the model with residual-like structure.
         
         This block contains:
               - LayerNorm layers for normalization.
-              - Enhanced MLP with LoRA as stick-and-stuff layer.
+              - MLP with LoRA as stick-and-stuff layer.
               - residual-like connections and DropPath for regularization.
               - Local window attention with LoRA and relative position bias.
         Takes input ``x`` of [B, H, W, C], outputs same shape.
@@ -349,7 +349,7 @@ class EnhancedPEFTLoLA_hsViTBlock(nn.Module):
         self.norm2 = norm_layer(dim)
         
         # Local attention with LoRA and relative position bias.
-        self.attn = EnhancedPEFTWindowAttention(
+        self.attn = PEFTWindowAttention(
             dim, num_heads=num_heads, window_size=window_size,
             qkv_bias=qkv_bias, qk_scale=qk_scale,
             attn_drop=attn_drop, proj_drop=drop,
@@ -359,12 +359,12 @@ class EnhancedPEFTLoLA_hsViTBlock(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         mlp_hidden_dim = int(dim * mlp_ratio)
         
-        # Enhanced MLP with LoRA as stick-and-stuff layer.
+        # MLP with LoRA as stick-and-stuff layer.
         self.mlp = nn.Sequential(
-            EnhancedLoRALinear(dim, mlp_hidden_dim, r=r, lora_alpha=lora_alpha),
+            LoRALinear(dim, mlp_hidden_dim, r=r, lora_alpha=lora_alpha),
             SwiGLU(mlp_hidden_dim, mlp_hidden_dim, mlp_hidden_dim),
             nn.Dropout(drop),
-            EnhancedLoRALinear(mlp_hidden_dim, dim, r=r, lora_alpha=lora_alpha),
+            LoRALinear(mlp_hidden_dim, dim, r=r, lora_alpha=lora_alpha),
             nn.Dropout(drop)
         )
 
@@ -618,7 +618,7 @@ class LoLA_hsViT(nn.Module):
             # Create blocks for current LEVEL.
             level = nn.ModuleList()
             for j in range(depths[i]):
-                block = EnhancedPEFTLoLA_hsViTBlock(
+                block = PEFTLoLA_hsViTBlock(
                     dim=self.dims[i],
                     num_heads=num_heads[i],
                     window_size=window_size[i],
@@ -646,7 +646,7 @@ class LoLA_hsViT(nn.Module):
         self.register_buffer('final_feature_map', torch.zeros(1))
         self.norm = nn.LayerNorm(self.dims[-1])
         self.avgpool = nn.AdaptiveAvgPool1d(1)
-        self.head = EnhancedLoRALinear(
+        self.head = LoRALinear(
             self.dims[-1], num_classes, r=r, 
             lora_alpha=lora_alpha, enable_gate_residual=False)
         self.lora_layers.append(self.head)
@@ -662,8 +662,8 @@ class LoLA_hsViT(nn.Module):
         print(f"LoLA_hsViT initialized.")
 
     def _init_weights(self, m):
-        if isinstance(m, (nn.Linear, EnhancedLoRALinear)):
-            if isinstance(m, EnhancedLoRALinear):
+        if isinstance(m, (nn.Linear, LoRALinear)):
+            if isinstance(m, LoRALinear):
                 trunc_normal_(m.linear.weight, std=.02)
                 if m.linear.bias is not None:
                     nn.init.constant_(m.linear.bias, 0)
@@ -679,7 +679,7 @@ class LoLA_hsViT(nn.Module):
         """Collect all LoRA layers for CLR updates"""
         self.lora_layers = []
         for module in self.modules():
-            if isinstance(module, EnhancedLoRALinear):
+            if isinstance(module, LoRALinear):
                 self.lora_layers.append(module)
 
     def freeze_all_but_lora(self):
@@ -689,7 +689,7 @@ class LoLA_hsViT(nn.Module):
 
         # Then, enable only LoRA adapter parameters (keep base linear frozen)
         for module in self.modules():
-            if isinstance(module, EnhancedLoRALinear):
+            if isinstance(module, LoRALinear):
                 module.linear.requires_grad_(False)
                 for p in module.lora_down.parameters():
                     p.requires_grad_(True)
@@ -704,7 +704,7 @@ class LoLA_hsViT(nn.Module):
 
     def merge_all_lora_into_linear(self):
         for module in self.modules():
-            if isinstance(module, EnhancedLoRALinear):
+            if isinstance(module, LoRALinear):
                 module.merge_into_linear_()
                 
     def update_lora_scale(self, factor):
@@ -822,89 +822,6 @@ class LoLA_hsViT(nn.Module):
             cam = self.generate_cam()
             return output, cam
         return output
-
-# LoRA Cyclic Learning Rate Scheduler.
-class LoRACLRScheduler:
-    r"""
-    Cyclical learning rate scheduler for optimizing LoRA parameters.
-    This optimizer separates lr scaling factors for LoRA and other parameters.
-
-    Scheduler features:
-        - Periodic lr with an initial cycle length ``T_0``, each cycle length increases by ``T_mult``.
-        - Each cycle, lr decays from the initial value to the minimum ``eta_min`` following a ``cos``.
-        - Additionally scaling lr of LoRA params by ``lora_lr_scale``, typically > 1 for faster convergence.
-    """
-
-    def __init__(self, optimizer, T_0=10, T_mult=2, eta_min=1e-6, lora_lr_scale=2.0):
-        """
-        :param optimizer: optimizer instances.
-        :param T_0: initial cycle length for each epoch.
-        :param T_mult: factor of cycle length, for exponential growth of lr cycles.
-        :param eta_min: limit the minimum of lr.
-        :param lora_lr_scale: factor of LoRA params. Note to be > 1.
-        """
-        self.optimizer = optimizer
-        self.T_0 = T_0
-        self.T_mult = T_mult
-        self.eta_min = eta_min
-        self.lora_lr_scale = lora_lr_scale
-        self.T_cur = 0
-        self.T_i = T_0
-        
-        # Store initial learning rates for each parameter group
-        self.initial_lrs = []
-        for param_group in optimizer.param_groups:
-            self.initial_lrs.append(param_group['lr'])
-
-    def step(self, epoch=None):
-        # Calculate cosine annealing learning rate
-        if self.T_cur == self.T_i:
-            self.T_cur = 0
-            self.T_i *= self.T_mult
-        
-        # Update learning rates for different parameter groups
-        for i, param_group in enumerate(self.optimizer.param_groups):
-            initial_lr = self.initial_lrs[i]
-            
-            # Calculate cosine annealing
-            cos_factor = (1 + math.cos(math.pi * self.T_cur / self.T_i)) / 2
-            
-            if 'lora' in param_group.get('name', ''):
-                # Higher learning rate for LoRA parameters
-                param_group['lr'] = self.eta_min + (initial_lr - self.eta_min) * cos_factor * self.lora_lr_scale
-            else:
-                # Standard learning rate for other parameters
-                param_group['lr'] = self.eta_min + (initial_lr - self.eta_min) * cos_factor
-        
-        self.T_cur += 1
-    
-    def state_dict(self):
-        r"""
-        Save the scheduler's state dict.
-        Returns a dict containing current cycle info, lr parameters & initial lr.
-        """
-        return {
-            'T_cur': self.T_cur,
-            'T_i': self.T_i,
-            'T_0': self.T_0,
-            'T_mult': self.T_mult,
-            'eta_min': self.eta_min,
-            'lora_lr_scale': self.lora_lr_scale,
-            'initial_lrs': self.initial_lrs
-        }
-    
-    def load_state_dict(self, state_dict):
-        r"""
-        Load the scheduler state from a state dict.
-        Dict is read for resuming training state.
-        """
-        self.T_cur = state_dict['T_cur']
-        self.T_i = state_dict['T_i']
-        self.T_0 = state_dict['T_0']
-        self.T_mult = state_dict['T_mult']
-        self.eta_min = state_dict['eta_min']
-        self.lora_lr_scale = state_dict['lora_lr_scale']
-        self.initial_lrs = state_dict['initial_lrs']
 
 if __name__ == "__main__":
     # Example usage and testing of the model and scheduler.

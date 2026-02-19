@@ -10,7 +10,7 @@ from typing import Tuple, Dict, Any, Optional, List
 from sklearn.model_selection import train_test_split
 
 
-class AbstractHyperspectralDataset(ABC, Dataset):
+class AbstractHSDataset(ABC, Dataset):
     """
     Abstract Base Class for different types of hyperspectral data.
     Inherited from ``torch.utils.data.Dataset``, ``torch.DataLoader`` compatible.
@@ -285,7 +285,7 @@ class AbstractHyperspectralDataset(ABC, Dataset):
         return torch.FloatTensor(patch), torch.LongTensor([label]).squeeze()
 
 
-class MatHyperspectralDataset(AbstractHyperspectralDataset):
+class MatHSDataset(AbstractHSDataset):
     """
     Hyperspectral dataset loader for .mat file format.
     
@@ -417,7 +417,7 @@ class MatHyperspectralDataset(AbstractHyperspectralDataset):
         )
         return train_loader, test_loader
 
-class TiffHyperspectralDataset(AbstractHyperspectralDataset):
+class TiffHSDataset(AbstractHSDataset):
     """
     Hyperspectral dataset loader for TIFF file format.
     
@@ -564,7 +564,7 @@ if __name__ == "__main__":
         
         from config import load_config
         config = load_config()
-        dataset = MatHyperspectralDataset(config=config)
+        dataset = MatHSDataset(config=config)
         train_loader, test_loader = dataset.create_data_loader(num_workers=0)
         
         # Print dataset info
