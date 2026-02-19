@@ -2,6 +2,7 @@
 ## 概览
 
 `HyperspectralTrainer` for highlighting the superiority of LoLA-hsViT over common ViT.
+
 毕业设计用, LoLA-hsViT的本地部署部分
 ---
 ## 工作结构
