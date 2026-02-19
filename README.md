@@ -39,14 +39,28 @@ LoLA_hsViT/
 
 ```
 output/
-├── models/
-│   └── {model_name}_best.pth          # 最优模型权重
-├── CAM/
-│   ├── epoch_001.png
-│   ├── epoch_005.png
-│   └── ...
-├── training_curves.png                # 训练/验证曲线
-└── confusion_matrix.png                # 混淆矩阵
+│
+├── model_A/
+│   ├── models/
+│   │   └── best_epoch.pth
+│   ├── CAM/
+│   │   ├── epoch_010.png
+│   │   ├── epoch_015.png
+│   │   ├── best_result.png
+│   │   └── ...
+│   ├── training_curves.png
+│   └── confusion_matrix.png
+├── model_B/
+│   ├── models/
+│   │   └── best_epoch.pth
+│   ├── CAM/
+│   │   ├── epoch_010.png
+│   │   ├── epoch_015.png
+│   │   ├── best_result.png
+│   │   └── ...
+│   ├── training_curves.png
+│   └── confusion_matrix.png
+└── ...
 ```
 
 ---
