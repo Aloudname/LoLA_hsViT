@@ -45,15 +45,16 @@ def main():
             print(f"  {key:20s}: {value}")
     
     # trainer2
-    # trainer2 = HyperspectralTrainer(
-    #     config=config,
-    #     dataLoader=dataLoader,
-    #     epochs=50,
-    #     model_fn=lambda: SimpleViT(num_classes=9),
-    #     model_name='SimpleViT',
-    #     output_dir='./output/hsi_vit'
-    # )
-    # results2 = trainer2.train()
+    trainer2 = hsTrainer(
+        config=config,
+        dataLoader=dataLoader,
+        epochs=50,
+        model_fn=lambda: CommonViT(),
+        model_name='CommonViT',
+        debug_mode=parser.parse_args().debug
+    )
+    
+    results2 = trainer2.train()
 
 
 if __name__ == "__main__":

@@ -50,8 +50,8 @@ class hsTrainer:
         self.epochs = epochs
         self.model = model
         self.model_name = model_name
-        self.output = config.path.output
         self.debug_mode = debug_mode
+        self.output = self.config.path.output + f'/{self.model_name}'
         
         os.makedirs(self.output, exist_ok=True)
         os.makedirs(os.path.join(self.output, 'CAM'), exist_ok=True)
