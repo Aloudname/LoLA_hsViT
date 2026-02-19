@@ -1,0 +1,53 @@
+# configuration of model hyperparams in training.py
+common:
+  dataset_name: 'placeholder'
+  lr: 2e-5
+  weight_decay: 0.01
+  eval_interval: 5  # Evaluate every x epoch
+  label_smoothing: 0.1
+  patience: 15  # More patience for CPU training
+  use_wandb: false  # Disabled by default for stability
+  scheduler:
+    T_0: 10  # Shorter warm restarts
+    T_mult: 2
+    eta_min: 1e-6
+  warmup_epochs: 5  # Reduced warmup
+  grad_clip: 0.5  # mixed precision settings
+  fast_eval: true  # Evaluate on full test set during training
+  gradient_accumulation_steps: 2  # Reduced for CPU training
+lora:
+  lora_dropout: 0.2
+  lora_rank: 16
+  lora_alpha: 32
+  merge_lora_for_inference: false
+split:
+  test_rate: 0.2 # 0.2 default.
+  batch_size: 32  # Reduced batch size for CPU training
+  patch_size: 31  # Pixel size of image patches.
+  eval_batch_size: 32  # Smaller eval batch size for CPU training
+preprocess:
+  pca_components: 15  # Number of PCA components to retain.
+memory:
+  use_amp: true  # disable for CPU.
+  pin_memory: false  # pin weights in memory down.
+  num_workers: 2  # multi-processor settings.
+  max_workers: 4
+path:
+  data: '/data/chenhaoran/WHUhypspec/data/WHU-Hi-LongKou.mat'
+  label: '/data/chenhaoran/WHUhypspec/data/WHU-Hi-LongKou_gt.mat'
+  output: '/home/chenhaoran/LoLA-hsViT/outputs'
+key: # keys to access data and label in .mat files.
+  data: 'hyperspectral_data'
+  label: 'hyperspectral_data'
+clsf:
+  num: 9
+  targets:
+    - 'Corn'
+    - 'Cotton'
+    - 'Sesame'
+    - 'Broad-leaf soybean'
+    - 'Narrow-leaf soybean'
+    - 'Rice'
+    - 'Water'
+    - 'Roads and houses'
+    - 'Mixed weed'
