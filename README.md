@@ -53,9 +53,9 @@ output/
 ### bugs
 - ``patch_size``与位置嵌入``pos_embed``维度不匹配
 ```
-   因: pos_embed由固定参数传入
-        File "./model/lola_vit.py", line 773, in ``forward_features``:
-            x = x + self.pos_embed
+因: pos_embed由固定参数传入
+    File "./model/lola_vit.py", line 773, in ``forward_features``:
+        x = x + self.pos_embed
 RuntimeError: The size of tensor a: x (15) must match the size of tensor b:  pos_embed (7) at non-singleton dimension 2.
 ```
 - config作为参数冗余传入多个层(LoLA-hsViT, MAThsDataLoader)
