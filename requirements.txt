@@ -59,6 +59,7 @@ mypy_extensions==1.1.0
 nest_asyncio @ file:///home/conda/feedstock_root/build_artifacts/nest-asyncio_1733325553580/work
 networkx @ file:///croot/networkx_1717597493534/work
 numpy==1.26.4
+nvidia-ml-py==13.590.48
 opencv-python==4.5.4.60
 opencv-python-headless==4.13.0.92
 packaging @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_packaging_1769093650/work
@@ -80,6 +81,7 @@ pydantic==2.12.5
 pydantic_core==2.41.5
 pyflakes==3.4.0
 Pygments @ file:///home/conda/feedstock_root/build_artifacts/pygments_1750615794071/work
+pynvml==13.0.1
 pyparsing==3.3.2
 PySocks @ file:///home/task_176175233246416/conda-bld/pysocks_1761753011536/work
 pytest==8.4.2
