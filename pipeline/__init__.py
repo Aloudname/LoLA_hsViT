@@ -1,5 +1,6 @@
-from pipeline.dataset import (AbstractHSDataset, MatHSDataset)
+from pipeline.dataset import (AbstractHSDataset,
+                              MatHSDataset, NpyHSDataset)
 from pipeline.trainer import hsTrainer
 
 __all__ = ['AbstractHSDataset',
-           'MatHSDataset', 'hsTrainer']
+           'MatHSDataset', 'NpyHSDataset', 'hsTrainer']

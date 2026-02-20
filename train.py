@@ -7,7 +7,7 @@ Run training with:
 import argparse
 from config import load_config
 from pipeline import hsTrainer
-from pipeline import MatHSDataset
+from pipeline import NpyHSDataset
 from model import Unet, CommonViT, LoLA_hsViT
 
 
@@ -26,7 +26,7 @@ def main():
     parser.add_argument('--debug', '-d', type=bool, default=False)
     config = load_config()
     
-    dataLoader = MatHSDataset(config=config, transform=None)
+    dataLoader = NpyHSDataset(config=config, transform=None)
     
     trainer = hsTrainer(
         config=config,
@@ -49,13 +49,17 @@ def main():
         config=config,
         dataLoader=dataLoader,
         epochs=50,
-        model_fn=lambda: CommonViT(),
+        model=lambda: CommonViT(),
         model_name='CommonViT',
         debug_mode=parser.parse_args().debug
     )
     
     results2 = trainer2.train()
-
+    for key, value in results2.items():
+        if isinstance(value, float):
+            print(f"  {key:20s}: {value:8.4f}")
+        else:
+            print(f"  {key:20s}: {value}")
 
 if __name__ == "__main__":
     main()

@@ -1,6 +1,7 @@
 # dataset.py - Hyperspectral Dataset Handling.
 # todo:
 # - Implement class distribution analysis and visualization methods.
+import os
 import torch
 import numpy as np
 from munch import Munch
@@ -284,6 +285,149 @@ class AbstractHSDataset(ABC, Dataset):
         
         return torch.FloatTensor(patch), torch.LongTensor([label]).squeeze()
 
+class NpyHSDataset(AbstractHSDataset):
+    """
+    Hyperspectral dataloader for .npy file format.
+    
+    There are a bunch of sample couple of patients in dir, in the form of:
+    - data/processed_npy_64_norm/
+        - Patient1_20250213_LU.npy
+        - Patient1_20250213_LU_gt.npy
+        - Patient1_20250213_RD.npy
+        - Patient1_20250213_RD_gt.npy
+        - Patient2_20250213_LU.npy
+        - Patient2_20250213_LU_gt.npy
+        - ...
+        Each patient may conclude many directions, LU(left-upper), RD, RU, LD, RUD etc.
+        Each direction of each patient has a pair of .npy files: one for hyperspectral data and one for labels.
+        Read them in pairs, and create a dataset for each pair. Then concatenate all datasets together to form the final dataset.
+    """
+    def __init__(self, 
+                 config: Munch = None,
+                 transform: Optional[Any] = None,
+                  **kwargs: Any) -> None:
+        """
+        Initialize a NumPy format hyperspectral dataset.
+        
+        See parent class for parameters.
+        """
+        super().__init__(config, transform, **kwargs)
+        self.data_path = config.path.data
+    
+    
+    def _pair_data_and_labels(self) -> List[Tuple[str, str]]:
+        """
+        Pair data and label files based on naming convention.
+        
+        Returns:
+            List of tuples containing (data_file, label_file) paths
+        """
+        
+        all_files = os.listdir(self.data_path)
+        
+        # Filter for .npy files and pair them
+        data_files = [f for f in all_files if f.endswith('.npy') and not f.endswith('_gt.npy')]
+        label_files = [f for f in all_files if f.endswith('_gt.npy')]
+        
+        pairs = []
+        for data_file in data_files:
+            base_name = data_file[:-4]  # Remove .npy extension
+            label_file = base_name + '_gt.npy'
+            if label_file in label_files:
+                pairs.append((os.path.join(self.data_path, data_file), os.path.join(self.data_path, label_file)))
+            else:
+                print(f"Warning: No label file found for {data_file}")
+        return pairs
+    
+    def _load_data(self) -> None:
+        """Load data from .npy files and concatenate them"""
+        pairs = self._pair_data_and_labels()
+        
+        data_list = []
+        label_list = []
+        
+        for data_file, label_file in pairs:
+            data = np.load(data_file)
+            labels = np.load(label_file)
+            
+            # Validate shapes
+            if data.shape[:2] != labels.shape[:2]:
+                raise ValueError(f"Shape mismatch between {data_file} and {label_file}")
+            
+            data_list.append(data)
+            label_list.append(labels)
+        
+        # Concatenate all data and labels
+        self.raw_data = np.concatenate(data_list, axis=0)  # data shape (H, W, C)
+        self.raw_labels = np.concatenate(label_list, axis=0)  # label shape (H, W)
+        
+        print(f"Loaded {len(pairs)} pairs of .npy files")
+        print(f"Concatenated data shape: {self.raw_data.shape}, labels shape: {self.raw_labels.shape}")
+        
+    def _preprocess_data(self) -> None:
+        """Preprocess data with normalization and optional PCA"""
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import StandardScaler
+        
+        # Reshape data for PCA (flatten spatial dimensions)
+        h, w, c = self.raw_data.shape
+        flat_data = self.raw_data.reshape(-1, c)
+        
+        # Handle outliers and normalization
+        scaler = StandardScaler()
+        scaled_data = scaler.fit_transform(flat_data)
+        
+        # Apply PCA if specified
+        if self.pca_component and self.pca_component < c:
+            pca = PCA(n_components=self.pca_component, random_state=42)
+            pca_data = pca.fit_transform(scaled_data)
+            self.processed_data = pca_data.reshape(h, w, self.pca_component)
+            print(f"Applied PCA: reduced from {c} to {self.pca_component} components")
+        else:
+            self.processed_data = scaled_data.reshape(h, w, c)
+            print("PCA not applied, using all original components")
+            
+    def create_data_loader(self, num_workers=0):
+        """Create a PyTorch DataLoader for the dataset"""
+
+        x_pca = self.processed_data  # (H, W, C)
+        y = self.raw_labels  # (H, W)
+        
+        print('Hyperspectral data shape after PCA: ', x_pca.shape)
+        print('Label shape: ', y.shape)
+        print('Original label range:', np.min(y), 'to', np.max(y))
+        print('Unique labels:', np.unique(y))
+        
+        x_patches, y_all = self._create_cube(x_pca, y, windowSize=self.patch_size)
+        print('Data cube X shape: ', x_patches.shape)
+        print('Processed label range:', np.min(y_all), 'to', np.max(y_all))
+        print('Unique processed labels:', np.unique(y_all))
+        
+        Xtrain, Xtest, ytrain, ytest = self.splitTrainTestDataset(x_patches, y_all, randomState=350234)
+        print('Xtrain shape: ', Xtrain.shape)
+        print('Xtest shape: ', Xtest.shape)
+        
+        X = x_patches.reshape(-1, self.patch_size, self.patch_size, self.processed_data.shape[2], 1)
+        Xtrain = Xtrain.reshape(-1, self.patch_size, self.patch_size, self.pca_components, 1)
+        Xtest = Xtest.reshape(-1, self.patch_size, self.patch_size, self.pca_components, 1)
+        
+        X = X.transpose(0, 4, 3, 1, 2).squeeze(1)
+        Xtrain = Xtrain.transpose(0, 4, 3, 1, 2).squeeze(1)
+        Xtest = Xtest.transpose(0, 4, 3, 1, 2).squeeze(1)
+        
+        # temp container.
+        trainset = container(Xtrain, ytrain)
+        testset = container(Xtest, ytest)
+        
+        pin_memory=self.pin_memory
+
+        train_loader = torch.utils.data.DataLoader(
+            trainset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory
+        )
+        test_loader = torch.utils.data.DataLoader(
+            testset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory
+        )
+        return train_loader, test_loader
 
 class MatHSDataset(AbstractHSDataset):
     """
@@ -564,21 +708,21 @@ if __name__ == "__main__":
         
         from config import load_config
         config = load_config()
-        dataset = MatHSDataset(config=config)
-        train_loader, test_loader = dataset.create_data_loader(num_workers=0)
+        # dataset = MatHSDataset(config=config)
+        # train_loader, test_loader = dataset.create_data_loader(num_workers=0)
         
-        # Print dataset info
-        pca_components = config.preprocess.pca_components
-        print(f"Dataset loaded with {len(train_loader.dataset)} training samples and {len(test_loader.dataset)} test samples")
-        print(f"Patch size: {config.split.patch_size}x{config.split.patch_size}")
-        print(f"Number of classes: {dataset.num}")
-        print(f"Class distribution in training set: {dataset.get_class_distribution()}")
-        print(f"Class distribution in test set: {dataset.get_class_distribution()}")
+        # # Print dataset info
+        # pca_components = config.preprocess.pca_components
+        # print(f"Dataset loaded with {len(train_loader.dataset)} training samples and {len(test_loader.dataset)} test samples")
+        # print(f"Patch size: {config.split.patch_size}x{config.split.patch_size}")
+        # print(f"Number of classes: {dataset.num}")
+        # print(f"Class distribution in training set: {dataset.get_class_distribution()}")
+        # print(f"Class distribution in test set: {dataset.get_class_distribution()}")
         
-        # Print sample shapes
-        sample_hyperspectral, sample_pretrained_input, sample_label = train_loader.dataset[0]
-        print(f"Sample hyperspectral data shape: {sample_hyperspectral.shape}")
+        # # Print sample shapes
+        # sample_hyperspectral, sample_pretrained_input, sample_label = train_loader.dataset[0]
+        # print(f"Sample hyperspectral data shape: {sample_hyperspectral.shape}")
         
-        print(f"Sample pretrained input shape: {sample_pretrained_input.shape}")
-        print(f"Sample label: {sample_label.item()}")
+        # print(f"Sample pretrained input shape: {sample_pretrained_input.shape}")
+        # print(f"Sample label: {sample_label.item()}")
     

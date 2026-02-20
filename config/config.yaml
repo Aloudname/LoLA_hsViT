@@ -34,21 +34,21 @@ memory:
   num_workers: 2  # multi-processor settings.
   max_workers: 4
 path:
-  data: '/data/chenhaoran/WHUhypspec/data/WHU-Hi-LongKou.mat'
-  label: '/data/chenhaoran/WHUhypspec/data/WHU-Hi-LongKou_gt.mat'
-  output: '/home/chenhaoran/LoLA_hsViT/outputs'
+  data: /data/xjz/houCT/CRCFound-main/dinov3-main/dinov3/data/processed_npy_64_norm
+  label: /data/xjz/houCT/CRCFound-main/dinov3-main/dinov3/data/processed_npy_64_norm
+  output: /home/chenhaoran/LoLA_hsViT/outputs
 key: # keys to access data and label in .mat files.
   data: 'hyperspectral_data'
   label: 'hyperspectral_data'
 clsf:
   num: 9
   targets:
-    - 'Corn'
-    - 'Cotton'
-    - 'Sesame'
-    - 'Broad-leaf soybean'
-    - 'Narrow-leaf soybean'
-    - 'Rice'
-    - 'Water'
-    - 'Roads and houses'
-    - 'Mixed weed'
+    - 'BG'   # Background
+    - 'PG'   # ⭐Parathyroid gland
+    - 'FAT'
+    - 'TG'   # ⭐Thyroid gland
+    - 'LN'   # Lymph Node
+    - 'MS'   # Muscle
+    - 'Blood'
+    - 'Tra'  # Trachea
+    - 'ES'   # Esophagus
