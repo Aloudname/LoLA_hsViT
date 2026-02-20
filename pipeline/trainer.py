@@ -97,11 +97,13 @@ class hsTrainer:
         os.environ['MKL_NUM_THREADS'] = '4'
     
     def _load_data(self) -> None:
-        """load & create data loaders"""
+        """load & create data loaders with optimized performance settings"""
         print("Loading data and creating data loaders with:")
         try:
             self.train_loader, self.test_loader = self.dataLoader.create_data_loader(
                 num_workers=self.config.memory.num_workers,
+                batch_size=self.config.split.batch_size,
+                pin_memory=self.config.memory.pin_memory
             )
             print(f"  training set: {len(self.train_loader)} batches")
             print(f"  test set: {len(self.test_loader)} batches")

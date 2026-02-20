@@ -44,18 +44,18 @@ class AbstractHSDataset(ABC, Dataset):
         self.num = config.clsf.num
         self.targets = config.clsf.targets
         self.patch_size = config.split.patch_size
-        self.margin = (config.split.patch_size - 1) // 2  # Calculate padding margin
+        self.margin = (config.split.patch_size - 1) // 2
         self.transform = transform
         self.kwargs = kwargs
         self.test_rate = config.split.test_rate
         self.pca_component = config.preprocess.pca_components
 
-        # Core data structures to be populated by subclasses
-        self.raw_data: np.ndarray = None  # Original hyperspectral data (H, W, C)
-        self.raw_labels: np.ndarray = None  # Original labels (H, W)
-        self.processed_data: np.ndarray = None  # Preprocessed data (e.g., after PCA)
-        self.patches: np.ndarray = None  # Extracted image patches
-        self.patch_labels: np.ndarray = None  # Labels corresponding to patches
+        # Core data structures
+        self.raw_data: np.ndarray = None
+        self.raw_labels: np.ndarray = None
+        self.processed_data: np.ndarray = None
+        self.patches: np.ndarray = None
+        self.patch_labels: np.ndarray = None
 
         # Load and process data
         self._load_data()
@@ -137,17 +137,19 @@ class AbstractHSDataset(ABC, Dataset):
         
         Patches are extracted with zero-padding at image boundaries. Only patches
         with non-zero labels are included (background/zero labels are excluded).
+        
+        OPTIMIZATION: Padding is done once and cached to avoid re-padding for each sample.
         """
-        # Add zero padding around the image
-        padded_data = self._pad_with_zeros(self.processed_data, self.margin)
+        # Add zero padding around the image (ONCE at initialization)
+        self.padded_data = self._pad_with_zeros(self.processed_data, self.margin)
         
         # Collect valid patches
-        patches_list = []
+        patch_indices = []
         labels_list = []
         
         # Iterate over all spatial positions in original image
-        for r in range(self.margin, padded_data.shape[0] - self.margin):
-            for c in range(self.margin, padded_data.shape[1] - self.margin):
+        for r in range(self.margin, self.padded_data.shape[0] - self.margin):
+            for c in range(self.margin, self.padded_data.shape[1] - self.margin):
                 # Get corresponding position in original (unpadded) image
                 orig_r = r - self.margin
                 orig_c = c - self.margin
@@ -155,65 +157,32 @@ class AbstractHSDataset(ABC, Dataset):
                 
                 # Skip background (zero labels)
                 if label > 0:
-                    # Extract patch (patch_size x patch_size x C)
-                    patch = padded_data[
-                        r - self.margin : r + self.margin + 1,
-                        c - self.margin : c + self.margin + 1,
-                        :
-                    ]
-                    patches_list.append(patch)
-                    labels_list.append(label - 1)  # Convert to 0-based index
+                    patch_indices.append((r, c))
+                    labels_list.append(label - 1)   # Convert to 0-based index
         
         # Convert to numpy arrays
-        self.patches = np.array(patches_list, dtype=np.float32)
+        # store indices and labels
+        self.patch_indices = np.array(patch_indices, dtype=np.int32)
         self.patch_labels = np.array(labels_list, dtype=np.int32)
+        print(f"Created {len(self.patch_indices)} indices for patch.")
+        print(f"Cached padded data shape: {self.padded_data.shape} (padding happens once at init)")
+
+    def _get_patch(self, idx: int) -> np.ndarray:
+        """
+        Get a single patch from the cached padded data.
         
-        # Validate patch creation
-        if len(self.patches) == 0:
-            raise RuntimeError("No valid patches created - check label data")
+        OPTIMIZATION: Uses pre-computed padded_data instead of re-padding for each sample.
+        This reduces per-sample overhead from O(H*W*C) to O(patch_size²*C).
+        """
+        r, c = self.patch_indices[idx]
         
-        print(f"Created {len(self.patches)} patches of size {self.patch_size}x{self.patch_size}")
-
-    def _create_cube(self, x: np.ndarray, y: np.ndarray, windowSize=15, removeZeroLabels=True):
-        """Create image cubes for hyperspectral data processing with memory-efficient approach"""
-        margin = int((windowSize -1) / 2)
-        zeroPaddedX = self._pad_with_zeros(x, margin=margin)
-
-        patches_list, labels_list = [], []
-
-        print(f"Creating patches for {x.shape[0]}x{x.shape[1]} image with {windowSize}x{windowSize} window...")
-    
-        for r in range(margin, zeroPaddedX.shape[0] - margin):
-            for c in range(margin, zeroPaddedX.shape[1] - margin):
-                # Get the original position in the unpadded image
-                orig_r = r - margin
-                orig_c = c - margin
-                label = y[orig_r, orig_c]
-            
-                # Only collect patches with non-zero labels (if removeZeroLabels=True)
-                if not removeZeroLabels or label > 0:
-                    patch = zeroPaddedX[r - margin:r + margin + 1, c - margin:c + margin + 1]
-                    patches_list.append(patch)
-                    labels_list.append(label)
-    
-        # Convert to numpy arrays only after filtering
-        patchesData = np.array(patches_list, dtype=np.float32)
-        patchesLabels = np.array(labels_list, dtype=np.int32)
-    
-        if removeZeroLabels:
-            # Labels are already filtered, just convert to 0-based indexing
-            patchesLabels -= 1
-    
-        # Validate label range
-        min_label = np.min(patchesLabels)
-        max_label = np.max(patchesLabels)
-        num_classes = len(np.unique(patchesLabels))
-        print(f"Created {len(patchesData)} patches")
-        print(f"Label range: [{min_label}, {max_label}], Number of classes: {num_classes}")
-    
-        # Check for non-finite values
-        assert np.isfinite(patchesData).all(), "Patch data contains non-finite values"
-        return patchesData, patchesLabels
+        # Extract patch from pre-computed padded_data
+        patch = self.padded_data[
+            r - self.margin : r + self.margin + 1,
+            c - self.margin : c + self.margin + 1,
+            :
+        ]
+        return patch.copy()
     
     def splitTrainTestDataset(self, X, y, randomState=350234):
         """
@@ -273,13 +242,12 @@ class AbstractHSDataset(ABC, Dataset):
                 - patch: Tensor of shape (C, H, W)
                 - label: Tensor containing class index
         """
-        patch = self.patches[idx]
+        patch = self._get_patch(idx)
         label = self.patch_labels[idx]
         
         # Convert to (C, H, W) format for PyTorch
         patch = np.transpose(patch, (2, 0, 1))
         
-        # Apply transforms if specified
         if self.transform:
             patch = self.transform(patch)
         
@@ -340,93 +308,151 @@ class NpyHSDataset(AbstractHSDataset):
         return pairs
     
     def _load_data(self) -> None:
-        """Load data from .npy files and concatenate them"""
+        """Load data from .npy files with memory-efficient approach"""
         pairs = self._pair_data_and_labels()
         
-        data_list = []
-        label_list = []
-        
+        # calculate total shape
+        total_h, total_w = 0, 0
         for data_file, label_file in pairs:
+            data = np.load(data_file, mmap_mode='r')  # read only metadata.
+            total_h += data.shape[0]
+            total_w = max(total_w, data.shape[1])
+            c = data.shape[2]
+        
+        print(f"Detected concatenation shape: ({total_h}, {total_w}, {c})")
+        
+        # Second pass: allocate once and fill
+        self.raw_data = np.zeros((total_h, total_w, c), dtype=np.float32)
+        self.raw_labels = np.zeros((total_h, total_w), dtype=np.int32)
+        
+        row_offset = 0
+        for idx, (data_file, label_file) in enumerate(pairs):
             data = np.load(data_file)
             labels = np.load(label_file)
             
+            h, w = data.shape[:2]
             # Validate shapes
             if data.shape[:2] != labels.shape[:2]:
                 raise ValueError(f"Shape mismatch between {data_file} and {label_file}")
             
-            data_list.append(data)
-            label_list.append(labels)
+            # Fill allocated arrays
+            self.raw_data[row_offset:row_offset+h, :w, :] = data
+            self.raw_labels[row_offset:row_offset+h, :w] = labels
+            row_offset += h
+            
+            print(f"  Loaded pair {idx+1}/{len(pairs)}: {data_file.split('/')[-1]}")
+            
+            # Explicitly delete to free memory
+            del data, labels
         
-        # Concatenate all data and labels
-        self.raw_data = np.concatenate(data_list, axis=0)  # data shape (H, W, C)
-        self.raw_labels = np.concatenate(label_list, axis=0)  # label shape (H, W)
-        
-        print(f"Loaded {len(pairs)} pairs of .npy files")
-        print(f"Concatenated data shape: {self.raw_data.shape}, labels shape: {self.raw_labels.shape}")
+        print(f"  Loaded {len(pairs)} pairs of .npy files")
+        print(f"  Concatenated data shape: {self.raw_data.shape}, labels shape: {self.raw_labels.shape}")
         
     def _preprocess_data(self) -> None:
-        """Preprocess data with normalization and optional PCA"""
-        from sklearn.decomposition import PCA
+        """
+        Preprocess data with normalization and optional PCA,
+        Process in chunks (100k pixels per chunk) to reduce memory usage.
+        """
+        from sklearn.decomposition import PCA, IncrementalPCA
         from sklearn.preprocessing import StandardScaler
         
-        # Reshape data for PCA (flatten spatial dimensions)
         h, w, c = self.raw_data.shape
-        flat_data = self.raw_data.reshape(-1, c)
+        chunk_size = 100_000
+        flat_data_chunks = []
         
-        # Handle outliers and normalization
-        scaler = StandardScaler()
-        scaled_data = scaler.fit_transform(flat_data)
+        print("Normalizing data in chunks...")
+        for i in range(0, h * w, chunk_size):
+            end_idx = min(i + chunk_size, h * w)
+            chunk = self.raw_data.reshape(-1, c)[i:end_idx]
+            
+            scaler = StandardScaler()
+            scaled_chunk = scaler.fit_transform(chunk)
+            flat_data_chunks.append(scaled_chunk)
+            
+            if (i // chunk_size + 1) % 100 == 0:
+                print(f"  Processed {min(end_idx, h*w)}/{h*w} pixels")
+        
+        flat_data = np.vstack(flat_data_chunks)
+        del flat_data_chunks  # release buffer results
         
         # Apply PCA if specified
         if self.pca_component and self.pca_component < c:
-            pca = PCA(n_components=self.pca_component, random_state=42)
-            pca_data = pca.fit_transform(scaled_data)
-            self.processed_data = pca_data.reshape(h, w, self.pca_component)
-            print(f"Applied PCA: reduced from {c} to {self.pca_component} components")
-        else:
-            self.processed_data = scaled_data.reshape(h, w, c)
-            print("PCA not applied, using all original components")
+            print(f"Applying PCA: Channel {c} -> {self.pca_component} components...")
+            # Use IncrementalPCA for large datasets
+            if h * w > 10_000_000:
+                pca = IncrementalPCA(n_components=self.pca_component, batch_size=100_000)
+            else:
+                pca = PCA(n_components=self.pca_component, random_state=42)
             
-    def create_data_loader(self, num_workers=0):
-        """Create a PyTorch DataLoader for the dataset"""
+            pca_data = pca.fit_transform(flat_data)
+            self.processed_data = pca_data.reshape(h, w, self.pca_component)
+            print(f"  Applied PCA: reduced from {c} to {self.pca_component} components")
+            print(f"  Explained variance ratio: {pca.explained_variance_ratio_.sum():.4f}")
+        else:
+            self.processed_data = flat_data.reshape(h, w, c)
+            print("  PCA not applied, using all original components")
+            
+        del flat_data  # release normalized data
+            
+    def create_data_loader(self, num_workers=4, batch_size=None, pin_memory=True):
+        """
+        Create PyTorch DataLoaders with optimized performance settings.
+        
+        Args:
+            num_workers: Number of worker threads for parallel data loading.
+                        Recommended: 4 for optimal throughput (prevents I/O bottleneck).
+                        Set to 0 only to debug or on single-core systems.
+            batch_size: Batch size for each iteration. If None, uses config value or 32.
+            pin_memory: Whether to pin memory for GPU transfer (True recommended on GPU systems).
+        
+        Returns:
+            Tuple of (train_loader, test_loader)
+        """
 
-        x_pca = self.processed_data  # (H, W, C)
-        y = self.raw_labels  # (H, W)
+        total_indices = np.arange(len(self.patch_indices))
         
-        print('Hyperspectral data shape after PCA: ', x_pca.shape)
-        print('Label shape: ', y.shape)
-        print('Original label range:', np.min(y), 'to', np.max(y))
-        print('Unique labels:', np.unique(y))
+        train_idx, test_idx, _, _ = train_test_split(
+            total_indices,
+            self.patch_labels,
+            test_size=self.test_rate,
+            random_state=350234,
+            stratify=self.patch_labels
+        )
         
-        x_patches, y_all = self._create_cube(x_pca, y, windowSize=self.patch_size)
-        print('Data cube X shape: ', x_patches.shape)
-        print('Processed label range:', np.min(y_all), 'to', np.max(y_all))
-        print('Unique processed labels:', np.unique(y_all))
+        # create an indexed subset
+        train_subset = _IndexedSubset(self, train_idx)
+        test_subset = _IndexedSubset(self, test_idx)
         
-        Xtrain, Xtest, ytrain, ytest = self.splitTrainTestDataset(x_patches, y_all, randomState=350234)
-        print('Xtrain shape: ', Xtrain.shape)
-        print('Xtest shape: ', Xtest.shape)
+        # Determine batch size and pin_memory settings
+        if batch_size is None:
+            batch_size = self.batch_size if hasattr(self, 'batch_size') else 32
         
-        X = x_patches.reshape(-1, self.patch_size, self.patch_size, self.processed_data.shape[2], 1)
-        Xtrain = Xtrain.reshape(-1, self.patch_size, self.patch_size, self.pca_components, 1)
-        Xtest = Xtest.reshape(-1, self.patch_size, self.patch_size, self.pca_components, 1)
+        actual_pin_memory = pin_memory and torch.cuda.is_available()
         
-        X = X.transpose(0, 4, 3, 1, 2).squeeze(1)
-        Xtrain = Xtrain.transpose(0, 4, 3, 1, 2).squeeze(1)
-        Xtest = Xtest.transpose(0, 4, 3, 1, 2).squeeze(1)
-        
-        # temp container.
-        trainset = container(Xtrain, ytrain)
-        testset = container(Xtest, ytest)
-        
-        pin_memory=self.pin_memory
-
         train_loader = torch.utils.data.DataLoader(
-            trainset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory
+            train_subset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=actual_pin_memory,
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=True if num_workers > 0 else False
         )
+        
         test_loader = torch.utils.data.DataLoader(
-            testset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory
+            test_subset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=actual_pin_memory,
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=True if num_workers > 0 else False
         )
+        
+        print(f"Training set: {len(train_loader)} batches ({len(train_idx)} samples)")
+        print(f"Test set: {len(test_loader)} batches ({len(test_idx)} samples)")
+        print(f"DataLoader config: num_workers={num_workers}, batch_size={batch_size}, pin_memory={actual_pin_memory}")
+        
         return train_loader, test_loader
 
 class MatHSDataset(AbstractHSDataset):
@@ -636,36 +662,48 @@ class TiffHSDataset(AbstractHSDataset):
         self.processed_data = scaled_data.reshape(h, w, c)
         print(f"Preprocessed data shape: {self.processed_data.shape}")
 
+class _IndexedSubset(Dataset):
+    """
+    indexed subset wrapper class.
+    """
+    def __init__(self, dataset: AbstractHSDataset, indices: np.ndarray):
+        self.dataset = dataset
+        self.indices = indices
+    
+    def __len__(self):
+        return len(self.indices)
+    
+    def __getitem__(self, idx: int):
+        original_idx = self.indices[idx]
+        return self.dataset[original_idx]
+
 class container:
     """
-        A simple container for temporary storage.
-        Before data & labels are split into dataLoaders.
-
-        Note: 
-        magic method ``__len__``, ``__getitem__``
-        is needed for such classes.
+    A simple container for temporary storage with deferred tensor conversion.
+    
+    Note: 
+    magic method ``__len__``, ``__getitem__``
+    is needed for such classes.
     """
     def __init__(self, hyperspectral_data, labels):
-        self.hyperspectral_data = hyperspectral_data
+        self.hyperspectral_data = hyperspectral_data  # Already (N, C, H, W)
         self.labels = labels
 
     def __len__(self):
         return len(self.hyperspectral_data)
     
     def __getitem__(self, idx):
-        # Get hyperspectral data - ensure it's properly shaped
-        hyperspectral = self.hyperspectral_data[idx]  # Shape: (H, W, 15)
+        # Get data (already in correct shape from create_data_loader)
+        hyperspectral = self.hyperspectral_data[idx]  # Shape: (C, H, W) - already transposed
         
-        # Convert to tensor and transpose to (C, H, W) for PyTorch
-        if len(hyperspectral.shape) == 3:
-            hyperspectral = np.transpose(hyperspectral, (2, 0, 1))  # (15, H, W)
+        # Convert to tensor directly
+        hyperspectral_tensor = torch.FloatTensor(hyperspectral)
         
-        # Convert hyperspectral data to RGB-like input for pretrained model
-        # Select 3 representative bands from the 15 hyperspectral bands
+        # Create pretrained input (RGB-like from 15 bands)
         if hyperspectral.shape[0] == 15:  # (15, H, W)
-            # Select bands that roughly correspond to RGB wavelengths
-            r_band = hyperspectral[0]  # First band as red
-            g_band = hyperspectral[7]  # Middle band as green  
+            # Select 3 representative bands
+            r_band = hyperspectral[0]   # First band as red
+            g_band = hyperspectral[7]   # Middle band as green  
             b_band = hyperspectral[14]  # Last band as blue
             
             # Stack to create RGB image
@@ -685,8 +723,8 @@ class container:
                 align_corners=False
             ).squeeze(0)  # Remove batch dimension
         else:
-            # Fallback: use first 3 channels if not 15
-            pretrained_input = torch.FloatTensor(hyperspectral[:3])
+            # Fallback: use first 3 channels
+            pretrained_input = torch.FloatTensor(hyperspectral[:3].copy())
             
             # Resize to 224x224
             pretrained_input = torch.nn.functional.interpolate(
@@ -699,7 +737,7 @@ class container:
         # Get label
         label = self.labels[idx]
         
-        return torch.FloatTensor(hyperspectral), pretrained_input, torch.LongTensor([label]).squeeze()
+        return hyperspectral_tensor, pretrained_input, torch.LongTensor([label]).squeeze()
     
 if __name__ == "__main__":
         """
