@@ -60,6 +60,8 @@ output/
 │   │   └── ...
 │   ├── training_curves.png
 │   └── confusion_matrix.png
+├── log/
+│    └── monitor.log
 └── ...
 ```
 
