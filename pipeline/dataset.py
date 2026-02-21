@@ -394,7 +394,8 @@ class NpyHSDataset(AbstractHSDataset):
             
         del flat_data  # release normalized data
             
-    def create_data_loader(self, num_workers=4, batch_size=None, pin_memory=True):
+    def create_data_loader(self, num_workers=4, batch_size=None, pin_memory=True, 
+                           prefetch_factor=2, persistent_workers=False):
         """
         Create PyTorch DataLoaders with optimized performance settings.
         
@@ -404,6 +405,8 @@ class NpyHSDataset(AbstractHSDataset):
                         Set to 0 only to debug or on single-core systems.
             batch_size: Batch size for each iteration. If None, uses config value or 32.
             pin_memory: Whether to pin memory for GPU transfer (True recommended on GPU systems).
+            prefetch_factor: preload batches per worker(default=2).
+            persistent_workers: keep workers from frequent recreation (default=False).
         
         Returns:
             Tuple of (train_loader, test_loader)
@@ -435,8 +438,10 @@ class NpyHSDataset(AbstractHSDataset):
             shuffle=True,
             num_workers=num_workers,
             pin_memory=actual_pin_memory,
-            prefetch_factor=2 if num_workers > 0 else None,
-            persistent_workers=True if num_workers > 0 else False
+            prefetch_factor=prefetch_factor if num_workers > 0 else 1,
+            persistent_workers=persistent_workers and (num_workers > 0),
+            drop_last=True,  # drop last batch if it's smaller than batch_size
+            timeout=60 if num_workers > 0 else 0
         )
         
         test_loader = torch.utils.data.DataLoader(
@@ -445,13 +450,16 @@ class NpyHSDataset(AbstractHSDataset):
             shuffle=False,
             num_workers=num_workers,
             pin_memory=actual_pin_memory,
-            prefetch_factor=2 if num_workers > 0 else None,
-            persistent_workers=True if num_workers > 0 else False
+            prefetch_factor=prefetch_factor if num_workers > 0 else 1,
+            persistent_workers=persistent_workers and (num_workers > 0),
+            drop_last=False,
+            timeout=60 if num_workers > 0 else 0
         )
         
         print(f"Training set: {len(train_loader)} batches ({len(train_idx)} samples)")
         print(f"Test set: {len(test_loader)} batches ({len(test_idx)} samples)")
         print(f"DataLoader config: num_workers={num_workers}, batch_size={batch_size}, pin_memory={actual_pin_memory}")
+        print(f"  prefetch_factor={prefetch_factor}, persistent_workers={persistent_workers and (num_workers > 0)}")
         
         return train_loader, test_loader
 

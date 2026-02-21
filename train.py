@@ -14,16 +14,25 @@ from model import Unet, CommonViT, LoLA_hsViT
 
 def main() -> bool:
     parser = argparse.ArgumentParser(
-        description='hsViT',
+        description='Train through here',
         formatter_class=argparse.RawDescriptionHelpFormatter
         )
     
-
-    parser.add_argument('--model', '-m', type=str, default='lola',
-                       choices=['unet', 'vit', 'lola', 'custom'],
-                       help='model type from {unet, vit, lola, custom}')
     parser.add_argument('--epoch', '-e', type=int, default=10)
-    parser.add_argument('--debug', '-d', type=bool, default=False)
+    parser.add_argument('--debug', '-d', type=bool, default=False,
+                        help='Whether to run in debug mode (default: False). '
+                        'Debug mode uses fewer epochs and smaller batch size for quick testing.')
+    parser.add_argument('--parallel', '-p', type=int, default=1,
+                       help='number of GPUs to use for parallel training (default: 1). '
+                            'Each number uses that many GPUs. Raises error if more than available.')
+    
+    args = parser.parse_args()
+    
+    # Validate parallel argument
+    if args.parallel < 1:
+        print(f"Error: --parallel must be >= 1, got {args.parallel}")
+        return False
+    
     config = load_config()
     
     dataLoader = NpyHSDataset(config=config, transform=None)
@@ -32,10 +41,11 @@ def main() -> bool:
     trainer = hsTrainer(
                 config=config,
                 dataLoader=dataLoader,
-                epochs=parser.parse_args().epoch,
+                epochs=args.epoch,
                 model=lambda: LoLA_hsViT(),
                 model_name='LoLA_hsViT',
-                debug_mode=parser.parse_args().debug
+                debug_mode=args.debug,
+                num_gpus=args.parallel
             )
     try:  
         results = trainer.train()
@@ -54,10 +64,11 @@ def main() -> bool:
     trainer2 = hsTrainer(
             config=config,
             dataLoader=dataLoader,
-            epochs=parser.parse_args().epoch,
+            epochs=args.epoch,
             model=lambda: CommonViT(),
             model_name='CommonViT',
-            debug_mode=parser.parse_args().debug
+            debug_mode=args.debug,
+            num_gpus=args.parallel
         )
     try:    
         results2 = trainer2.train()

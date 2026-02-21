@@ -42,7 +42,8 @@ class hsTrainer:
         epochs: int = 20,
         model: Callable[..., Module] = None,
         model_name: str = "model",
-        debug_mode: bool = False
+        debug_mode: bool = False,
+        num_gpus: int = 1
     ):
         
         self.config = config
@@ -51,6 +52,7 @@ class hsTrainer:
         self.model = model
         self.model_name = model_name
         self.debug_mode = debug_mode
+        self.num_gpus = num_gpus
         self.output = self.config.path.output + f'/{self.model_name}'
         
         os.makedirs(self.output, exist_ok=True)
@@ -61,6 +63,7 @@ class hsTrainer:
         self._setup_device()
         self._load_data()
         self._create_model()
+        self._setup_multi_gpu()
         self._setup_training()
         
         # training state
@@ -76,21 +79,44 @@ class hsTrainer:
         print(f"  model: {self.model_name}")
         print(f"  epoch: {self.epochs}")
         print(f"  device: {self.device}")
+        print(f"  num_gpus: {self.num_gpus}")
         print(f"  output_dir: {self.output}")
     
     def _setup_device(self) -> None:
-        """setup device and print GPU info if available"""
+        """setup device and validate multi-GPU configuration"""
         device_type = self.config.get('device_type', 'cuda')
         try:
             self.device = torch.device(device_type)
             if device_type == 'cuda':
-                print(f"  GPU: {torch.cuda.get_device_name()}")
+                # Get available GPU count
+                self.available_gpus = torch.cuda.device_count()
+                
+                # Validate num_gpus
+                if self.num_gpus > self.available_gpus:
+                    raise RuntimeError(
+                        f"Requested {self.num_gpus} GPUs but only {self.available_gpus} available. "
+                        f"Please set --parallel to a value <= {self.available_gpus}"
+                    )
+                
+                if self.num_gpus < 1:
+                    raise RuntimeError(f"num_gpus must be >= 1, got {self.num_gpus}")
+                
+                # Store GPU IDs to use
+                self.gpu_ids = list(range(self.num_gpus))
+                
+                print(f"  Available GPUs: {self.available_gpus}")
+                print(f"  Using {self.num_gpus} GPU(s): {self.gpu_ids}")
+                for gpu_id in self.gpu_ids:
+                    print(f"    GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)} - "
+                          f"{torch.cuda.get_device_properties(gpu_id).total_memory / (1024**3):.2f} GB")
                 print(f"  CUDA version: {torch.version.cuda}")
-                print(f"  GPU memory: {torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f} GB")
                 torch.cuda.empty_cache()
         except Exception as e:
             print(f"Initialization on CPU due to {e}")
             self.device = torch.device('cpu')
+            self.num_gpus = 0
+            self.gpu_ids = []
+            self.available_gpus = 0
         
         # limit CPU threads to prevent oversubscription.
         os.environ['OMP_NUM_THREADS'] = '4'
@@ -100,10 +126,39 @@ class hsTrainer:
         """load & create data loaders with optimized performance settings"""
         print("Loading data and creating data loaders with:")
         try:
+            # Optimize data loading for multi-GPU
+            num_workers = self.config.memory.num_workers
+            batch_size = self.config.split.batch_size
+            prefetch_factor = 2
+            persistent_workers = False
+            
+            if self.num_gpus > 1:
+                # define num_workers with flexible way:
+                # min(CPU core/2, 8, GPU*2)
+                # Too mang workers on CPU causes imbalance.
+                available_cpus = os.cpu_count() or 4
+                num_workers = min(available_cpus // 2, 8, self.num_gpus * 2)
+                
+                # Increase batch size for multi-GPU to improve GPU utilization
+                batch_size = self.config.split.batch_size * self.num_gpus
+                
+                # prefetch_factor=2: preload 2 batches per worker.
+                # persistent_workers=True: avoid frequent worker del.
+                prefetch_factor = 2
+                persistent_workers = True
+                
+                print(f"  [Multi-GPU Optimization] Scaling for {self.num_gpus} GPUs:")
+                print(f"    num_workers: {self.config.memory.num_workers} -> {num_workers}")
+                print(f"    batch_size: {self.config.split.batch_size} -> {batch_size} "
+                      f"({batch_size // self.num_gpus} per GPU)")
+                print(f"    prefetch_factor: {prefetch_factor}, persistent_workers: {persistent_workers}")
+            
             self.train_loader, self.test_loader = self.dataLoader.create_data_loader(
-                num_workers=self.config.memory.num_workers,
-                batch_size=self.config.split.batch_size,
-                pin_memory=self.config.memory.pin_memory
+                num_workers=num_workers,
+                batch_size=batch_size,
+                pin_memory=self.config.memory.pin_memory,
+                prefetch_factor=prefetch_factor,
+                persistent_workers=persistent_workers
             )
             print(f"  training set: {len(self.train_loader)} batches")
             print(f"  test set: {len(self.test_loader)} batches")
@@ -125,6 +180,18 @@ class hsTrainer:
             print(f"  trainable parameters: {trainable_params:,}")
         except Exception as e:
             raise RuntimeError(f"Error during model creation: {e}")
+    
+    def _setup_multi_gpu(self) -> None:
+        """Setup DataParallel for multi-GPU training if num_gpus > 1"""
+        if self.num_gpus > 1 and self.device.type == 'cuda':
+            print("Setting up DataParallel for multi-GPU training:")
+            try:
+                # Use DataParallel with explicit device IDs
+                self.model = nn.DataParallel(self.model, device_ids=self.gpu_ids, output_device=self.gpu_ids[0])
+                print(f"  Model wrapped with DataParallel using {self.num_gpus} GPU(s): {self.gpu_ids}")
+            except Exception as e:
+                print(f"Warning: Failed to setup DataParallel: {e}")
+                print(f"  Continuing with single GPU training")
     
     def _setup_training(self) -> None:
         """initialize training components including optimizer, scheduler, loss function, and mixed precision settings"""
@@ -176,7 +243,7 @@ class hsTrainer:
     
     def train_epoch(self, epoch: int) -> Tuple[float, float]:
         """
-        for a single epoch.
+        Train for a single epoch.
         
         Return: Tuple (``loss``, ``accuracy``)
         """
@@ -196,8 +263,9 @@ class hsTrainer:
         
         for batch_idx, batch_data in enumerate(pbar):
             hsi, labels = self._unpack_batch(batch_data)
-            hsi = hsi.to(self.device)
-            labels = labels.to(self.device)
+            # non_blocking=True to transfer data parallel with last GPU caculation.
+            hsi = hsi.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
             
             # check up data format
             if hsi.dim() == 4 and hsi.shape[-1] <= 16:  # [B, H, W, C]
@@ -230,11 +298,11 @@ class hsTrainer:
             if epoch >= self.warmup_epochs:
                 self.scheduler.step(epoch + batch_idx / len(self.train_loader))
             
-            # stats update
             total_loss += loss.item()
-            _, predicted = torch.max(outputs.detach(), 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+            with torch.no_grad():
+                _, predicted = torch.max(outputs.detach(), 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
             
             # tqdm
             acc = 100.0 * correct / total
@@ -558,13 +626,32 @@ class hsTrainer:
         if self.best_model_state is None:
             return
         
-        model_path = os.path.join(self.output, f'{self.model_name}_best.pth')
-        torch.save(self.best_model_state['model_state'], model_path)
+        model_path = os.path.join(self.output, 'models', f'{self.model_name}_best.pth')
+        # Extract state_dict and remove 'module.' prefix if using DataParallel
+        state_dict = self.best_model_state['model_state']
+        if isinstance(self.model, nn.DataParallel):
+            # Remove 'module.' prefix added by DataParallel
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        
+        torch.save(state_dict, model_path)
+        print(f"  Model saved to: {model_path}")
     
     def load_best_model(self) -> Module:
         model_path = os.path.join(self.output, 'models', f'{self.model_name}_best.pth')
         if os.path.exists(model_path):
-            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+            state_dict = torch.load(model_path, map_location=self.device)
+            
+            # Handle DataParallel model loading
+            if isinstance(self.model, nn.DataParallel):
+                # Add 'module.' prefix if loading into DataParallel model
+                if not any(k.startswith('module.') for k in state_dict.keys()):
+                    state_dict = {f'module.{k}': v for k, v in state_dict.items()}
+            else:
+                # Remove 'module.' prefix if loading into non-DataParallel model
+                if any(k.startswith('module.') for k in state_dict.keys()):
+                    state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            
+            self.model.load_state_dict(state_dict)
             print(f"  Loaded best model from: {model_path}")
         else:
             print(f"  Warning: Model file not found: {model_path}")
