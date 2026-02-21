@@ -9,7 +9,23 @@ import argparse
 from config import load_config
 from pipeline import hsTrainer
 from pipeline import NpyHSDataset
+from pipeline import ModelComparator
 from model import Unet, CommonViT, LoLA_hsViT
+
+
+def _run_trainer(trainer):
+    """Run a single trainer and return (results, trainer) or None on failure."""
+    try:
+        results = trainer.train()
+        for key, value in results.items():
+            if isinstance(value, float):
+                print(f"  {key:20s}: {value:8.4f}")
+            else:
+                print(f"  {key:20s}: {value}")
+        return results, trainer
+    except Exception as e:
+        print(f"Training during {trainer.model_name} failed: {e}")
+        return None
 
 
 def main() -> bool:
@@ -34,54 +50,73 @@ def main() -> bool:
         return False
     
     config = load_config()
-    
     dataLoader = NpyHSDataset(config=config, transform=None)
     
+    model_specs = [
+        ('LoLA_hsViT', lambda: LoLA_hsViT()),
+        ('CommonViT',  lambda: CommonViT()),
+        ('Unet',       lambda: Unet()),
+    ]
     
-    trainer = hsTrainer(
-                config=config,
-                dataLoader=dataLoader,
-                epochs=args.epoch,
-                model=lambda: LoLA_hsViT(),
-                model_name='LoLA_hsViT',
-                debug_mode=args.debug,
-                num_gpus=args.parallel
-            )
-    try:  
-        results = trainer.train()
-        for key, value in results.items():
-                if isinstance(value, float):
-                    print(f"  {key:20s}: {value:8.4f}")
-                else:
-                    print(f"  {key:20s}: {value}")
-                    
-        del trainer
-    except Exception as e:
-        print(f"Training during {trainer.model_name} failed: {e}")
-        return False
+    finished = []  # list of (name, results, trainer)
     
-    # trainer2
-    trainer2 = hsTrainer(
+    for model_name, model_fn in model_specs:
+        trainer = hsTrainer(
             config=config,
             dataLoader=dataLoader,
             epochs=args.epoch,
-            model=lambda: CommonViT(),
-            model_name='CommonViT',
+            model=model_fn,
+            model_name=model_name,
             debug_mode=args.debug,
-            num_gpus=args.parallel
+            num_gpus=args.parallel,
         )
-    try:    
-        results2 = trainer2.train()
-        for key, value in results2.items():
-            if isinstance(value, float):
-                print(f"  {key:20s}: {value:8.4f}")
-            else:
-                print(f"  {key:20s}: {value}")
-                
-        del trainer2
-    except Exception as e:
-        print(f"Training during {trainer2.model_name} failed: {e}")
-        return False
+        outcome = _run_trainer(trainer)
+        if outcome is None:
+            return False
+        finished.append((model_name, outcome[0], outcome[1]))
+    
+    # Cross-model comparison 
+    class_names = config.clsf.targets[:config.clsf.num]
+    comparator = ModelComparator(
+        output_dir=config.path.output,
+        class_names=class_names,
+        eval_interval=config.common.eval_interval,
+    )
+    
+    for name, results, tr in finished:
+        # Gather optional data the trainer collected during final evaluation
+        probas = getattr(tr, '_last_probas', None)
+        feats = getattr(tr, '_last_features', None)
+        feat_labels = getattr(tr, '_last_feature_labels', None)
+        param_counts = getattr(tr, '_param_counts', None)
+        inf_time = getattr(tr, '_inference_time', None)
+        
+        # Quick re-evaluate to get predictions/targets for the comparator
+        _, _, _, preds, targets = tr.evaluate()
+        
+        comparator.add_model(
+            name=name,
+            results=results,
+            train_losses=tr.train_losses,
+            train_accs=tr.train_accs,
+            eval_losses=tr.eval_losses,
+            eval_accs=tr.eval_accs,
+            predictions=preds,
+            targets=targets,
+            probabilities=probas,
+            features=feats,
+            feature_labels=feat_labels,
+            param_counts=param_counts,
+            inference_time=inf_time,
+            lr_history=tr.lr_history,
+        )
+    
+    comparator.plot_all()
+    
+    # Cleanup
+    for _, _, tr in finished:
+        del tr
+    
     return True
             
 if __name__ == "__main__":

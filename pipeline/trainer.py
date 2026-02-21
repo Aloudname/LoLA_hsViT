@@ -22,8 +22,10 @@ from torch.nn import Module
 from typing import Tuple, Callable, Dict
 from pipeline.dataset import AbstractHSDataset
 from torch.cuda.amp import GradScaler, autocast
-from sklearn.metrics import accuracy_score, cohen_kappa_score, confusion_matrix, precision_recall_fscore_support
-import cv2, os, time, torch, traceback, warnings
+from sklearn.metrics import (accuracy_score, cohen_kappa_score, confusion_matrix,
+                             precision_recall_fscore_support, roc_curve, auc,
+                             average_precision_score, precision_recall_curve)
+import cv2, os, time, torch, traceback, warnings, json
 
 warnings.filterwarnings("ignore")
 
@@ -72,6 +74,11 @@ class hsTrainer:
         self.best_acc = 0.0
         self.best_epoch = 0
         self.best_model_state = None
+        
+        # enhanced tracking for richer visualizations
+        self.lr_history = []          # lr per epoch
+        self.grad_norms = []          # gradient L2 norm per epoch
+        self.epoch_times = []         # wall-clock time per epoch
 
         print(f"Trainer Initialized successfully with:")
         print(f"  model: {self.model_name}")
@@ -318,27 +325,53 @@ class hsTrainer:
         epoch_loss = total_loss / len(self.train_loader)
         epoch_acc = 100.0 * correct / total
         
+        # record lr for this epoch
+        self.lr_history.append(self.optimizer.param_groups[0]['lr'])
+        
+        # record gradient L2 norm
+        total_norm = 0.0
+        for p in self.model.parameters():
+            if p.grad is not None:
+                total_norm += p.grad.data.norm(2).item() ** 2
+        self.grad_norms.append(total_norm ** 0.5)
+        
         return epoch_loss, epoch_acc
     
     @torch.no_grad()
-    def evaluate(self) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
+    def evaluate(self, collect_extra: bool = False
+                 ) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
         """
         Evaluate on the test set with optimized performance.
         
-        Optimizations:
-        - Reuse test_loader (already optimized) instead of recreating
-        - Use larger batch_size for better throughput
-        - non_blocking=True for async data transfer
-        - torch.no_grad() to save memory
-        - Batch array operations instead of extend() for faster collection
+        Args:
+            collect_extra: if True, also collect softmax probabilities and
+                           penultimate-layer features (for ROC / t-SNE).
         
         Return:
             Tuple (``loss``, ``accuracy``, ``kappa``, ``predictions``, ``labels``)
+            When collect_extra is True, also stores self._last_probas and
+            self._last_features for consumption by the comparator.
         """
         self.model.eval()
         total_loss = 0.0
         predictions_list = []
         targets_list = []
+        probas_list = [] if collect_extra else None
+        features_list = [] if collect_extra else None
+        
+        # hook for feature extraction (penultimate layer)
+        _feat_hook = None
+        _feat_buffer = []
+        if collect_extra:
+            # Find the layer just before the classification head
+            target_layer = None
+            for name, module in self.model.named_modules():
+                if isinstance(module, (nn.AdaptiveAvgPool1d, nn.AdaptiveAvgPool2d)):
+                    target_layer = module
+            if target_layer is not None:
+                def _hook(mod, inp, out):
+                    _feat_buffer.append(out.detach().cpu())
+                _feat_hook = target_layer.register_forward_hook(_hook)
         
         eval_loader = self.test_loader
         
@@ -363,6 +396,13 @@ class hsTrainer:
                 _, predicted = torch.max(outputs, 1)
                 predictions_list.append(predicted.cpu().numpy())
                 targets_list.append(labels.cpu().numpy())
+                
+                if collect_extra:
+                    probas_list.append(
+                        torch.nn.functional.softmax(outputs, dim=1).cpu().numpy())
+        
+        if _feat_hook is not None:
+            _feat_hook.remove()
         
         predictions = np.concatenate(predictions_list, axis=0)
         targets = np.concatenate(targets_list, axis=0)
@@ -370,6 +410,16 @@ class hsTrainer:
         acc = accuracy_score(targets, predictions) * 100
         kappa = cohen_kappa_score(targets, predictions) * 100
         loss = total_loss / len(eval_loader)
+        
+        if collect_extra:
+            self._last_probas = np.concatenate(probas_list, axis=0)
+            if _feat_buffer:
+                raw = torch.cat(_feat_buffer, dim=0)
+                self._last_features = raw.view(raw.size(0), -1).numpy()
+                self._last_feature_labels = targets
+            else:
+                self._last_features = None
+                self._last_feature_labels = None
         
         return loss, acc, kappa, predictions, targets
     
@@ -395,7 +445,9 @@ class hsTrainer:
         
         for epoch in range(self.epochs):
             # training
+            epoch_tic = time.perf_counter()
             train_loss, train_acc = self.train_epoch(epoch)
+            self.epoch_times.append(time.perf_counter() - epoch_tic)
             self.train_losses.append(train_loss)
             self.train_accs.append(train_acc)
             
@@ -451,12 +503,26 @@ class hsTrainer:
         if self.best_model_state is not None:
             self.model.load_state_dict(self.best_model_state['model_state'])
         
-        # final evaluation
-        final_loss, final_acc, final_kappa, final_pred, final_target = self.evaluate()
+        # final evaluation with extra data collection (probabilities, features)
+        final_loss, final_acc, final_kappa, final_pred, final_target = self.evaluate(
+            collect_extra=True)
         
-        # Final visualizations
+        # measure inference time (average over a few batches)
+        self._inference_time = self._measure_inference_time()
+        
+        # parameter counts
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        self._param_counts = {'total': total_params, 'trainable': trainable_params}
+        
+        # single-model visualizations 
         self._plot_training_curves()
         self._plot_confusion_matrix(final_target, final_pred)
+        self._plot_per_class_metrics(final_target, final_pred)
+        self._plot_roc_curves(final_target)
+        self._plot_grad_norm_curve()
+        self._plot_lr_curve()
+        self._plot_epoch_time_curve()
         
         results = {
             'best_epoch': self.best_epoch + 1,
@@ -809,4 +875,148 @@ class hsTrainer:
         h_f.remove()
         h_b.remove()
         return cam
-    
+
+    def _plot_per_class_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> None:
+        """Bar chart of per-class Precision / Recall / F1."""
+        if not hasattr(self.config.clsf, 'targets'):
+            return
+        num_classes = self.config.clsf.num
+        names = self.config.clsf.targets[:num_classes]
+
+        p, r, f1, sup = precision_recall_fscore_support(
+            y_true, y_pred, labels=range(num_classes), zero_division=0)
+
+        x = np.arange(num_classes)
+        width = 0.25
+
+        fig, ax = plt.subplots(figsize=(12, 5))
+        ax.bar(x - width, p, width, label='Precision', color='#2196F3', alpha=0.85)
+        ax.bar(x, r, width, label='Recall', color='#FF5722', alpha=0.85)
+        ax.bar(x + width, f1, width, label='F1-Score', color='#4CAF50', alpha=0.85)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(names, rotation=45, ha='right', fontsize=9)
+        ax.set_ylim(0, 1.1)
+        ax.set_ylabel('Score')
+        ax.set_title(f'{self.model_name} — Per-Class Metrics', fontsize=13, fontweight='bold')
+        ax.legend()
+        ax.grid(axis='y', alpha=0.3)
+
+        plt.tight_layout()
+        path = os.path.join(self.output, 'per_class_metrics.png')
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  Per-class metrics saved to {path}")
+
+    def _plot_roc_curves(self, y_true: np.ndarray) -> None:
+        """Per-class ROC curves with AUC for the current model."""
+        if not hasattr(self, '_last_probas') or self._last_probas is None:
+            return
+        num_classes = self.config.clsf.num
+        names = self.config.clsf.targets[:num_classes]
+        proba = self._last_probas
+
+        y_onehot = np.zeros((len(y_true), num_classes))
+        for i, t in enumerate(y_true):
+            if 0 <= t < num_classes:
+                y_onehot[i, t] = 1
+
+        fig, ax = plt.subplots(figsize=(8, 7))
+        for cls_i in range(num_classes):
+            fpr, tpr, _ = roc_curve(y_onehot[:, cls_i], proba[:, cls_i])
+            roc_auc = auc(fpr, tpr)
+            ax.plot(fpr, tpr, label=f'{names[cls_i]} (AUC={roc_auc:.3f})', linewidth=1.3)
+
+        ax.plot([0, 1], [0, 1], 'k--', alpha=0.4)
+        ax.set_xlabel('False Positive Rate')
+        ax.set_ylabel('True Positive Rate')
+        ax.set_title(f'{self.model_name} — Per-Class ROC Curves', fontsize=13, fontweight='bold')
+        ax.legend(fontsize=8, loc='lower right')
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        path = os.path.join(self.output, 'roc_curves.png')
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  ROC curves saved to {path}")
+
+    def _plot_grad_norm_curve(self) -> None:
+        """Gradient L2 norm across training epochs."""
+        if not self.grad_norms:
+            return
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(self.grad_norms, marker='o', markersize=3, linewidth=1.5, color='#FF5722')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Gradient L2 Norm')
+        ax.set_title(f'{self.model_name} — Gradient Norm', fontsize=13, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        path = os.path.join(self.output, 'gradient_norm.png')
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  Gradient norm curve saved to {path}")
+
+    def _plot_lr_curve(self) -> None:
+        """Learning rate schedule over training epochs."""
+        if not self.lr_history:
+            return
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(self.lr_history, linewidth=1.5, color='#2196F3')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Learning Rate')
+        ax.set_yscale('log')
+        ax.set_title(f'{self.model_name} — Learning Rate Schedule', fontsize=13, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        path = os.path.join(self.output, 'lr_schedule.png')
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  LR schedule saved to {path}")
+
+    def _plot_epoch_time_curve(self) -> None:
+        """Wall-clock time per epoch."""
+        if not self.epoch_times:
+            return
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.bar(range(len(self.epoch_times)), self.epoch_times,
+               color='#4CAF50', alpha=0.8)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Time (s)')
+        ax.set_title(f'{self.model_name} — Per-Epoch Wall-Clock Time', fontsize=13, fontweight='bold')
+        ax.grid(axis='y', alpha=0.3)
+        plt.tight_layout()
+        path = os.path.join(self.output, 'epoch_times.png')
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  Epoch time chart saved to {path}")
+
+    def _measure_inference_time(self, num_batches: int = 10) -> float:
+        """
+        Measure average inference latency in ms per batch.
+        
+        Returns:
+            Average inference time in milliseconds.
+        """
+        self.model.eval()
+        times = []
+        try:
+            test_iter = iter(self.test_loader)
+            for _ in range(min(num_batches, len(self.test_loader))):
+                batch_data = next(test_iter)
+                hsi, _ = self._unpack_batch(batch_data)
+                hsi = hsi.to(self.device, non_blocking=True)
+                if hsi.dim() == 4 and hsi.shape[-1] <= 16:
+                    hsi = hsi.permute(0, 3, 1, 2)
+                hsi = self._normalize(hsi)
+
+                if self.device.type == 'cuda':
+                    torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                with torch.no_grad():
+                    _ = self.model(hsi)
+                if self.device.type == 'cuda':
+                    torch.cuda.synchronize()
+                times.append((time.perf_counter() - t0) * 1000)  # ms
+        except Exception:
+            pass
+        return float(np.mean(times)) if times else 0.0

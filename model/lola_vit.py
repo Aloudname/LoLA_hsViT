@@ -756,14 +756,13 @@ class LoLA_hsViT(nn.Module):
             x = x.unsqueeze(1)  # [B, 1, C, H, W]
             
         # Enhanced spectral processing with 3D convolution
-        x = self.spectral_conv(x)  # [B, dim, D, H, W]
+        x = self.spectral_conv(x)  # [B, dim, C, H, W]
         
         x = self.band_dropout(x)
         x = self.spectral_attention(x)  # Now uses adaptive attention
         
         # Average over spectral dimension -> [B, dim, H, W]
         x = x.mean(dim=2)
-        
 
         # Patch embedding
         x = self.patch_embed(x)  # [B, dim, H/2, W/2]

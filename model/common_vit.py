@@ -126,7 +126,7 @@ class TransformerBlock(nn.Module):
     """
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False,
                  drop=0., attn_drop=0., drop_path=0., 
-                 act_layer=Swish, norm_layer=nn.LayerNorm):
+                norm_layer=nn.LayerNorm):
         super().__init__()
         
         self.norm1 = norm_layer(dim)
@@ -141,7 +141,8 @@ class TransformerBlock(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(dim, mlp_hidden_dim),
-            SwiGLU(mlp_hidden_dim, mlp_hidden_dim, mlp_hidden_dim),
+            nn.ReLU(inplace=True),
+            # SwiGLU(mlp_hidden_dim, mlp_hidden_dim, mlp_hidden_dim),
             nn.Dropout(drop),
             nn.Linear(mlp_hidden_dim, dim),
             nn.Dropout(drop)
@@ -193,13 +194,13 @@ class CommonViT(nn.Module):
         self.spectral_conv = nn.Sequential(
             nn.Conv3d(1, 32, kernel_size=(7, 3, 3), padding=(3, 1, 1)),
             nn.BatchNorm3d(32),
-            Swish(),
+            nn.ReLU(inplace=True),
             nn.Conv3d(32, 64, kernel_size=(5, 3, 3), padding=(2, 1, 1)),
             nn.BatchNorm3d(64),
-            Swish(),
+            nn.ReLU(inplace=True),
             nn.Conv3d(64, dim, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
             nn.BatchNorm3d(dim),
-            Swish()
+            nn.ReLU(inplace=True)
         )
         
         self.band_dropout = BandDropout(drop_rate=0.1)
@@ -210,7 +211,7 @@ class CommonViT(nn.Module):
         self.patch_embed = nn.Sequential(
             nn.Conv2d(dim, dim, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(dim),
-            Swish()
+            nn.ReLU(inplace=True)
         )
         
         self.patch_resolution = spatial_size // 2
@@ -261,7 +262,7 @@ class CommonViT(nn.Module):
                         nn.Conv2d(current_dim, self.dims[level_idx + 1], 
                                 kernel_size=3, stride=2, padding=1),
                         nn.BatchNorm2d(self.dims[level_idx + 1]),
-                        Swish()
+                        nn.ReLU(inplace=True)
                     )
                 )
         

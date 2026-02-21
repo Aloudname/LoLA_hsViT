@@ -7,61 +7,71 @@ import torch.nn.functional as F
 from timm.layers import trunc_normal_
 
 
-class SEBlock(nn.Module):
-    def __init__(self, channels, reduction=16):
+
+class DoubleConv(nn.Module):
+    """(Conv3D -> IN -> ReLU) * 2"""
+
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.channels = channels
-        self.reduction = reduction
-        
-        self.adaptive_pool_2d = nn.AdaptiveAvgPool2d(1)
-        self.adaptive_pool_3d = nn.AdaptiveAvgPool3d(1)
-        
-        self.fc = nn.Sequential(
-            # Squeeze
-            nn.Linear(channels, channels // reduction, bias=False),
+        self.double_conv = nn.Sequential(
+            nn.Conv3d(in_channels, out_channels, kernel_size = 3, stride = 1, padding = 1,bias=True),
             nn.ReLU(inplace=True),
-            
-            # Excitation
-            nn.Linear(channels // reduction, channels, bias=False),
-            nn.Sigmoid()
+            nn.Conv3d(out_channels, out_channels, kernel_size = 3, stride = 1, padding = 1,bias=True),
+            nn.ReLU(inplace=True)
         )
 
     def forward(self, x):
-        if x.dim() == 5:  # 3D: (B, C, D, H, W)
-            b, c, d, h, w = x.size()
-            y = self.adaptive_pool_3d(x).view(b, c)
-            y = self.fc(y).view(b, c, 1, 1, 1)
-            return x * y.expand_as(x)
-        elif x.dim() == 4:  # 2D: (B, C, H, W)
-            b, c, h, w = x.size()
-            y = self.adaptive_pool_2d(x).view(b, c)
-            y = self.fc(y).view(b, c, 1, 1)
-            return x * y.expand_as(x)
-        else:
-            raise ValueError(f"Unsupported tensor shape: {x.dim()}")
+        return self.double_conv(x)
 
+# down-sampling
+class Down(nn.Module):
 
-class BandDropout(nn.Module):
-    """Dropout for spectral bands C"""
-    def __init__(self, drop_rate=0.1):
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.drop_rate = drop_rate
+        self.encoder = nn.Sequential(
+            nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2), ceil_mode=True),
+            DoubleConv(in_channels, out_channels)
+        )
 
     def forward(self, x):
-        if not self.training or self.drop_rate == 0:
-            return x
-            
-        if x.dim() == 5:  # (b, c, d, h, w)
-            b, c, d, h, w = x.shape
-            mask = torch.bernoulli(torch.ones(b, c, d, 1, 1, device=x.device) * (1 - self.drop_rate))
-        elif x.dim() == 4:  # (b, c, h, w)
-            b, c, h, w = x.shape
-            mask = torch.bernoulli(torch.ones(b, c, 1, 1, device=x.device) * (1 - self.drop_rate))
+        return self.encoder(x)
+
+# up-sampling
+class Up(nn.Module):
+
+    def __init__(self, in_channels, out_channels, trilinear = True):
+        super().__init__()
+
+        if trilinear:
+            self.up = nn.Upsample(scale_factor = 2)
         else:
-            return x
-        
-        x = x * mask / (1 - self.drop_rate)
-        return x
+            self.up = nn.ConvTranspose3d(in_channels // 2, in_channels // 2, kernel_size = 2, stride = 2)
+
+        self.conv = DoubleConv(in_channels, out_channels)
+        self.downc = nn.Conv3d(in_channels, out_channels, kernel_size = 3, stride=1, padding=1, bias=True)
+        self.downr = nn.ReLU(inplace=True)
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+
+        diffZ = x2.size()[2] - x1.size()[2]
+        diffY = x2.size()[3] - x1.size()[3]
+        diffX = x2.size()[4] - x1.size()[4]
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2, diffZ // 2, diffZ - diffZ // 2])
+
+        x1 = self.downr(self.downc(x1))
+
+        x = torch.cat([x2, x1], dim = 1)
+        return self.conv(x)
+
+# Output layer
+class Out(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size = 3, stride=1, padding=1)
+
+    def forward(self, x):
+        return self.conv(x)
     
 
 class Unet(nn.Module):
@@ -70,131 +80,45 @@ class Unet(nn.Module):
     Same API and params with LoLA are remaining.
     """
     
-    def __init__(self, in_channels=15, num_classes=9, dim=96, 
-                 spatial_size=15):
+    def __init__(self, in_channels=15, num_classes=9, dim=64):
         """
-        Hyperspectral U-net for classification.
+        Standard, common ViT for hyperspectral image classification.
         
         params:
             in_channels (int): 15 default.
             num_classes (int): 9 default.
             dim (int): dim of feature maps, 96 default.
-            spatial_size (int): input spatial size (pixel), 15 default.
-            r (int): only for compatibility.
-            lora_alpha (float): only for compatibility.
-            depths (list): only for compatibility.
-            num_heads (list): only for compatibility.
-            window_size (list): only for compatibility.
-            mlp_ratio (float): only for compatibility.
-            drop_path_rate (float): only for compatibility.
         """
+        
         super().__init__()
         self.in_channels = in_channels
         self.num_classes = num_classes
         self.dim = dim
-        self.spatial_size = spatial_size
         
         print(f"U-net initialized with {in_channels} input channels, "
-              f"{num_classes} classes, dim {dim}, spatial_size {spatial_size}")
+              f"{num_classes} classes")
         
-        # preprocessing layers.
-        self.encode_conv1 = nn.Sequential(
-            nn.Conv3d(1, 64, kernel_size=(3, 3, 3), padding=(0, 0, 0)),
-            nn.BatchNorm3d(64),
-            nn.ReLU(),
-            nn.Conv3d(64, 64, kernel_size=(3, 3, 3), padding=(0, 0, 0)),
-            nn.BatchNorm3d(64),
-            nn.ReLU()
-        )
-        self.SEBlock1 = SEBlock(64)
-        self.max_pool1 = nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(2, 2, 2))
         
-        self.encode_conv2 = nn.Sequential(
-            nn.Conv3d(64, 128, kernel_size=(3, 3, 3), padding=(0, 0, 0)),
-            nn.BatchNorm3d(128),
-            nn.ReLU(),
-            nn.Conv3d(128, 128, kernel_size=(3, 3, 3), padding=(0, 0, 0)),
-            nn.BatchNorm3d(128),
-            nn.ReLU()
-        )
-        self.SEBlock2 = SEBlock(128)
-        self.max_pool2 = nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(2, 2, 2))
+        self.in_conv = DoubleConv(in_channels, dim)  # [B, dim, D, H, W]
         
-        self.encode_conv3 = nn.Sequential(
-            nn.Conv3d(128, 256, kernel_size=(3, 3, 3), padding=(0, 0, 0)),
-            nn.BatchNorm3d(256),
-            nn.ReLU(),
-            nn.Conv3d(256, 256, kernel_size=(3, 3, 3), padding=(0, 0, 0)),
-            nn.BatchNorm3d(256),
-            nn.ReLU()
-        )
-        self.SEBlock3 = SEBlock(256)
-        self.max_pool3 = nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(2, 2, 2))
+        self.encoder_conv1 = Down(dim, dim * 2)  # [B, 2*dim, D/2, H/2, W/2]
+        self.encoder_conv2 = Down(dim * 2, dim * 4)  # [B, 4*dim, D/4, H/4, W/4]
+        self.encoder_conv3 = Down(dim * 4, dim * 8)  # [B, 8*dim, D/8, H/8, W/8]
+        self.encoder_conv4 = Down(dim * 8, dim * 16)  # [B, 16*dim, D/16, H/16, W/16]
         
-        self.encode_conv4 = nn.Sequential(
-            nn.Conv3d(256, 512, kernel_size=(3, 3, 3), padding=(0, 0, 0)),
-            nn.BatchNorm3d(512),
-            nn.ReLU(),
-            nn.Conv3d(512, 512, kernel_size=(3, 3, 3), padding=(0, 0, 0)),
-            nn.BatchNorm3d(512),
-            nn.ReLU()
-        )
-        self.SEBlock4 = SEBlock(512)
-        self.max_pool4 = nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(2, 2, 2))
+        self.decoder_conv4 = Up(dim * 16, dim * 8)  # [B, 8*dim, D/8, H/8, W/8]
+        self.decoder_conv3 = Up(dim * 8, dim * 4)  # [B, 4*dim, D/4, H/4, W/4]
+        self.decoder_conv2 = Up(dim * 4, dim * 2)  # [B, 2*dim, D/2, H/2, W/2]
+        self.decoder_conv1 = Up(dim * 2, dim)  # [B, dim, D, H, W]
+        self.out_conv = Out(dim, num_classes)  # [B, num_classes, D, H, W]
         
-        self.plain_conv = nn.Sequential(
-            nn.Conv3d(512, 1024, kernel_size=(3, 3, 3), padding=(0, 0, 0)),
-            nn.BatchNorm3d(1024),
-            nn.ReLU(),
-            nn.Conv3d(1024, 1024, kernel_size=(3, 3, 3), padding=(0, 0, 0)),
-            nn.BatchNorm3d(1024),
-            nn.ReLU()
-        )
+        # Classification head
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.head = nn.Linear(dim, num_classes)
         
-        self.decode_conv4 = nn.Sequential(
-            nn.Conv3d(1024, 512, kernel_size=(3, 3, 3), padding=(0, 0, 0)),
-            nn.BatchNorm3d(512),
-            nn.ReLU(),
-            nn.Conv3d(512, 512, kernel_size=(3, 3, 3), padding=(0, 0, 0)),
-            nn.BatchNorm3d(512),
-            nn.ReLU()
-        )
-        
-        self.decode_conv3 = nn.Sequential(
-            nn.Conv3d(512, 256, kernel_size=(3, 3, 3), padding=(0, 0, 0)),
-            nn.BatchNorm3d(256),
-            nn.ReLU(),
-            nn.Conv3d(256, 256, kernel_size=(3, 3, 3), padding=(0, 0, 0)),
-            nn.BatchNorm3d(256),
-            nn.ReLU()
-        )
-        
-        self.decode_conv2 = nn.Sequential(
-            nn.Conv3d(256, 128, kernel_size=(3, 3, 3), padding=(0, 0, 0)),
-            nn.BatchNorm3d(128),
-            nn.ReLU(),
-            nn.Conv3d(128, 128, kernel_size=(3, 3, 3), padding=(0, 0, 0)),
-            nn.BatchNorm3d(128),
-            nn.ReLU()
-        )
-        
-        self.decode_conv1 = nn.Sequential(
-            nn.Conv3d(128, 64, kernel_size=(3, 3, 3), padding=(0, 0, 0)),
-            nn.BatchNorm3d(64),
-            nn.ReLU(),
-            nn.Conv3d(64, 64, kernel_size=(3, 3, 3), padding=(0, 0, 0)),
-            nn.BatchNorm3d(64),
-            nn.ReLU()
-        )
-        
-        # classification head
+        # useful components
         self.final_feature_map = None  # for CAM
-        self.norm = nn.LayerNorm(64)
-        self.avgpool = nn.AdaptiveAvgPool1d(1)
-        self.head = nn.Linear(64, num_classes)
-        
         self.apply(self._init_weights)
-        
         print(f"U-net initialized successfully.")
 
     def _init_weights(self, m):
@@ -208,11 +132,9 @@ class Unet(nn.Module):
 
     def freeze_all_but_lora(self):
         """
-        Freeze all parameters except the classification head and norm layers.
+        Null compatible with LoLA interface.
         """
-        for name, param in self.named_parameters():
-            if 'head' not in name and 'norm' not in name:
-                param.requires_grad = False
+        pass
 
     def merge_all_lora_into_linear(self):
         """
@@ -230,6 +152,7 @@ class Unet(nn.Module):
         
         # shape of last feat. map: [B, C, H, W]
         feature_map = self.final_feature_map
+        B, C_feat, H, W = feature_map.shape
         
         # CAM: weights @ feature_map -> [B, num_classes, H, W]
         cam = torch.einsum('kc, bchw -> bkhw', weights, feature_map)
@@ -249,47 +172,25 @@ class Unet(nn.Module):
         input shape: [B, C, H, W]
         """
         if x.dim() == 4:  # [B, C, H, W]
-            x = x.unsqueeze(2)  # [B, C, 1, H, W]
+            x = x.unsqueeze(2)  # [B, C, 1, H, W] - add depth dimension for Conv3d
+            
+        x1 = self.in_conv(x)  # [B, dim, D, H, W]
+        x2 = self.encoder_conv1(x1)  # [B, 2*dim, D/2, H/2, W/2]
+        x3 = self.encoder_conv2(x2)  # [B, 4*dim, D/4, H/4, W/4]
+        x4 = self.encoder_conv3(x3)  # [B, 8*dim, D/8, H/8, W/8]
+        x5 = self.encoder_conv4(x4)  # [B, 16*dim, D/16, H/16, W/16]
         
-        B, C, D, H, W = x.shape
-        x = self.encode_conv1(x)
-        x = self.SEBlock1(x)
-        x = self.max_pool1(x)
+        mask = self.decoder_conv4(x5, x4)  # [B, 8*dim, D/8, H/8, W/8]
+        mask = self.decoder_conv3(mask, x3)  # [B, 4*dim, D/4, H/4, W/4]
+        mask = self.decoder_conv2(mask, x2)  # [B, 2*dim, D/2, H/2, W/2]
+        x = self.decoder_conv1(mask, x1)  # [B, dim, D, H, W]
+        x = x.mean(dim=2)  # global spectral pooling -> [B, dim(new C), H, W]
         
-        x = self.encode_conv2(x)
-        x = self.SEBlock2(x)
-        x = self.max_pool2(x)
-        
-        x = self.encode_conv3(x)
-        x = self.SEBlock3(x)
-        x = self.max_pool3(x)
-        
-        x = self.encode_conv4(x)
-        x = self.SEBlock4(x)
-        x = self.max_pool4(x)
-        
-        x = self.plain_conv(x)
-        
-        x = F.interpolate(x, scale_factor=2, mode='trilinear', align_corners=False)
-        x = self.decode_conv4(x)
-        
-        x = F.interpolate(x, scale_factor=2, mode='trilinear', align_corners=False)
-        x = self.decode_conv3(x)
-        
-        x = F.interpolate(x, scale_factor=2, mode='trilinear', align_corners=False)
-        x = self.decode_conv2(x)
-        
-        x = F.interpolate(x, scale_factor=2, mode='trilinear', align_corners=False)
-        x = self.decode_conv1(x)
-        
-        # ave pooling -> [B, 64, 1, 1, 1]
-        x_pooled = F.adaptive_avg_pool3d(x, (1, 1, 1))
-        # for CAM: [B, 64, H, W]
-        self.final_feature_map = x.reshape(B, H, W, C).permute(0, 3, 1, 2).detach()
-        
-        return x_pooled
+        # Store feature map for CAM generation
+        self.final_feature_map = x.detach()  # [B, C, H, W]
+        return x
 
-    def forward(self, x, return_cam=True):
+    def forward(self, x, pretrained_input=None, return_cam=False):
         """
         Args:
             x: input [B, C, H, W]
@@ -309,10 +210,11 @@ class Unet(nn.Module):
         if C != self.in_channels:
             print(f"WARNING: Input has {C} channels, but model expects {self.in_channels}")
         
-        x = self.forward_features(x)
+        x = self.forward_features(x)  # [B, C, H, W]
         
-        # flatten
-        x = x.view(B, -1)
+        # global ave pooling
+        x = self.avgpool(x)     # [B, C, 1, 1]
+        x = x.flatten(1)        # [B, C]
         
         # classification head
         output = self.head(x)
@@ -328,10 +230,10 @@ if __name__ == "__main__":
     model = Unet(
         in_channels=15, 
         num_classes=9, 
-        spatial_size=15
+        dim=64
     )
     
-    dummy_input = torch.randn(2, 15, 15, 15)  # [B, C, H, W]
+    dummy_input = torch.randn(4, 15, 15, 15)  # [B, C, H, W]
     output = model(dummy_input)
     print(f"  Output shape: {output.shape}")  # Expected: [2, 9]
     
