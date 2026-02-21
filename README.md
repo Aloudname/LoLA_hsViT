@@ -42,7 +42,7 @@ output/
 │
 ├── model_A/
 │   ├── models/
-│   │   └── best_epoch.pth
+│   │   └── model_A_best.pth
 │   ├── CAM/
 │   │   ├── epoch_010.png
 │   │   ├── epoch_015.png
@@ -52,7 +52,7 @@ output/
 │   └── confusion_matrix.png
 ├── model_B/
 │   ├── models/
-│   │   └── best_epoch.pth
+│   │   └── model_B_best.pth
 │   ├── CAM/
 │   │   ├── epoch_010.png
 │   │   ├── epoch_015.png
