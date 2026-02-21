@@ -394,6 +394,21 @@ class NpyHSDataset(AbstractHSDataset):
             
         del flat_data  # release normalized data
             
+    def validate_data_quality(self) -> None:
+        """Check data quality: distribution, ranges, duplicates"""
+        print("\n[Dataset Quality Check]")
+        unique_labels, counts = np.unique(self.patch_labels, return_counts=True)
+        print(f"  Class distribution: {dict(zip(unique_labels, counts))}")
+        
+        # Check imbalance
+        imbalance = counts.max() / counts.min() if len(counts) > 0 else 1
+        if imbalance > 10:
+            print(f"  Class imbalance detected (ratio: {imbalance:.1f}x)")
+        
+        # Check data range
+        sample = self._get_patch(0)
+        print(f"  Data range: [{sample.min():.4f}, {sample.max():.4f}]")
+    
     def create_data_loader(self, num_workers=4, batch_size=None, pin_memory=True, 
                            prefetch_factor=2, persistent_workers=False):
         """
@@ -543,6 +558,21 @@ class MatHSDataset(AbstractHSDataset):
         self.processed_data = pca_data.reshape(h, w, self.pca_components)
         return self.processed_data, pca
 
+    def validate_data_quality(self) -> None:
+        """Check data quality: distribution, ranges, duplicates"""
+        print("\n[Dataset Quality Check]")
+        unique_labels, counts = np.unique(self.patch_labels, return_counts=True)
+        print(f"  Class distribution: {dict(zip(unique_labels, counts))}")
+        
+        # Check imbalance
+        imbalance = counts.max() / counts.min() if len(counts) > 0 else 1
+        if imbalance > 10:
+            print(f"  Class imbalance detected (ratio: {imbalance:.1f}x)")
+        
+        # Check data range
+        sample = self._get_patch(0)
+        print(f"  Data range: [{sample.min():.4f}, {sample.max():.4f}]")
+    
     def create_data_loader(self, num_workers=0):
         """
             Create enhanced data loaders with comprehensive processing

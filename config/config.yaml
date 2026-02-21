@@ -25,7 +25,7 @@ split:
   test_rate: 0.2 # 0.2 default.
   batch_size: 1024  # This refers to the size on a single GPU.
   patch_size: 15  # Pixel size of image patches.
-  eval_batch_size: 32  # Smaller eval batch size for CPU training
+  eval_batch_size: 1024  # Smaller eval batch size for CPU training
 preprocess:
   pca_components: 15  # Number of PCA components to retain.
 memory:
@@ -33,6 +33,7 @@ memory:
   pin_memory: true  # true is faster but may cause memoleak in distant server.
   num_workers: 4  # Workers on single GPU. More memory usage to accelerate data loading.
   max_workers: 8  # max threads.
+  prefetch_factor: 4  # Prefetch batches to speed up training.
 path:
   data: /data/xjz/houCT/CRCFound-main/dinov3-main/dinov3/data/processed_npy_64_norm
   label: /data/xjz/houCT/CRCFound-main/dinov3-main/dinov3/data/processed_npy_64_norm

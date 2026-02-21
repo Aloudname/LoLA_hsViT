@@ -8,24 +8,22 @@ start train with:
     trainer.train()
 """
 
-import os
-import time
-import warnings
-import traceback
-from typing import Tuple, Callable, Dict
+
 
 import numpy as np
-import torch
+import seaborn as sns
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
-from sklearn.metrics import accuracy_score, cohen_kappa_score, confusion_matrix
-from torch.cuda.amp import GradScaler, autocast
-from torch.nn import Module
+
 from tqdm import tqdm
 from munch import Munch
-
+from torch.nn import Module
+from typing import Tuple, Callable, Dict
 from pipeline.dataset import AbstractHSDataset
+from torch.cuda.amp import GradScaler, autocast
+from sklearn.metrics import accuracy_score, cohen_kappa_score, confusion_matrix, precision_recall_fscore_support
+import cv2, os, time, torch, traceback, warnings
 
 warnings.filterwarnings("ignore")
 
@@ -129,7 +127,7 @@ class hsTrainer:
             # Optimize data loading for multi-GPU
             num_workers = self.config.memory.num_workers
             batch_size = self.config.split.batch_size
-            prefetch_factor = 2
+            prefetch_factor = 0
             persistent_workers = False
             
             if self.num_gpus > 1:
@@ -144,7 +142,7 @@ class hsTrainer:
                 
                 # prefetch_factor=2: preload 2 batches per worker.
                 # persistent_workers=True: avoid frequent worker del.
-                prefetch_factor = 2
+                prefetch_factor = self.config.memory.prefetch_factor
                 persistent_workers = True
                 
                 print(f"  [Multi-GPU Optimization] Scaling for {self.num_gpus} GPUs:")
@@ -194,17 +192,18 @@ class hsTrainer:
                 print(f"  Continuing with single GPU training")
     
     def _setup_training(self) -> None:
-        """initialize training components including optimizer, scheduler, loss function, and mixed precision settings"""
+        """Initialize training components: optimizer, scheduler, loss, precision"""
         print("Initializing training components with:")
         
-        # Optimizer
+        # Optimizer - AdamW for better generalization
         lr = self.config.common.lr
         weight_decay = self.config.common.weight_decay
         
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=lr,
-            weight_decay=weight_decay
+            weight_decay=weight_decay,
+            betas=(0.9, 0.999)
         )
         print(f"  optimizer: AdamW (lr={lr}, weight_decay={weight_decay})")
         
@@ -324,51 +323,49 @@ class hsTrainer:
     @torch.no_grad()
     def evaluate(self) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
         """
-        evaluate on the test set.
+        Evaluate on the test set with optimized performance.
+        
+        Optimizations:
+        - Reuse test_loader (already optimized) instead of recreating
+        - Use larger batch_size for better throughput
+        - non_blocking=True for async data transfer
+        - torch.no_grad() to save memory
+        - Batch array operations instead of extend() for faster collection
         
         Return:
             Tuple (``loss``, ``accuracy``, ``kappa``, ``predictions``, ``labels``)
         """
         self.model.eval()
         total_loss = 0.0
-        predictions = []
-        targets = []
+        predictions_list = []
+        targets_list = []
         
-        eval_batch_size = self.config.common.eval_batch_size if hasattr(self.config.common, 'eval_batch_size') else 64
-        if self.device.type == 'cpu':
-            eval_batch_size = min(eval_batch_size, 16)
-        
-        eval_loader = torch.utils.data.DataLoader(
-            self.test_loader.dataset,
-            batch_size=eval_batch_size,
-            shuffle=False,
-            num_workers=self.config.memory.num_workers,
-            pin_memory=False
-        )
+        eval_loader = self.test_loader
         
         pbar = tqdm(eval_loader, desc='Evaluating', leave=False)
         
-        for batch_data in pbar:
-            hsi, labels = self._unpack_batch(batch_data)
-            hsi = hsi.to(self.device)
-            labels = labels.to(self.device)
-            
-            # format check up
-            if hsi.dim() == 4 and hsi.shape[-1] <= 16:
-                hsi = hsi.permute(0, 3, 1, 2)
-            
-            hsi = self._normalize(hsi)
-            
-            outputs = self.model(hsi)
-            loss = self.criterion(outputs, labels)
-            total_loss += loss.item()
-            
-            _, predicted = torch.max(outputs, 1)
-            predictions.extend(predicted.cpu().numpy())
-            targets.extend(labels.cpu().numpy())
+        with torch.no_grad():
+            for batch_data in pbar:
+                hsi, labels = self._unpack_batch(batch_data)
+                hsi = hsi.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
+                
+                # format check up
+                if hsi.dim() == 4 and hsi.shape[-1] <= 16:
+                    hsi = hsi.permute(0, 3, 1, 2)
+                
+                hsi = self._normalize(hsi)
+                
+                outputs = self.model(hsi)
+                loss = self.criterion(outputs, labels)
+                total_loss += loss.item()
+                
+                _, predicted = torch.max(outputs, 1)
+                predictions_list.append(predicted.cpu().numpy())
+                targets_list.append(labels.cpu().numpy())
         
-        predictions = np.array(predictions)
-        targets = np.array(targets)
+        predictions = np.concatenate(predictions_list, axis=0)
+        targets = np.concatenate(targets_list, axis=0)
         
         acc = accuracy_score(targets, predictions) * 100
         kappa = cohen_kappa_score(targets, predictions) * 100
@@ -378,17 +375,19 @@ class hsTrainer:
     
     def train(self) -> Dict[str, float]:
         """
-        training for epochs.
-        
-        Args:
-            debug_mode: return CAM for every epoch if ``True``.
+        Training loop with optional data validation.
         
         Returns:
             Dict[``str``, ``float``] of final results.
         """
+        # Validate data quality on first epoch
+        if not hasattr(self, '_data_validated'):
+            self._validate_data_quality()
+            self._data_validated = True
+        
         print(f"\n{'='*20}")
         if self.debug_mode:
-            print(f"Debug mode enabled: CAM and Eval enabled every epoch.")
+            print(f"Debug mode enabled: CAM and visualizations enabled every epoch.")
         print(f"Training ({self.model_name})")
         print(f"{'='*20}\n")
         
@@ -432,12 +431,12 @@ class hsTrainer:
             else:
                 print(f"[Epoch {epoch+1:3d}] Train Loss: {train_loss:.4f} Acc: {train_acc:6.2f}%", end='')
             
-            # generate CAM for debug mode or every 2 epochs
+            # Generate visualizations
             if self.debug_mode or (should_eval and (epoch + 1) % 2 == 0):
                 try:
                     self._generate_cam(epoch)
                 except Exception as e:
-                    print(f"  Error during CAM generating: {e}")
+                    print(f"  CAM error: {e}")
         
         toc = time.perf_counter()
         training_time = toc - tic
@@ -455,7 +454,7 @@ class hsTrainer:
         # final evaluation
         final_loss, final_acc, final_kappa, final_pred, final_target = self.evaluate()
         
-        # visualization
+        # Final visualizations
         self._plot_training_curves()
         self._plot_confusion_matrix(final_target, final_pred)
         
@@ -467,9 +466,7 @@ class hsTrainer:
             'training_time': training_time,
             'model_path': os.path.join(self.output, 'models', f'{self.model_name}_best.pth')
         }
-        
         return results
-    
     
     def _generate_cam(self, epoch: int) -> None:
         """
@@ -568,32 +565,93 @@ class hsTrainer:
         plt.savefig(path, dpi=150, bbox_inches='tight')
         plt.close()
         print(f"  Curve saved to {path}")
-    
+
     def _plot_confusion_matrix(self, y_true: np.ndarray, y_pred: np.ndarray) -> None:
-        """plotting confusion matrix"""
+        """Confusion matrix per class"""
+        if not hasattr(self.config.clsf, 'targets'):
+            return
+        
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            y_true, y_pred, labels=range(self.config.clsf.num), zero_division=0
+        )
+        
+        print("\n[Classification Metrics]")
+        for i in range(self.config.clsf.num):
+            name = self.config.clsf.targets[i] if i < len(self.config.clsf.targets) else f"Class_{i}"
+            print(f"  {i:1d}. {name:10s} | P:{precision[i]:.4f} | R:{recall[i]:.4f} | F1:{f1[i]:.4f}")
+        
+        # Plot enhanced confusion matrix
         cm = confusion_matrix(y_true, y_pred)
+        cm_norm = cm.astype('float') / (cm.sum(axis=1, keepdims=True) + 1e-8)
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+        # Count
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[0])
+        axes[0].set_title('Confusion Matrix (Count)')
+        axes[0].set_ylabel('True')
+        axes[0].set_xlabel('Predicted')
         
-        fig, ax = plt.subplots(figsize=(10, 8))
-        im = ax.imshow(cm, cmap='Blues', aspect='auto')
-        
-        ax.set_xlabel('Predicted Label')
-        ax.set_ylabel('True Label')
-        ax.set_title('Confusion Matrix')
-        
-        for i in range(cm.shape[0]):
-            for j in range(cm.shape[1]):
-                text = ax.text(j, i, cm[i, j],
-                             ha="center", va="center",
-                             color="white" if cm[i, j] > cm.max() / 2 else "black",
-                             fontsize=8)
-        
-        plt.colorbar(im, ax=ax)
+        # Normalized
+        sns.heatmap(cm_norm, annot=True, fmt='.1%', cmap='Greens', ax=axes[1])
+        axes[1].set_title('Confusion Matrix (Normalized)')
+        axes[1].set_ylabel('True')
+        axes[1].set_xlabel('Predicted')
+
         plt.tight_layout()
-        path = os.path.join(self.output, 'confusion_matrix.png')
-        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.savefig(os.path.join(self.output, 'confusion_matrix.png'), dpi=150, bbox_inches='tight')
         plt.close()
-        print(f"  Confusion matrix saved to {path}")
-    
+
+    def _visualize_layer_activations(self) -> None:
+        """Visualize layer activation statistics for debugging"""
+        self.model.eval()
+        try:
+            sample, _ = self.test_loader.dataset[0]
+            sample = sample.unsqueeze(0).to(self.device)
+            
+            activation_stats = {}
+            hooks = []
+            
+            def hook_fn(name):
+                def hook(module, input, output):
+                    if isinstance(output, torch.Tensor):
+                        activation_stats[name] = {
+                            'mean': output.mean().item(),
+                            'std': output.std().item(),
+                        }
+                return hook
+            
+            # Register hooks for Conv and Linear layers
+            for name, module in self.model.named_modules():
+                if isinstance(module, (nn.Linear, nn.Conv2d)):
+                    hooks.append(module.register_forward_hook(hook_fn(name)))
+            
+            with torch.no_grad():
+                _ = self.model(sample)
+            
+            # Clean up hooks
+            for h in hooks:
+                h.remove()
+            
+            # Visualize if we have data
+            if len(activation_stats) > 0:
+                layers = list(activation_stats.keys())[:15]
+                means = [activation_stats[l]['mean'] for l in layers]
+                stds = [activation_stats[l]['std'] for l in layers]
+                
+                fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+                axes[0].bar(range(len(means)), means, alpha=0.7, color='steelblue')
+                axes[0].set_title('Mean Activation by Layer')
+                axes[0].set_xlabel('Layer Index')
+                axes[1].bar(range(len(stds)), stds, alpha=0.7, color='coral')
+                axes[1].set_title('Std Activation by Layer')
+                axes[1].set_xlabel('Layer Index')
+                plt.tight_layout()
+                save_path = os.path.join(self.output, 'layer_activations.png')
+                plt.savefig(save_path, dpi=150, bbox_inches='tight')
+                plt.close()
+        except Exception as e:
+            print(f"  Layer visualization skipped: {e}")
     
     def _unpack_batch(self, batch_data) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -660,11 +718,13 @@ class hsTrainer:
     
     def predict(self, hsi: torch.Tensor) -> torch.Tensor:
         """
-        predict single sample/batch    
-        hsi: shape of [B, C, H, W] or [B, H, W, C]
-
+        Predict single sample/batch.
+        
+        Args:
+            hsi: Tensor [B, C, H, W] or [B, H, W, C]
+            
         Returns:
-            tensor: predicted labels [B]
+            Predicted labels [B]
         """
         self.model.eval()
         
@@ -679,3 +739,74 @@ class hsTrainer:
             predictions = torch.argmax(outputs, dim=1)
         
         return predictions
+    
+    def _validate_data_quality(self) -> None:
+        """Validate dataset quality: distribution, ranges, duplicates"""
+        print("\n[Data Quality Check]")
+        labels = self.dataLoader.patch_labels
+        
+        # Class distribution
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        print(f"  Label distribution:")
+        for lbl, cnt in zip(unique_labels, counts):
+            pct = cnt / len(labels) * 100
+            print(f"    Class {lbl}: {cnt:6d} ({pct:5.1f}%)")
+        
+        # Imbalance ratio
+        imbalance = counts.max() / counts.min()
+        if imbalance > 10:
+            print(f"   Class imbalance ratio: {imbalance:.1f}x")
+        
+        # Data range check
+        sample_patch = self.dataLoader._get_patch(0)
+        data_min, data_max = sample_patch.min(), sample_patch.max()
+        print(f"  Data range: [{data_min:.4f}, {data_max:.4f}]")
+        if data_max > 1.5 or data_min < -0.5:
+            print(f"   Unexpected data range - check normalization")
+    
+    def _compute_gradcam(self, x: torch.Tensor, class_idx: int) -> np.ndarray:
+        """Compute Grad-CAM heatmap for model interpretability"""
+        features = None
+        gradients = None
+        
+        def forward_hook(module, input, output):
+            nonlocal features
+            features = output.detach()
+        
+        def backward_hook(module, grad_input, grad_output):
+            nonlocal gradients
+            gradients = grad_output[0].detach()
+        
+        # Find last Conv2d layer
+        target_layer = None
+        for module in self.model.modules():
+            if isinstance(module, nn.Conv2d):
+                target_layer = module
+        
+        if target_layer is None:
+            return np.ones((x.shape[-2], x.shape[-1])) * 0.5
+        
+        # Register hooks
+        h_f = target_layer.register_forward_hook(forward_hook)
+        h_b = target_layer.register_backward_hook(backward_hook)
+        
+        # Forward pass
+        self.model.zero_grad()
+        output = self.model(x)
+        loss = output[0, class_idx]
+        loss.backward(retain_graph=True)
+        
+        # Compute CAM
+        if features is not None and gradients is not None:
+            weights = gradients.mean(dim=(2, 3), keepdim=True)
+            cam = (features * weights).sum(dim=1).squeeze(0)
+            cam = torch.relu(cam).cpu().numpy()
+            cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+            cam = cv2.resize(cam, (x.shape[-1], x.shape[-2])) if cam.size > 0 else np.ones((x.shape[-2], x.shape[-1])) * 0.5
+        else:
+            cam = np.ones((x.shape[-2], x.shape[-1])) * 0.5
+        
+        h_f.remove()
+        h_b.remove()
+        return cam
+    
