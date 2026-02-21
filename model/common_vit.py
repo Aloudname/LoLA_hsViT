@@ -2,7 +2,6 @@
 Standard ViT.
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -268,7 +267,7 @@ class CommonViT(nn.Module):
         
         
         # clsf heads      
-        self.register_buffer('final_feature_map', torch.zeros(1))
+        self.final_feature_map = None  # for CAM
         self.norm = nn.LayerNorm(self.dims[-1])
         self.avgpool = nn.AdaptiveAvgPool1d(1)
         self.head = nn.Linear(self.dims[-1], num_classes)
@@ -292,7 +291,6 @@ class CommonViT(nn.Module):
         False name. This method actually freezes
         all parameters except the cls head and norm layers.
         """
-        # 冻除分类头外的所有参数
         for name, param in self.named_parameters():
             if 'head' not in name and 'norm' not in name:
                 param.requires_grad = False
@@ -386,8 +384,6 @@ class CommonViT(nn.Module):
 
     def forward(self, x, pretrained_input=None, return_cam=False):
         """
-        前向传播
-        
         Args:
             x: input [B, C, H, W]
             pretrained_input: Optional pretrained input.
@@ -440,16 +436,16 @@ if __name__ == "__main__":
     
     dummy_input = torch.randn(2, 15, 15, 15)  # [B, C, H, W]
     output = model(dummy_input)
-    print(f"✓ Output shape: {output.shape}")  # Expected: [2, 9]
+    print(f" Output shape: {output.shape}")  # Expected: [2, 9]
     
     output_with_cam = model(dummy_input, return_cam=True)
     if isinstance(output_with_cam, tuple):
         output, cam = output_with_cam
-        print(f"✓ CAM shape: {cam.shape}")  # Expected: [2, 9, H', W']
+        print(f"  CAM shape: {cam.shape}")  # Expected: [2, 9, H', W']
     
     model.freeze_all_but_lora()
-    print(f"✓ Model parameters frozen (except head and norm)")
+    print(f"  Model parameters frozen (except head and norm)")
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"✓ Total parameters: {total_params:,}")
-    print(f"✓ Trainable parameters: {trainable_params:,}")
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Trainable parameters: {trainable_params:,}")

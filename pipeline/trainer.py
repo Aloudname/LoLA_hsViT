@@ -318,11 +318,11 @@ class hsTrainer:
         Returns:
             Dict[``str``, ``float``] of final results.
         """
-        print(f"\n{'='*60}")
+        print(f"\n{'='*20}")
         if self.debug_mode:
             print(f"Debug mode enabled: CAM and Eval enabled every epoch.")
         print(f"Training ({self.model_name})")
-        print(f"{'='*60}\n")
+        print(f"{'='*20}\n")
         
         tic = time.perf_counter()
         
@@ -364,8 +364,8 @@ class hsTrainer:
             else:
                 print(f"[Epoch {epoch+1:3d}] Train Loss: {train_loss:.4f} Acc: {train_acc:6.2f}%", end='')
             
-            # generate CAM for debug mode or every 5 epochs
-            if self.debug_mode or (should_eval and (epoch + 1) % 5 == 0):
+            # generate CAM for debug mode or every 2 epochs
+            if self.debug_mode or (should_eval and (epoch + 1) % 2 == 0):
                 try:
                     self._generate_cam(epoch)
                 except Exception as e:
@@ -374,11 +374,11 @@ class hsTrainer:
         toc = time.perf_counter()
         training_time = toc - tic
         
-        print(f"\n{'='*60}")
+        print(f"\n{'='*20}")
         print(f"Training completed with:")
         print(f"  Best epoch: {self.best_epoch + 1} (Acc: {self.best_acc:.2f}%)")
         print(f"  Total time: {training_time:.2f}s")
-        print(f"{'='*60}\n")
+        print(f"{'='*20}\n")
         
         # load best model for final evaluation
         if self.best_model_state is not None:
@@ -496,7 +496,7 @@ class hsTrainer:
         axes[1].grid(True, alpha=0.3)
         
         plt.tight_layout()
-        path = os.path.join(self.output, 'training_curves.png')
+        path = os.path.join(self.output, 'training_curve.png')
         plt.savefig(path, dpi=150, bbox_inches='tight')
         plt.close()
         print(f"  Curve saved to {path}")
@@ -521,7 +521,6 @@ class hsTrainer:
         
         plt.colorbar(im, ax=ax)
         plt.tight_layout()
-        
         path = os.path.join(self.output, 'confusion_matrix.png')
         plt.savefig(path, dpi=150, bbox_inches='tight')
         plt.close()
@@ -559,7 +558,7 @@ class hsTrainer:
         if self.best_model_state is None:
             return
         
-        model_path = os.path.join(self.output, 'models', f'{self.model_name}_best.pth')
+        model_path = os.path.join(self.output, f'{self.model_name}_best.pth')
         torch.save(self.best_model_state['model_state'], model_path)
     
     def load_best_model(self) -> Module:

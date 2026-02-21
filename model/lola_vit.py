@@ -643,7 +643,7 @@ class LoLA_hsViT(nn.Module):
         
         # layers in final block.
         # register a buffer of final feature map for CAM.
-        self.register_buffer('final_feature_map', torch.zeros(1))
+        self.final_feature_map = None
         self.norm = nn.LayerNorm(self.dims[-1])
         self.avgpool = nn.AdaptiveAvgPool1d(1)
         self.head = LoRALinear(

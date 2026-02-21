@@ -22,7 +22,7 @@ def main() -> bool:
     parser.add_argument('--model', '-m', type=str, default='lola',
                        choices=['unet', 'vit', 'lola', 'custom'],
                        help='model type from {unet, vit, lola, custom}')
-    parser.add_argument('--epoch', '-e', type=int, default=50)
+    parser.add_argument('--epoch', '-e', type=int, default=10)
     parser.add_argument('--debug', '-d', type=bool, default=False)
     config = load_config()
     
