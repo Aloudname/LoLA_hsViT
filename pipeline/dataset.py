@@ -708,56 +708,68 @@ class MatHSDataset(AbstractHSDataset):
         sample = self._get_patch(0)
         print(f"  Data range: [{sample.min():.4f}, {sample.max():.4f}]")
     
-    def create_data_loader(self, num_workers=0):
+    def create_data_loader(self, num_workers=0, batch_size=None, pin_memory=True,
+                           prefetch_factor=2, persistent_workers=False):
         """
-            Create enhanced data loaders with comprehensive processing
+        Create PyTorch DataLoaders using the parent class's patch-based pipeline.
         
-        Args:
-            batch_size (int): Batch size for data loaders
-            test_rate (float): Ratio of data to use for testing (0.02 = 2% test, 98% train)
-            patch_size (int): Size of image patches
-            dataset_name (str): Dataset to use (see loadData for options)
-    
+        MatHSDataset reuses the same _create_patches / _get_patch approach as
+        NpyHSDataset (patches and labels are already built by AbstractHSDataset.__init__).
+        Because MatHSDataset has no patient-level grouping, a stratified random
+        split is used instead.
+        
         Returns:
-            tuple: (train_loader, test_loader, all_loader, y_all, pca_components, dataset_info)
+            Tuple of (train_loader, test_loader)
         """
-        x_pca = self.processed_data  # (H, W, C)
-        y = self.raw_labels  # (H, W)
+        total_indices = np.arange(len(self.patch_indices))
         
-        print('Hyperspectral data shape after PCA: ', x_pca.shape)
-        print('Label shape: ', y.shape)
-        print('Original label range:', np.min(y), 'to', np.max(y))
-        print('Unique labels:', np.unique(y))
+        # Stratified random split (no patient groups for .mat benchmarks)
+        train_idx, test_idx = train_test_split(
+            total_indices,
+            test_size=self.test_rate,
+            random_state=350234,
+            stratify=self.patch_labels
+        )
         
-        x_patches, y_all = self._create_cube(x_pca, y, windowSize=self.patch_size)
-        print('Data cube X shape: ', x_patches.shape)
-        print('Processed label range:', np.min(y_all), 'to', np.max(y_all))
-        print('Unique processed labels:', np.unique(y_all))
+        # Check class coverage
+        train_classes = set(np.unique(self.patch_labels[train_idx]))
+        test_classes = set(np.unique(self.patch_labels[test_idx]))
+        all_classes = set(np.unique(self.patch_labels))
+        if train_classes != all_classes:
+            print(f"  WARNING: Training set missing classes: {all_classes - train_classes}")
+        if test_classes != all_classes:
+            print(f"  WARNING: Test set missing classes: {all_classes - test_classes}")
         
-        Xtrain, Xtest, ytrain, ytest = self.splitTrainTestDataset(x_patches, y_all, randomState=350234)
-        print('Xtrain shape: ', Xtrain.shape)
-        print('Xtest shape: ', Xtest.shape)
+        train_subset = _IndexedSubset(self, train_idx)
+        test_subset = _IndexedSubset(self, test_idx)
         
-        X = x_patches.reshape(-1, self.patch_size, self.patch_size, self.pca_components, 1)
-        Xtrain = Xtrain.reshape(-1, self.patch_size, self.patch_size, self.pca_components, 1)
-        Xtest = Xtest.reshape(-1, self.patch_size, self.patch_size, self.pca_components, 1)
+        if batch_size is None:
+            batch_size = self.batch_size if hasattr(self, 'batch_size') else 32
+        actual_pin_memory = pin_memory and torch.cuda.is_available()
         
-        X = X.transpose(0, 4, 3, 1, 2).squeeze(1)
-        Xtrain = Xtrain.transpose(0, 4, 3, 1, 2).squeeze(1)
-        Xtest = Xtest.transpose(0, 4, 3, 1, 2).squeeze(1)
-        
-        # temp container.
-        trainset = container(Xtrain, ytrain)
-        testset = container(Xtest, ytest)
-        
-        pin_memory=self.pin_memory
-
         train_loader = torch.utils.data.DataLoader(
-            trainset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory
+            train_subset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=actual_pin_memory,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=persistent_workers and (num_workers > 0),
+            drop_last=True,
         )
         test_loader = torch.utils.data.DataLoader(
-            testset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory
+            test_subset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=actual_pin_memory,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=persistent_workers and (num_workers > 0),
+            drop_last=False,
         )
+        
+        print(f"Training set: {len(train_loader)} batches ({len(train_idx)} samples)")
+        print(f"Test set: {len(test_loader)} batches ({len(test_idx)} samples)")
         return train_loader, test_loader
 
 class TiffHSDataset(AbstractHSDataset):

@@ -708,10 +708,21 @@ class hsTrainer:
         """Plot training loss and accuracy curves."""
         fig, axes = plt.subplots(1, 2, figsize=(14, 4))
         
+        # Build actual eval epoch indices to avoid x-axis mismatch
+        # (debug_mode evaluates every epoch regardless of eval_interval)
+        eval_epochs = []
+        total_epochs = len(self.train_losses)
+        for e in range(total_epochs):
+            should_eval = ((e + 1) % self.eval_interval == 0) or (e + 1 == total_epochs)
+            if should_eval or self.debug_mode:
+                eval_epochs.append(e)
+        # Trim to match actual eval_losses length (handles early stopping)
+        eval_epochs = eval_epochs[:len(self.eval_losses)]
+        
         # loss curve
         axes[0].plot(self.train_losses, label='Train Loss', marker='o', markersize=4)
         if self.eval_losses:
-            axes[0].plot(range(0, len(self.train_losses), self.eval_interval), 
+            axes[0].plot(eval_epochs,
                         self.eval_losses, label='Test Loss', marker='s', markersize=4)
         axes[0].set_xlabel('Epoch')
         axes[0].set_ylabel('Loss')
@@ -722,7 +733,7 @@ class hsTrainer:
         # acc curve
         axes[1].plot(self.train_accs, label='Train Acc', marker='o', markersize=4)
         if self.eval_accs:
-            axes[1].plot(range(0, len(self.train_accs), self.eval_interval), 
+            axes[1].plot(eval_epochs,
                         self.eval_accs, label='Test Acc', marker='s', markersize=4)
         axes[1].axhline(y=self.best_acc, color='r', linestyle='--', label=f'Best: {self.best_acc:.2f}%')
         axes[1].set_xlabel('Epoch')
@@ -1016,14 +1027,15 @@ class hsTrainer:
         """Bar chart of per-class Precision / Recall / F1."""
         if not hasattr(self.config.clsf, 'targets'):
             return
-        # remove BG.
-        num_classes = self.config.clsf.num - 1
-        names = self.config.clsf.targets[1:num_classes + 1]
+        # remove BG (class 0) — evaluate classes 1..num-1 only
+        num_classes = self.config.clsf.num
+        non_bg_labels = list(range(1, num_classes))
+        names = self.config.clsf.targets[1:]
 
         p, r, f1, sup = precision_recall_fscore_support(
-            y_true, y_pred, labels=range(num_classes), zero_division=0)
+            y_true, y_pred, labels=non_bg_labels, zero_division=0)
 
-        x = np.arange(num_classes)
+        x = np.arange(len(non_bg_labels))
         width = 0.25
 
         fig, ax = plt.subplots(figsize=(12, 5))
@@ -1049,19 +1061,22 @@ class hsTrainer:
         """Per-class ROC curves with AUC for the current model."""
         if not hasattr(self, '_last_probas') or self._last_probas is None:
             return
-        # remove BG.
-        num_classes = self.config.clsf.num - 1
-        names = self.config.clsf.targets[1:num_classes + 1]
+        # remove BG (class 0) — plot classes 1..num-1 only
+        num_classes = self.config.clsf.num
+        non_bg_labels = list(range(1, num_classes))
+        names = self.config.clsf.targets[1:]
         proba = self._last_probas
 
-        y_onehot = np.zeros((len(y_true), num_classes))
+        n_non_bg = len(non_bg_labels)
+        y_onehot = np.zeros((len(y_true), n_non_bg))
         for i, t in enumerate(y_true):
-            if 0 <= t < num_classes:
-                y_onehot[i, t] = 1
+            mapped = t - 1  # class 1 -> index 0, class 2 -> index 1, ...
+            if 0 <= mapped < n_non_bg:
+                y_onehot[i, mapped] = 1
 
         fig, ax = plt.subplots(figsize=(8, 7))
-        for cls_i in range(num_classes):
-            fpr, tpr, _ = roc_curve(y_onehot[:, cls_i], proba[:, cls_i])
+        for cls_i in range(n_non_bg):
+            fpr, tpr, _ = roc_curve(y_onehot[:, cls_i], proba[:, non_bg_labels[cls_i]])
             roc_auc = auc(fpr, tpr)
             ax.plot(fpr, tpr, label=f'{names[cls_i]} (AUC={roc_auc:.3f})', linewidth=1.3)
 

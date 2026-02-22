@@ -3,7 +3,7 @@ common:
   dataset_name: 'placeholder'
   lr: 0.0001
   weight_decay: 0.05
-  eval_interval: 1  # Evaluate every x epoch
+  eval_interval: 4  # Evaluate every x epoch
   label_smoothing: 0.2
   patience: 20  # More patience for patient-level split
   use_wandb: false  # Disabled by default for stability

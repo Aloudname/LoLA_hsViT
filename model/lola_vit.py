@@ -759,7 +759,7 @@ class LoLA_hsViT(nn.Module):
         # Normalize CAM to [0, 1] per class
         cam_min = cam.min(dim=-1, keepdim=True)[0].min(dim=-2, keepdim=True)[0]
         cam_max = cam.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0]
-        cam = (cam - cam_min) / (cam - cam_min + 1e-8)
+        cam = (cam - cam_min) / (cam_max - cam_min + 1e-8)
         
         # Return specific class if requested.
         if class_idx is not None:
