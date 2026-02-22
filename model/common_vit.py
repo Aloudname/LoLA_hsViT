@@ -246,7 +246,6 @@ class CommonViT(nn.Module):
                     drop=0.1,
                     attn_drop=0.1,
                     drop_path=drop_path_prob,
-                    act_layer=Swish,
                     norm_layer=nn.LayerNorm
                 )
                 blocks.append(block)

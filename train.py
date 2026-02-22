@@ -76,7 +76,7 @@ def main() -> bool:
         finished.append((model_name, outcome[0], outcome[1]))
     
     # Cross-model comparison 
-    class_names = config.clsf.targets[:config.clsf.num]
+    class_names = config.clsf.targets[1:config.clsf.num]
     comparator = ModelComparator(
         output_dir=config.path.output,
         class_names=class_names,

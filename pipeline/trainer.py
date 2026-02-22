@@ -881,7 +881,7 @@ class hsTrainer:
         if not hasattr(self.config.clsf, 'targets'):
             return
         num_classes = self.config.clsf.num
-        names = self.config.clsf.targets[:num_classes]
+        names = self.config.clsf.targets[1:num_classes]
 
         p, r, f1, sup = precision_recall_fscore_support(
             y_true, y_pred, labels=range(num_classes), zero_division=0)
@@ -913,7 +913,7 @@ class hsTrainer:
         if not hasattr(self, '_last_probas') or self._last_probas is None:
             return
         num_classes = self.config.clsf.num
-        names = self.config.clsf.targets[:num_classes]
+        names = self.config.clsf.targets[1:num_classes]
         proba = self._last_probas
 
         y_onehot = np.zeros((len(y_true), num_classes))
