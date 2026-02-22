@@ -54,8 +54,8 @@ def main() -> bool:
     
     model_specs = [
         ('LoLA_hsViT', lambda: LoLA_hsViT()),
-        ('CommonViT',  lambda: CommonViT()),
-        ('Unet',       lambda: Unet()),
+        # ('CommonViT',  lambda: CommonViT()),
+        # ('Unet',       lambda: Unet()),
     ]
     
     finished = []  # list of (name, results, trainer)

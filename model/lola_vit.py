@@ -52,7 +52,7 @@ class LoRALinear(nn.Module):
     """
     def __init__(self, in_features, out_features,
                 r=16, lora_alpha=32, lora_dropout=0.1,
-                bias=True, enable_gate_residual=True):
+                bias=True, enable_gate_residual=False):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
