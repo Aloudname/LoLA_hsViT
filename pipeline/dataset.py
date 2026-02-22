@@ -110,6 +110,9 @@ class AbstractHSDataset(ABC, Dataset):
         Validate the loaded raw data and labels.
         
         Ensures consistent shape alignment and valid label range.
+        
+        OPTIMIZATION: Chunked finite-value check avoids allocating a full
+        boolean array the size of raw_data.
         """
         # Check data and label spatial dimensions match
         if self.raw_data.shape[:2] != self.raw_labels.shape[:2]:
@@ -118,9 +121,12 @@ class AbstractHSDataset(ABC, Dataset):
                 f"labels {self.raw_labels.shape[:2]}"
             )
             
-        # Check for non-finite values in data
-        if not np.isfinite(self.raw_data).all():
-            raise ValueError("Raw data contains non-finite values (NaN/inf)")
+        # Check for non-finite values — chunked to avoid huge intermediate array
+        flat = self.raw_data.reshape(-1)
+        chunk = 1_000_000
+        for i in range(0, flat.size, chunk):
+            if not np.isfinite(flat[i:i + chunk]).all():
+                raise ValueError("Raw data contains non-finite values (NaN/inf)")
             
         # Validate label range
         unique_labels = np.unique(self.raw_labels)
@@ -137,31 +143,21 @@ class AbstractHSDataset(ABC, Dataset):
         with non-zero labels are included (background/zero labels are excluded).
         
         OPTIMIZATION: Padding is done once and cached to avoid re-padding for each sample.
+        OPTIMIZATION: Vectorized with np.where instead of nested Python for-loop.
         """
         # Add zero padding around the image (ONCE at initialization)
         self.padded_data = self._pad_with_zeros(self.processed_data, self.margin)
         
-        # Collect valid patches
-        patch_indices = []
-        labels_list = []
+        # Vectorized: find all non-background pixel positions at once
+        rows, cols = np.where(self.raw_labels > 0)
         
-        # Iterate over all spatial positions in original image
-        for r in range(self.margin, self.padded_data.shape[0] - self.margin):
-            for c in range(self.margin, self.padded_data.shape[1] - self.margin):
-                # Get corresponding position in original (unpadded) image
-                orig_r = r - self.margin
-                orig_c = c - self.margin
-                label = self.raw_labels[orig_r, orig_c]
-                
-                # Skip background (zero labels)
-                if label > 0:
-                    patch_indices.append((r, c))
-                    labels_list.append(label - 1)   # Convert to 0-based index
+        # Convert to padded coordinates (offset by margin)
+        self.patch_indices = np.stack(
+            [rows + self.margin, cols + self.margin], axis=1
+        ).astype(np.int32)
         
-        # Convert to numpy arrays
-        # store indices and labels
-        self.patch_indices = np.array(patch_indices, dtype=np.int32)
-        self.patch_labels = np.array(labels_list, dtype=np.int32)
+        # Convert labels to 0-based index
+        self.patch_labels = (self.raw_labels[rows, cols] - 1).astype(np.int32)
         print(f"Created {len(self.patch_indices)} indices for patch.")
         print(f"Cached padded data shape: {self.padded_data.shape} (padding happens once at init)")
 
@@ -437,36 +433,31 @@ class NpyHSDataset(AbstractHSDataset):
         
     def _preprocess_data(self) -> None:
         """
-        Preprocess data with normalization and optional PCA,
-        Process in chunks (100k pixels per chunk) to reduce memory usage.
+        Preprocess data with normalization and optional PCA.
+        
+        OPTIMIZATION:
+        - Use a single global StandardScaler (consistent normalization across
+          the entire image, not per-chunk which caused statistical inconsistency).
+        - Vectorized numpy operations instead of Python chunk loop.
+        - IncrementalPCA for datasets > 10M pixels to cap memory.
         """
         from sklearn.decomposition import PCA, IncrementalPCA
         from sklearn.preprocessing import StandardScaler
         
         h, w, c = self.raw_data.shape
-        chunk_size = 100_000
-        flat_data_chunks = []
+        n_pixels = h * w
         
-        print("Normalizing data in chunks...")
-        for i in range(0, h * w, chunk_size):
-            end_idx = min(i + chunk_size, h * w)
-            chunk = self.raw_data.reshape(-1, c)[i:end_idx]
-            
-            scaler = StandardScaler()
-            scaled_chunk = scaler.fit_transform(chunk)
-            flat_data_chunks.append(scaled_chunk)
-            
-            if (i // chunk_size + 1) % 100 == 0:
-                print(f"  Processed {min(end_idx, h*w)}/{h*w} pixels")
-        
-        flat_data = np.vstack(flat_data_chunks)
-        del flat_data_chunks  # release buffer results
+        # --- Global normalization (single scaler, consistent statistics) ---
+        print("Normalizing data (global StandardScaler)...")
+        flat_data = self.raw_data.reshape(-1, c)  # view, no copy
+        scaler = StandardScaler()
+        flat_data = scaler.fit_transform(flat_data)  # single pass, globally consistent
         
         # Apply PCA if specified
         if self.pca_component and self.pca_component < c:
             print(f"Applying PCA: Channel {c} -> {self.pca_component} components...")
-            # Use IncrementalPCA for large datasets
-            if h * w > 10_000_000:
+            # Use IncrementalPCA for large datasets to cap memory
+            if n_pixels > 10_000_000:
                 pca = IncrementalPCA(n_components=self.pca_component, batch_size=100_000)
             else:
                 pca = PCA(n_components=self.pca_component, random_state=42)
