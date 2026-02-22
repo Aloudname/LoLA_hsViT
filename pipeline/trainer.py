@@ -317,9 +317,8 @@ class hsTrainer:
                 'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
             })
             
-            # cache sweep
-            if batch_idx % 5 == 0 and self.device.type == 'cuda':
-                torch.cuda.empty_cache()
+            # NOTE: torch.cuda.empty_cache() removed here — it forces
+            # a device sync every 5 steps and is counter-productive.
         
         epoch_loss = total_loss / len(self.train_loader)
         epoch_acc = 100.0 * correct / total if total > 0 else 0.0
@@ -353,8 +352,8 @@ class hsTrainer:
         """
         self.model.eval()
         total_loss = 0.0
-        predictions_list = []
-        targets_list = []
+        predictions_list = []   # GPU tensors, moved to CPU at end
+        targets_list = []       # GPU tensors, moved to CPU at end
         probas_list = [] if collect_extra else None
         features_list = [] if collect_extra else None
         
@@ -388,18 +387,22 @@ class hsTrainer:
                 
                 hsi = self._normalize(hsi)
                 
-                outputs = self.model(hsi)
-                loss = self.criterion(outputs, labels)
+                # Use AMP for evaluation (match training precision)
+                if self.use_amp:
+                    with autocast():
+                        outputs = self.model(hsi)
+                        loss = self.criterion(outputs, labels)
+                else:
+                    outputs = self.model(hsi)
+                    loss = self.criterion(outputs, labels)
                 total_loss += loss.item()
                 
                 _, predicted = torch.max(outputs, 1)
                 
-                # Flatten and filter out ignore pixels for metrics
-                pred_np = predicted.cpu().numpy()
-                label_np = labels.cpu().numpy()
-                valid_mask = label_np != 255
-                predictions_list.append(pred_np[valid_mask])
-                targets_list.append(label_np[valid_mask])
+                # Stay on GPU: filter ignore pixels and accumulate
+                valid_mask = (labels != 255)
+                predictions_list.append(predicted[valid_mask])
+                targets_list.append(labels[valid_mask])
                 
                 # Skip collecting probabilities to save memory (dense output)
                 if collect_extra:
@@ -408,8 +411,9 @@ class hsTrainer:
         if _feat_hook is not None:
             _feat_hook.remove()
         
-        predictions = np.concatenate(predictions_list, axis=0)
-        targets = np.concatenate(targets_list, axis=0)
+        # Single GPU -> CPU transfer at the end
+        predictions = torch.cat(predictions_list, dim=0).cpu().numpy()
+        targets = torch.cat(targets_list, dim=0).cpu().numpy()
         
         acc = accuracy_score(targets, predictions) * 100
         kappa = cohen_kappa_score(targets, predictions) * 100

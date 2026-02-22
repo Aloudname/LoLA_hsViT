@@ -164,6 +164,15 @@ output/ablation/
 
 ---
 
+## 工作日志
+### 2025.12
+
+12.26 新建GitHub项目LoLA-hsViT.
+
+
+
+
+
 ## bugs & to-do
 ### bugs
 - ``patch_size``与位置嵌入``pos_embed``维度不匹配
