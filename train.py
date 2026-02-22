@@ -9,7 +9,6 @@ import argparse
 from config import load_config
 from pipeline import hsTrainer
 from pipeline import NpyHSDataset
-from pipeline import ModelComparator
 from model import Unet, CommonViT, LoLA_hsViT
 
 
@@ -58,8 +57,6 @@ def main() -> bool:
         ('Unet',       lambda: Unet()),
     ]
     
-    finished = []  # list of (name, results, trainer)
-    
     for model_name, model_fn in model_specs:
         trainer = hsTrainer(
             config=config,
@@ -73,50 +70,6 @@ def main() -> bool:
         outcome = _run_trainer(trainer)
         if outcome is None:
             return False
-        finished.append((model_name, outcome[0], outcome[1]))
-    
-    # Cross-model comparison 
-    class_names = config.clsf.targets[1:config.clsf.num]
-    comparator = ModelComparator(
-        output_dir=config.path.output,
-        class_names=class_names,
-        eval_interval=config.common.eval_interval,
-    )
-    
-    for name, results, tr in finished:
-        # Gather optional data the trainer collected during final evaluation
-        probas = getattr(tr, '_last_probas', None)
-        feats = getattr(tr, '_last_features', None)
-        feat_labels = getattr(tr, '_last_feature_labels', None)
-        param_counts = getattr(tr, '_param_counts', None)
-        inf_time = getattr(tr, '_inference_time', None)
-        
-        # Quick re-evaluate to get predictions/targets for the comparator
-        _, _, _, preds, targets = tr.evaluate()
-        
-        comparator.add_model(
-            name=name,
-            results=results,
-            train_losses=tr.train_losses,
-            train_accs=tr.train_accs,
-            eval_losses=tr.eval_losses,
-            eval_accs=tr.eval_accs,
-            predictions=preds,
-            targets=targets,
-            probabilities=probas,
-            features=feats,
-            feature_labels=feat_labels,
-            param_counts=param_counts,
-            inference_time=inf_time,
-            lr_history=tr.lr_history,
-        )
-    
-    comparator.plot_all()
-    
-    # Cleanup
-    for _, _, tr in finished:
-        del tr
-    
     return True
             
 if __name__ == "__main__":
