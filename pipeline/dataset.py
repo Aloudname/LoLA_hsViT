@@ -436,12 +436,14 @@ class NpyHSDataset(AbstractHSDataset):
         Preprocess data with normalization and optional PCA.
         
         OPTIMIZATION:
-        - Use a single global StandardScaler (consistent normalization across
-          the entire image, not per-chunk which caused statistical inconsistency).
-        - Vectorized numpy operations instead of Python chunk loop.
-        - IncrementalPCA for datasets > 10M pixels to cap memory.
+        - Global StandardScaler for consistent normalization.
+        - Randomized SVD: O(n·k²) instead of full SVD O(n·c²), ideal when
+          n_components(15) << n_features(64).
+        - Subsampled fit: fit PCA on a random subsample of pixels (max 500k),
+          then project all pixels. Spatial correlation makes this near-lossless.
+        - Manual projection in float32 avoids sklearn's internal float64 copy.
         """
-        from sklearn.decomposition import PCA, IncrementalPCA
+        from sklearn.decomposition import PCA
         from sklearn.preprocessing import StandardScaler
         
         h, w, c = self.raw_data.shape
@@ -449,23 +451,40 @@ class NpyHSDataset(AbstractHSDataset):
         
         # --- Global normalization (single scaler, consistent statistics) ---
         print("Normalizing data (global StandardScaler)...")
-        flat_data = self.raw_data.reshape(-1, c)  # view, no copy
+        flat_data = self.raw_data.reshape(-1, c).astype(np.float32)
         scaler = StandardScaler()
-        flat_data = scaler.fit_transform(flat_data)  # single pass, globally consistent
+        flat_data = scaler.fit_transform(flat_data).astype(np.float32)
         
         # Apply PCA if specified
         if self.pca_component and self.pca_component < c:
-            print(f"Applying PCA: Channel {c} -> {self.pca_component} components...")
-            # Use IncrementalPCA for large datasets to cap memory
-            if n_pixels > 10_000_000:
-                pca = IncrementalPCA(n_components=self.pca_component, batch_size=100_000)
-            else:
-                pca = PCA(n_components=self.pca_component, random_state=42)
+            print(f"Applying PCA: {c} -> {self.pca_component} components (randomized SVD)...")
             
-            pca_data = pca.fit_transform(flat_data)
-            self.processed_data = pca_data.reshape(h, w, self.pca_component)
-            print(f"  Applied PCA: reduced from {c} to {self.pca_component} components")
+            # Subsample for faster fit: 500k pixels is more than enough
+            # to capture principal directions from spatially correlated data
+            max_fit_samples = 500_000
+            if n_pixels > max_fit_samples:
+                rng = np.random.RandomState(42)
+                fit_idx = rng.choice(n_pixels, max_fit_samples, replace=False)
+                fit_data = flat_data[fit_idx]
+                print(f"  Subsampled {max_fit_samples}/{n_pixels} pixels for PCA fit")
+            else:
+                fit_data = flat_data
+            
+            # Randomized SVD — dramatically faster when k << c
+            pca = PCA(n_components=self.pca_component,
+                      svd_solver='randomized', random_state=42)
+            pca.fit(fit_data)
             print(f"  Explained variance ratio: {pca.explained_variance_ratio_.sum():.4f}")
+            
+            # Manual projection in float32: X_pca = (X - mean) @ components.T
+            # Avoids sklearn transform()'s internal float64 upcast.
+            components = pca.components_.astype(np.float32)     # (k, c)
+            mean = pca.mean_.astype(np.float32)                 # (c,)
+            pca_data = (flat_data - mean) @ components.T        # (n, k), stays float32
+            self.processed_data = pca_data.reshape(h, w, self.pca_component)
+            
+            print(f"  Applied PCA: reduced from {c} to {self.pca_component} components")
+            del fit_data, pca_data, components, mean
         else:
             self.processed_data = flat_data.reshape(h, w, c)
             print("  PCA not applied, using all original components")
@@ -646,6 +665,8 @@ class MatHSDataset(AbstractHSDataset):
     def _preprocess_data(self):
         """
         Preprocess data with PCA dimensionality reduction and normalization.
+        
+        OPTIMIZATION: Randomized SVD for fast PCA when n_components << n_features.
         """
         from sklearn.decomposition import PCA
         from sklearn.preprocessing import StandardScaler
@@ -656,11 +677,17 @@ class MatHSDataset(AbstractHSDataset):
         
         # Handle outliers and normalization
         scaler = StandardScaler()
-        scaled_data = scaler.fit_transform(flat_data)
+        scaled_data = scaler.fit_transform(flat_data).astype(np.float32)
         
-        # Apply PCA
-        pca = PCA(n_components=self.pca_components, random_state=42)
-        pca_data = pca.fit_transform(scaled_data)
+        # Apply PCA with randomized SVD — much faster when pca_components << c
+        pca = PCA(n_components=self.pca_components,
+                  svd_solver='randomized', random_state=42)
+        pca.fit(scaled_data)
+        
+        # Manual projection in float32 to avoid internal float64 upcast
+        components = pca.components_.astype(np.float32)
+        mean = pca.mean_.astype(np.float32)
+        pca_data = (scaled_data - mean) @ components.T
         
         # Reshape back to original spatial dimensions
         self.processed_data = pca_data.reshape(h, w, self.pca_components)

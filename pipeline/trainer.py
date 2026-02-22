@@ -21,9 +21,43 @@ from pipeline.dataset import AbstractHSDataset
 from torch.cuda.amp import GradScaler, autocast
 from sklearn.metrics import (accuracy_score, cohen_kappa_score, confusion_matrix,
                              precision_recall_fscore_support, roc_curve, auc)
-import cv2, os, time, torch, traceback, warnings
+import cv2, os, time, torch, traceback, warnings, copy
 
 warnings.filterwarnings("ignore")
+
+
+class ModelEMA:
+    """
+    Exponential Moving Average of model weights for better generalization.
+    
+    Maintains a shadow copy of parameters updated as:
+        shadow = decay * shadow + (1 - decay) * current_params
+    
+    Near-zero training overhead (one extra parameter copy + in-place lerp per step).
+    At evaluation time, swap in shadow weights for improved test accuracy.
+    """
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        # Deep copy the model parameters (detached, no grad)
+        self.shadow = copy.deepcopy(model)
+        self.shadow.eval()
+        for p in self.shadow.parameters():
+            p.requires_grad_(False)
+    
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        """Update shadow weights with current model weights."""
+        for ema_p, model_p in zip(self.shadow.parameters(), model.parameters()):
+            ema_p.data.lerp_(model_p.data, 1.0 - self.decay)
+        # Also update buffers (e.g., BatchNorm running stats)
+        for ema_b, model_b in zip(self.shadow.buffers(), model.buffers()):
+            ema_b.data.copy_(model_b.data)
+    
+    def state_dict(self):
+        return self.shadow.state_dict()
+    
+    def load_state_dict(self, state_dict):
+        self.shadow.load_state_dict(state_dict)
 
 
 class hsTrainer:
@@ -243,6 +277,11 @@ class hsTrainer:
         self.patience = self.config.common.patience if hasattr(self.config.common, 'patience') else 20
         self.eval_interval = self.config.common.eval_interval if hasattr(self.config.common, 'eval_interval') else 1
 
+        # EMA (Exponential Moving Average) for better generalization
+        ema_decay = self.config.common.ema_decay if hasattr(self.config.common, 'ema_decay') else 0.999
+        self.ema = ModelEMA(self.model, decay=ema_decay)
+        print(f"  EMA enabled (decay={ema_decay})")
+
     
     def train_epoch(self, epoch: int) -> Tuple[float, float]:
         """
@@ -296,6 +335,9 @@ class hsTrainer:
                 if self.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 self.optimizer.step()
+            
+            # Update EMA shadow weights (negligible overhead)
+            self.ema.update(self.model)
             
             # update lr after warmup
             if epoch >= self.warmup_epochs:
@@ -439,6 +481,22 @@ class hsTrainer:
         
         return loss, acc, kappa, predictions, targets
     
+    def evaluate_ema(self, collect_extra: bool = False
+                     ) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
+        """
+        Evaluate using EMA shadow weights for better generalization.
+        Temporarily swaps model weights with EMA weights, evaluates, then restores.
+        """
+        # Save current model state and swap in EMA weights
+        original_state = copy.deepcopy(self.model.state_dict())
+        self.model.load_state_dict(self.ema.state_dict())
+        
+        result = self.evaluate(collect_extra=collect_extra)
+        
+        # Restore original training weights
+        self.model.load_state_dict(original_state)
+        return result
+    
     def train(self) -> Dict[str, float]:
         """
         Training loop with optional data validation.
@@ -471,7 +529,7 @@ class hsTrainer:
             should_eval = ((epoch + 1) % self.eval_interval == 0) or (epoch + 1 == self.epochs)
             
             if should_eval or self.debug_mode:
-                eval_loss, eval_acc, kappa, pred, target = self.evaluate()
+                eval_loss, eval_acc, kappa, pred, target = self.evaluate_ema()
                 self.eval_losses.append(eval_loss)
                 self.eval_accs.append(eval_acc)
                 
@@ -489,7 +547,7 @@ class hsTrainer:
                     self.best_epoch = epoch
                     self.best_model_state = {
                         'epoch': epoch,
-                        'model_state': self.model.state_dict(),
+                        'model_state': self.ema.state_dict(),
                         'acc': eval_acc,
                         'kappa': kappa
                     }

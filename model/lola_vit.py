@@ -64,6 +64,9 @@ class LoRALinear(nn.Module):
         self.linear = nn.Linear(in_features, out_features, bias=bias)
         self.linear.requires_grad_(False)
         
+        # LoRA dropout — applied between down and up projections
+        self.lora_drop = nn.Dropout(lora_dropout) if lora_dropout > 0 else nn.Identity()
+        
         # down and up projections with dim of down(in * r), up(r * out).
         self.lora_down = nn.Linear(in_features, r, bias=False)
         self.lora_up = nn.Linear(r, out_features, bias=False)
@@ -87,8 +90,8 @@ class LoRALinear(nn.Module):
         # part1: Main linear transformation.
         main_output = self.linear(x)
         
-        # part2: LoRA component.
-        lora_output = self.lora_up(self.lora_down(x)) * self.scaling
+        # part2: LoRA component (with dropout between down/up projections).
+        lora_output = self.lora_up(self.lora_drop(self.lora_down(x))) * self.scaling
         
         if self.enable_gate_residual:
             gate = torch.sigmoid(self.lora_gate(x))
@@ -626,8 +629,8 @@ class LoLA_hsViT(nn.Module):
                     mlp_ratio=mlp_ratio,
                     qkv_bias=True,
                     qk_scale=None,
-                    drop=0.0,
-                    attn_drop=0.0,
+                    drop=0.1,
+                    attn_drop=0.1,
                     drop_path=dpr[curr_idx + j],
                     norm_layer=nn.LayerNorm,
                     r=r,

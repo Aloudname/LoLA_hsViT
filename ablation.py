@@ -302,6 +302,40 @@ class AblationRunner:
         print(f"  Ablation Complete: {len(self.results)} runs in {elapsed:.1f}s")
         print(f"\n")
 
+    def run_tag(self, tag: str, all_configs: List[AblationConfig]) -> None:
+        """
+        Train only the two configs (one per model_type) that match the given tag.
+
+        This is useful for quickly re-running or comparing a single architecture
+        variant across LoLA_hsViT and CommonViT without running the full ablation.
+
+        Args:
+            tag: The config tag to match (e.g. 'full_stack', 'tiny').
+            all_configs: The complete list of ablation configs to search.
+        """
+        matched = [c for c in all_configs if c.tag == tag]
+        if not matched:
+            available_tags = sorted(set(c.tag for c in all_configs))
+            print(f"  ERROR: No config found with tag '{tag}'.")
+            print(f"  Available tags: {available_tags}")
+            return
+
+        model_types_found = [c.model_type for c in matched]
+        print(f"\n")
+        print(f"  Tag Run: '{tag}' — {len(matched)} config(s) matched")
+        for c in matched:
+            print(f"    {c.model_type}/{c.tag}  dim={c.dim} depths={c.depths}")
+        print(f"\n")
+
+        tic = time.perf_counter()
+        for i, cfg in enumerate(matched):
+            self.run_single(i, cfg)
+        elapsed = time.perf_counter() - tic
+
+        print(f"\n")
+        print(f"  Tag Run Complete: {len(matched)} run(s) in {elapsed:.1f}s")
+        print(f"\n")
+
     def analyze(self) -> Dict[str, Optional[AblationResult]]:
         """
         Analyze results:
@@ -659,6 +693,9 @@ def main():
     parser.add_argument('--model', '-m', type=str, default='both',
                         choices=['lola', 'common', 'both'],
                         help='Which model(s) to ablate (default: both)')
+    parser.add_argument('--tag', '-t', type=str, default=None,
+                        help='Train only the configs with this tag from both model types '
+                             '(e.g. --tag full_stack trains LoLA_hsViT/full_stack + CommonViT/full_stack)')
     parser.add_argument('--dry-run', action='store_true',
                         help='Only show parameter counts; do not train')
     parser.add_argument('--resume', type=int, default=0,
@@ -668,7 +705,12 @@ def main():
 
     args = parser.parse_args()
 
-    # Build config list
+    # Build full config pool (both model types always, for tag lookup)
+    all_configs: List[AblationConfig] = []
+    all_configs.extend(build_common_vit_configs())
+    all_configs.extend(build_lola_vit_configs())
+
+    # Filter by --model flag for full ablation (not tag mode)
     configs: List[AblationConfig] = []
     if args.model in ('common', 'both'):
         configs.extend(build_common_vit_configs())
@@ -684,6 +726,7 @@ def main():
 
     # Dry-run: skip data loading, just show parameter counts
     if args.dry_run:
+        show_configs = [c for c in all_configs if c.tag == args.tag] if args.tag else configs
         runner = AblationRunner(
             base_config=config,
             dataLoader=None,
@@ -692,7 +735,7 @@ def main():
             gap_threshold=args.gap_threshold,
             resume_idx=args.resume,
         )
-        runner.dry_run(configs)
+        runner.dry_run(show_configs)
         return
 
     # Full run: load data
@@ -707,7 +750,20 @@ def main():
         resume_idx=args.resume,
     )
 
-    # Run all experiments
+    # Tag mode: train only the matching configs
+    if args.tag:
+        runner.run_tag(args.tag, all_configs)
+        if len(runner.results) >= 2:
+            runner.analyze()
+        else:
+            print(f"  Skipping full analysis (need >=2 results, got {len(runner.results)})")
+            for r in runner.results:
+                print(f"  {r.model_type}/{r.config_tag}: "
+                      f"Acc={r.best_eval_acc:.2f}% Gap={r.overfit_gap:.1f}% "
+                      f"Params={r.total_params:,}")
+        return
+
+    # Full ablation: run all experiments
     runner.run_all(configs)
 
     # Analyze, visualize, and select best models

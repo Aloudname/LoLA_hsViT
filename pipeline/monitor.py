@@ -80,6 +80,9 @@ class Monitor:
                 return False
     
     def _init_gpu_monitor(self):
+        self._gpu_backend = None  # 'pynvml' or 'torch'
+        
+        # Try pynvml first (provides temperature, utilization, per-process info)
         try:
             import pynvml
             pynvml.nvmlInit()
@@ -98,11 +101,33 @@ class Monitor:
             for gpu_id in self.gpu_ids:
                 self.gpu_handles[gpu_id] = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
             
-            print(f" GPU monitor initialized successfully with {len(self.gpu_ids)} GPU monitored.")
+            self._gpu_backend = 'pynvml'
+            print(f" GPU monitor initialized (pynvml) with {len(self.gpu_ids)} GPU monitored.")
             
         except Exception as e:
-            print(f"Error during GPU monitor initialization: {e}")
-            self.enable_gpu = False
+            print(f"pynvml unavailable ({e}), falling back to torch.cuda...")
+            # Fallback to torch.cuda
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    self.gpu_device_count = torch.cuda.device_count()
+                    if self.gpu_ids is None:
+                        self.gpu_ids = list(range(self.gpu_device_count))
+                    else:
+                        self.gpu_ids = [i for i in self.gpu_ids if i < self.gpu_device_count]
+                    
+                    if self.gpu_ids:
+                        self._gpu_backend = 'torch'
+                        print(f" GPU monitor initialized (torch.cuda) with {len(self.gpu_ids)} GPU monitored.")
+                    else:
+                        print("No valid GPU, disable GPU monitoring.")
+                        self.enable_gpu = False
+                else:
+                    print("torch.cuda not available, disable GPU monitoring.")
+                    self.enable_gpu = False
+            except Exception as e2:
+                print(f"torch.cuda fallback also failed ({e2}), disable GPU monitoring.")
+                self.enable_gpu = False
     
     def get_system_memory(self) -> Dict[str, float]:
         mem = psutil.virtual_memory()
@@ -195,10 +220,14 @@ class Monitor:
             return []
     
     def get_gpu_memory(self) -> List[Dict]:
-        try:
-            return self.get_gpu_memory_pynvml()
-        except:
+        if self._gpu_backend == 'pynvml':
+            try:
+                return self.get_gpu_memory_pynvml()
+            except:
+                return self.get_gpu_memory_torch()
+        elif self._gpu_backend == 'torch':
             return self.get_gpu_memory_torch()
+        return []
     
     def get_process_memory(self, pid: Optional[int] = None) -> Tuple[float, float]:
         if pid is None:
@@ -230,7 +259,8 @@ class Monitor:
         )
         
         if gpu_info:
-            total_used = sum(g['used'] for g in gpu_info)
+            # pynvml returns 'used', torch returns 'allocated' — normalise
+            total_used = sum(g.get('used', g.get('allocated', 0)) for g in gpu_info)
             total_total = sum(g['total'] for g in gpu_info)
             avg_percent = (total_used / total_total) * 100 if total_total > 0 else 0
             
