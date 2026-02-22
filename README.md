@@ -27,6 +27,7 @@ LoLA_hsViT/
 │   ├── trainer.py
 │   └── monitor.py
 ├── ablation.py # 消融实验入口
+├── LOG.md
 ├── README.md
 ├── requirements.txt
 └── ...
@@ -37,7 +38,7 @@ LoLA_hsViT/
 ## 输出目录结构
 
 ```
-output/
+outputs/
 │
 ├── model_A/
 │   ├── models/
@@ -80,7 +81,7 @@ output/
 搜索空间定义 -> 自动消融训练 -> 评估指标收集 -> 评估排名 -> 保留最优模型 -> 生成分析图表
 ```
 
-1. **搜索空间**：预定义 12 组配置(CommonViT * 6 + LoLA_hsViT * 6), 覆盖以下维度：
+1. **搜索空间**：预定义 12 组配置(CommonViT * 6 + LoLA_hsViT * 6), 覆盖：
    - `dim`：基础特征维度 (96 -> 32)
    - `depths`：Transformer 层深度 ([3,4,5] -> [1,1,1])
    - `mlp_ratio`：MLP 隐藏层比率 (4.0 -> 2.0)
