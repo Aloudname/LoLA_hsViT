@@ -6,6 +6,10 @@ and re-trains to find the parameter-performance sweet spot where models
 no longer overfit.
 """
 
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources.*")
+
 import numpy as np
 import matplotlib.pyplot as plt
 import os, gc, json, time, torch, argparse

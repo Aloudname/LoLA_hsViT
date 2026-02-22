@@ -1,6 +1,10 @@
 # dataset.py - Hyperspectral Dataset Handling.
 # todo:
 # - Implement class distribution analysis and visualization methods.
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources.*")
+
 import os, re, torch
 import numpy as np
 from munch import Munch
@@ -542,9 +546,17 @@ class NpyHSDataset(AbstractHSDataset):
             missing = all_classes - test_classes
             print(f"  WARNING: Test set missing classes: {missing}")
         
-        # create an indexed subset
-        train_subset = _IndexedSubset(self, train_idx)
+        # create indexed subsets:
+        # Training: augmented subset with spatial/spectral augmentations
+        # Testing: plain subset without augmentations
+        train_subset = _AugmentedSubset(
+            self, train_idx,
+            noise_std=0.02,
+            band_drop_rate=0.05,
+            cutout_ratio=0.15
+        )
         test_subset = _IndexedSubset(self, test_idx)
+        print(f"Training augmentations enabled: flip, rotate, spectral noise, band dropout, cutout")
         
         # Determine batch size and pin_memory settings
         if batch_size is None:
@@ -819,6 +831,87 @@ class _IndexedSubset(Dataset):
     def __getitem__(self, idx: int):
         original_idx = self.indices[idx]
         return self.dataset[original_idx]
+
+
+class _AugmentedSubset(Dataset):
+    """
+    Training-only subset with on-the-fly spatial & spectral augmentations.
+    
+    Augmentations applied (all random, each with 50% probability):
+      - Spatial: horizontal flip, vertical flip, 90°/180°/270° rotation
+      - Spectral: Gaussian noise, band-wise dropout (zero out random bands)
+      - Mixup-style: CutOut (mask random spatial region)
+    
+    Labels are augmented consistently for dense (segmentation) tasks.
+    """
+    def __init__(self, dataset: AbstractHSDataset, indices: np.ndarray,
+                 noise_std: float = 0.02,
+                 band_drop_rate: float = 0.05,
+                 cutout_ratio: float = 0.15):
+        self.dataset = dataset
+        self.indices = indices
+        self.noise_std = noise_std
+        self.band_drop_rate = band_drop_rate
+        self.cutout_ratio = cutout_ratio
+    
+    def __len__(self):
+        return len(self.indices)
+    
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        original_idx = self.indices[idx]
+        
+        # Get raw numpy patch (H, W, C) and label (H, W)
+        patch = self.dataset._get_patch(original_idx)      # (H, W, C)
+        label = self.dataset._get_label_patch(original_idx) # (H, W)
+        
+        # --- Spatial augmentations (applied to both patch and label) ---
+        # Horizontal flip
+        if np.random.rand() > 0.5:
+            patch = np.flip(patch, axis=1).copy()
+            label = np.flip(label, axis=1).copy()
+        
+        # Vertical flip
+        if np.random.rand() > 0.5:
+            patch = np.flip(patch, axis=0).copy()
+            label = np.flip(label, axis=0).copy()
+        
+        # Random 90° rotation
+        if np.random.rand() > 0.5:
+            k = np.random.choice([1, 2, 3])
+            patch = np.rot90(patch, k, axes=(0, 1)).copy()
+            label = np.rot90(label, k, axes=(0, 1)).copy()
+        
+        # --- Spectral augmentations (patch only) ---
+        # Gaussian noise
+        if self.noise_std > 0 and np.random.rand() > 0.5:
+            noise = np.random.normal(0, self.noise_std, patch.shape).astype(patch.dtype)
+            patch = patch + noise
+        
+        # Random band dropout (zero out a few spectral bands)
+        if self.band_drop_rate > 0 and np.random.rand() > 0.5:
+            n_bands = patch.shape[2]
+            n_drop = max(1, int(n_bands * self.band_drop_rate))
+            drop_idx = np.random.choice(n_bands, n_drop, replace=False)
+            patch[:, :, drop_idx] = 0.0
+        
+        # --- Spatial CutOut (mask a random rectangular region) ---
+        if self.cutout_ratio > 0 and np.random.rand() > 0.3:
+            h, w = patch.shape[:2]
+            ch = max(1, int(h * self.cutout_ratio))
+            cw = max(1, int(w * self.cutout_ratio))
+            y0 = np.random.randint(0, h - ch + 1)
+            x0 = np.random.randint(0, w - cw + 1)
+            patch[y0:y0+ch, x0:x0+cw, :] = 0.0
+            # Mark cutout region as ignore in labels
+            label[y0:y0+ch, x0:x0+cw] = 255
+        
+        # Convert to (C, H, W) tensor
+        patch = np.transpose(patch, (2, 0, 1))
+        
+        if self.dataset.transform:
+            patch = self.dataset.transform(patch)
+        
+        return torch.FloatTensor(patch), torch.LongTensor(label)
 
 class container:
     """

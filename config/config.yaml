@@ -1,11 +1,11 @@
 # configuration of model hyperparams in training.py
 common:
   dataset_name: 'placeholder'
-  lr: 0.00002
-  weight_decay: 0.01
+  lr: 0.0001
+  weight_decay: 0.05
   eval_interval: 3  # Evaluate every x epoch
-  label_smoothing: 0.1
-  patience: 15  # More patience for CPU training
+  label_smoothing: 0.2
+  patience: 20  # More patience for patient-level split
   use_wandb: false  # Disabled by default for stability
   use_amp: true  # Enable mixed precision (will auto-disable on CPU)
   scheduler:

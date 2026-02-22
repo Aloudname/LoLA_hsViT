@@ -122,8 +122,7 @@ LoLA_hsViT/
 ### 2.20
 - 年后开工，增添了固定参数的普通`Vision Transformer`和`U-net`用于对比分析；
 - 调试模型，增加`pipeline/monitor.py`用于对训练时内存显存占用的实时分析：
-<video controls src="src/monitor.mp4" title="monitor"></video>
-
+![monitor](src/monitor.png)
 ### 2.22
 - 在固定参数对比训练的基础上，增添针对两种ViT的消融实验，以确定最简结构的有效模型；
 - 准备`TensorRT`推理部署；
