@@ -5,6 +5,8 @@
 
 毕业设计用, LoLA-hsViT的本地部署部分
 
+abation分支提供消融实验
+
 ---
 ## 工作结构
 ```
@@ -79,6 +81,6 @@ RuntimeError: The size of tensor a: x (15) must match the size of tensor b:  pos
 - config作为参数冗余传入多个层(LoLA-hsViT, MAThsDataLoader)
 ### to-do
 - Nvidia Clara API边缘部署支持
-- 外源数据的泛化测试
+- 外源数据的泛化测试 (⭐)
 - 多模态数据支持
 - 训练日志WandB
