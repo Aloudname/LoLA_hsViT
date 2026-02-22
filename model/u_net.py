@@ -76,24 +76,25 @@ class Out(nn.Module):
 
 class Unet(nn.Module):
     """
-    Hyperspectral imaging U-net.
+    Hyperspectral imaging U-net for pixel-level segmentation.
     Same API and params with LoLA are remaining.
     """
     
     def __init__(self, in_channels=15, num_classes=9, dim=64):
         """
-        Standard, common ViT for hyperspectral image classification.
+        U-net for hyperspectral image pixel-level segmentation.
         
         params:
             in_channels (int): 15 default.
             num_classes (int): 9 default.
-            dim (int): dim of feature maps, 96 default.
+            dim (int): dim of feature maps, 64 default.
         """
         
         super().__init__()
         self.in_channels = in_channels
         self.num_classes = num_classes
         self.dim = dim
+        self.mode = 'segmentation'  # pixel-level only
         
         print(f"U-net initialized with {in_channels} input channels, "
               f"{num_classes} classes")
@@ -112,9 +113,12 @@ class Unet(nn.Module):
         self.decoder_conv1 = Up(dim * 2, dim)  # [B, dim, D, H, W]
         self.out_conv = Out(dim, num_classes)  # [B, num_classes, D, H, W]
         
-        # Classification head
+        # Kept for CAM generation compatibility
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.head = nn.Linear(dim, num_classes)
+        
+        # Segmentation head: 1x1 conv for per-pixel prediction
+        self.seg_head = nn.Conv2d(dim, num_classes, kernel_size=1)
         
         # useful components
         self.final_feature_map = None  # for CAM
@@ -192,15 +196,16 @@ class Unet(nn.Module):
 
     def forward(self, x, pretrained_input=None, return_cam=False):
         """
+        Pixel-level segmentation forward pass.
+        
         Args:
             x: input [B, C, H, W]
-            pretrained_input: Optional pretrained input.
-            return_cam: if True, return CAM
+            pretrained_input: Optional pretrained input (unused, kept for API compat).
+            return_cam: if True, also return CAM as second element.
         
         Return:
-            output: classification [B, num_classes]
-            or
-            (output, cam) if return_cam.
+            [B, num_classes, H, W] dense per-pixel logits.
+            If return_cam: (logits, cam)
         """
         if x.dim() != 4:
             raise ValueError(f"Expected 4D input [B, C, H, W], got {x.dim()}D tensor")
@@ -210,14 +215,8 @@ class Unet(nn.Module):
         if C != self.in_channels:
             print(f"WARNING: Input has {C} channels, but model expects {self.in_channels}")
         
-        x = self.forward_features(x)  # [B, C, H, W]
-        
-        # global ave pooling
-        x = self.avgpool(x)     # [B, C, 1, 1]
-        x = x.flatten(1)        # [B, C]
-        
-        # classification head
-        output = self.head(x)
+        x = self.forward_features(x)  # [B, dim, H, W]
+        output = self.seg_head(x)     # [B, num_classes, H, W]
         
         if return_cam:
             cam = self.generate_cam()
@@ -227,23 +226,17 @@ class Unet(nn.Module):
 
 
 if __name__ == "__main__":
-    model = Unet(
-        in_channels=15, 
-        num_classes=9, 
-        dim=64
-    )
+    model = Unet(in_channels=15, num_classes=9, dim=64)
     
     dummy_input = torch.randn(4, 15, 15, 15)  # [B, C, H, W]
     output = model(dummy_input)
-    print(f"  Output shape: {output.shape}")  # Expected: [2, 9]
+    print(f"  Output shape: {output.shape}")  # Expected: [4, 9, 15, 15]
     
     output_with_cam = model(dummy_input, return_cam=True)
     if isinstance(output_with_cam, tuple):
         output, cam = output_with_cam
-        print(f"  CAM shape: {cam.shape}")  # Expected: [2, 9, H', W']
+        print(f"  CAM shape: {cam.shape}")
     
-    model.freeze_all_but_lora()
-    print(f"  Model parameters frozen (except head and norm)")
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Total parameters: {total_params:,}")

@@ -94,7 +94,7 @@ class AblationResult:
 
 
 def build_common_vit_configs() -> List[AblationConfig]:
-    """Define ablation configs for CommonViT (10 levels from heavy to light)."""
+    """Define ablation configs for CommonViT."""
     return [
         AblationConfig(tag="full_stack",  model_type="CommonViT",
                        dim=96, depths=[3,4,5], num_heads=[4,8,16], mlp_ratio=4.0),
@@ -113,7 +113,7 @@ def build_common_vit_configs() -> List[AblationConfig]:
 
 
 def build_lola_vit_configs() -> List[AblationConfig]:
-    """Define ablation configs for LoLA_hsViT (structural + LoRA rank)."""
+    """Define ablation configs for LoLA_hsViT."""
     return [
         AblationConfig(tag="full_stack",  model_type="LoLA_hsViT",
                        dim=96, depths=[3,4,5], num_heads=[4,8,16], mlp_ratio=4.0,
@@ -130,7 +130,7 @@ def build_lola_vit_configs() -> List[AblationConfig]:
         AblationConfig(tag="mini",     model_type="LoLA_hsViT",
                        dim=32, depths=[1,1,2], num_heads=[2,4,8], window_size=[7,7,7],
                        mlp_ratio=2.0, r=4, lora_alpha=8),
-        AblationConfig(tag="two_level_r4", model_type="LoLA_hsViT",
+        AblationConfig(tag="two_level", model_type="LoLA_hsViT",
                             dim=48, depths=[2,3], num_heads=[4,8], window_size=[7,7],
                             mlp_ratio=3.0, r=4, lora_alpha=8),
     ]
@@ -286,6 +286,7 @@ class AblationRunner:
 
         tic = time.perf_counter()
 
+        # run in sequence.
         for i, cfg in enumerate(configs):
             if i < self.resume_idx:
                 print(f"  [Skipping {i+1}/{total}] {cfg.run_name} (resume)")

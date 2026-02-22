@@ -228,10 +228,11 @@ class hsTrainer:
         )
         print(f"  lr scheduler: CosineAnnealingWarmRestarts (T_0={T_0}, T_mult={T_mult}, eta_min={eta_min})")
         
-        # loss function
+        # loss function — always use ignore_index=255 for background/padding
         label_smoothing = self.config.common.label_smoothing if hasattr(self.config.common, 'label_smoothing') else 0.1
-        self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-        print(f"  loss function: CrossEntropyLoss (label_smoothing={label_smoothing})")
+        self.criterion = nn.CrossEntropyLoss(
+            label_smoothing=label_smoothing, ignore_index=255)
+        print(f"  loss function: CrossEntropyLoss (label_smoothing={label_smoothing}, ignore_index=255)")
         
         # mixed precision training on GPU
         use_amp = self.config.common.use_amp and self.device.type == 'cuda'
@@ -307,11 +308,13 @@ class hsTrainer:
             total_loss += loss.item()
             with torch.no_grad():
                 _, predicted = torch.max(outputs.detach(), 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
+                # Pixel-wise accuracy excluding ignore pixels (label==255)
+                valid_mask = (labels != 255)
+                total += valid_mask.sum().item()
+                correct += ((predicted == labels) & valid_mask).sum().item()
             
             # tqdm
-            acc = 100.0 * correct / total
+            acc = 100.0 * correct / total if total > 0 else 0.0
             pbar.set_postfix({
                 'loss': f'{loss.item():.4f}',
                 'acc': f'{acc:.2f}%',
@@ -323,7 +326,7 @@ class hsTrainer:
                 torch.cuda.empty_cache()
         
         epoch_loss = total_loss / len(self.train_loader)
-        epoch_acc = 100.0 * correct / total
+        epoch_acc = 100.0 * correct / total if total > 0 else 0.0
         
         # record lr for this epoch
         self.lr_history.append(self.optimizer.param_groups[0]['lr'])
@@ -394,12 +397,17 @@ class hsTrainer:
                 total_loss += loss.item()
                 
                 _, predicted = torch.max(outputs, 1)
-                predictions_list.append(predicted.cpu().numpy())
-                targets_list.append(labels.cpu().numpy())
                 
+                # Flatten and filter out ignore pixels for metrics
+                pred_np = predicted.cpu().numpy()
+                label_np = labels.cpu().numpy()
+                valid_mask = label_np != 255
+                predictions_list.append(pred_np[valid_mask])
+                targets_list.append(label_np[valid_mask])
+                
+                # Skip collecting probabilities to save memory (dense output)
                 if collect_extra:
-                    probas_list.append(
-                        torch.nn.functional.softmax(outputs, dim=1).cpu().numpy())
+                    pass  # probabilities not collected for dense predictions
         
         if _feat_hook is not None:
             _feat_hook.remove()
@@ -411,8 +419,16 @@ class hsTrainer:
         kappa = cohen_kappa_score(targets, predictions) * 100
         loss = total_loss / len(eval_loader)
         
+        # Compute mIoU
+        model_ref = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        miou = self._compute_miou(targets, predictions, model_ref.num_classes)
+        self._last_miou = miou
+        
         if collect_extra:
-            self._last_probas = np.concatenate(probas_list, axis=0)
+            if probas_list:
+                self._last_probas = np.concatenate(probas_list, axis=0)
+            else:
+                self._last_probas = None
             if _feat_buffer:
                 raw = torch.cat(_feat_buffer, dim=0)
                 self._last_features = raw.view(raw.size(0), -1).numpy()
@@ -459,9 +475,13 @@ class hsTrainer:
                 self.eval_losses.append(eval_loss)
                 self.eval_accs.append(eval_acc)
                 
+                miou_str = ''
+                if hasattr(self, '_last_miou'):
+                    miou_str = f' mIoU: {self._last_miou:6.2f}%'
+                
                 print(f"\n[Epoch {epoch+1:3d}] "
                       f"Train Loss: {train_loss:.4f} Acc: {train_acc:6.2f}% | "
-                      f"Test Loss: {eval_loss:.4f} Acc: {eval_acc:6.2f}% Kappa: {kappa:6.2f}%")
+                      f"Test Loss: {eval_loss:.4f} Acc: {eval_acc:6.2f}% Kappa: {kappa:6.2f}%{miou_str}")
                 
                 # save the best model
                 if eval_acc > self.best_acc:
@@ -532,6 +552,9 @@ class hsTrainer:
             'training_time': training_time,
             'model_path': os.path.join(self.output, 'models', f'{self.model_name}_best.pth')
         }
+        # Always include mIoU
+        if hasattr(self, '_last_miou'):
+            results['final_miou'] = self._last_miou
         return results
     
     def _generate_cam(self, epoch: int) -> None:
@@ -572,13 +595,17 @@ class hsTrainer:
                     rgb = np.repeat(sample[0:1].transpose(1, 2, 0), 3, axis=2)
                 
                 axes[i, 0].imshow(rgb)
-                axes[i, 0].set_title(f'Sample {i+1}\nLabel: {labels[i].item()}')
+                # Dense labels: show center pixel label
+                center_label = labels[i][labels[i].shape[0]//2, labels[i].shape[1]//2].item()
+                axes[i, 0].set_title(f'Sample {i+1}\nCenter Label: {center_label}')
                 axes[i, 0].axis('off')
                 
                 # grayscale intensity
                 gray = sample.mean(axis=0)
                 axes[i, 1].imshow(gray, cmap='gray')
-                axes[i, 1].set_title(f'Intensity\nPred: {preds[i].item()}')
+                # Show center pixel prediction
+                center_pred = preds[i][preds[i].shape[0]//2, preds[i].shape[1]//2].item()
+                axes[i, 1].set_title(f'Intensity\nCenter Pred: {center_pred}')
                 axes[i, 1].axis('off')
                 
                 # grayscale spectrum (center pixel)
@@ -746,6 +773,23 @@ class hsTrainer:
         std = hsi.std(dim=(2, 3), keepdim=True)
         return (hsi - mean) / (std + 1e-8)
     
+    def _compute_miou(self, y_true: np.ndarray, y_pred: np.ndarray,
+                      num_classes: int) -> float:
+        """
+        Compute mean Intersection-over-Union (mIoU) for segmentation evaluation.
+        Ignores classes not present in both y_true and y_pred.
+        
+        Returns:
+            mIoU percentage (0-100).
+        """
+        ious = []
+        for cls in range(num_classes):
+            intersection = ((y_pred == cls) & (y_true == cls)).sum()
+            union = ((y_pred == cls) | (y_true == cls)).sum()
+            if union > 0:
+                ious.append(float(intersection) / float(union))
+        return float(np.mean(ious)) * 100.0 if ious else 0.0
+    
     def _save_model(self) -> None:
         if self.best_model_state is None:
             return
@@ -790,7 +834,7 @@ class hsTrainer:
             hsi: Tensor [B, C, H, W] or [B, H, W, C]
             
         Returns:
-            Predicted labels [B]
+            Predicted dense labels [B, H, W]
         """
         self.model.eval()
         
@@ -809,7 +853,7 @@ class hsTrainer:
     def _validate_data_quality(self) -> None:
         """Validate dataset quality: distribution, ranges, duplicates"""
         print("\n[Data Quality Check]")
-        labels = self.dataLoader.patch_labels
+        labels = self.dataLoader.patch_labels[1:]
         
         # Class distribution
         unique_labels, counts = np.unique(labels, return_counts=True)
@@ -859,7 +903,11 @@ class hsTrainer:
         # Forward pass
         self.model.zero_grad()
         output = self.model(x)
-        loss = output[0, class_idx]
+        # For segmentation output [B, K, H, W], sum spatial dims to get scalar
+        if output.dim() == 4:
+            loss = output[0, class_idx].sum()
+        else:
+            loss = output[0, class_idx]
         loss.backward(retain_graph=True)
         
         # Compute CAM
@@ -880,7 +928,8 @@ class hsTrainer:
         """Bar chart of per-class Precision / Recall / F1."""
         if not hasattr(self.config.clsf, 'targets'):
             return
-        num_classes = self.config.clsf.num
+        # remove BG.
+        num_classes = self.config.clsf.num - 1
         names = self.config.clsf.targets[1:num_classes]
 
         p, r, f1, sup = precision_recall_fscore_support(
@@ -912,7 +961,8 @@ class hsTrainer:
         """Per-class ROC curves with AUC for the current model."""
         if not hasattr(self, '_last_probas') or self._last_probas is None:
             return
-        num_classes = self.config.clsf.num
+        # remove BG.
+        num_classes = self.config.clsf.num - 1
         names = self.config.clsf.targets[1:num_classes]
         proba = self._last_probas
 

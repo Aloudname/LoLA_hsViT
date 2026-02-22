@@ -28,17 +28,12 @@ class AbstractHSDataset(ABC, Dataset):
         Initialize the hyperspectral dataset.
 
         Args:
-            data_path: Path to the main hyperspectral data file
-            label_path: Path to the label file
-            num_classes: Number of classes in the dataset
-            target_names: List of class names
-            patch_size: Size of spatial patches to extract (must be odd)
-            transform: Optional transform to apply to samples
-            test_rate: test rate for split test dataset
-            pca_component: how many dims (main features) picked for pca.
+            config: Munch config object with dataset parameters.
+            transform: Optional transform to apply to samples.
            **kwargs: Additional format-specific parameters.
         """
 
+        self.config = config  # store for get_dataset_info() etc.
         self.data_path = config.path.data
         self.label_path = config.path.label
         self.num = config.clsf.num
@@ -167,6 +162,20 @@ class AbstractHSDataset(ABC, Dataset):
         print(f"Created {len(self.patch_indices)} indices for patch.")
         print(f"Cached padded data shape: {self.padded_data.shape} (padding happens once at init)")
 
+        # Pad labels for dense segmentation
+        self.padded_labels = np.full(
+            (self.raw_labels.shape[0] + 2 * self.margin,
+             self.raw_labels.shape[1] + 2 * self.margin),
+            fill_value=255, dtype=np.int32
+        )
+        # Convert to 0-based class indices; background (label==0) -> ignore (255)
+        label_region = self.raw_labels.copy().astype(np.int32)
+        label_region[label_region > 0] -= 1
+        label_region[self.raw_labels == 0] = 255
+        self.padded_labels[self.margin:self.margin + self.raw_labels.shape[0],
+                           self.margin:self.margin + self.raw_labels.shape[1]] = label_region
+        print(f"Created padded label map: {self.padded_labels.shape}")
+
     def _get_patch(self, idx: int) -> np.ndarray:
         """
         Get a single patch from the cached padded data.
@@ -183,7 +192,20 @@ class AbstractHSDataset(ABC, Dataset):
             :
         ]
         return patch.copy()
-    
+
+    def _get_label_patch(self, idx: int) -> np.ndarray:
+        """
+        Get the dense label patch for segmentation mode.
+        Returns label map of shape (patch_size, patch_size) where
+        background/padding pixels have value 255 (ignore_index).
+        """
+        r, c = self.patch_indices[idx]
+        label_patch = self.padded_labels[
+            r - self.margin : r + self.margin + 1,
+            c - self.margin : c + self.margin + 1
+        ]
+        return label_patch.copy()
+
     def splitTrainTestDataset(self, X, y, randomState=350234):
         """
             Splitter for test and training dataloader.
@@ -208,8 +230,8 @@ class AbstractHSDataset(ABC, Dataset):
         """
         return {
             "dataset_name": self.config.common.dataset_name,
-            "total_samples": len(self.patches),
-            "test_samples": int(len(self.patches) * self.test_rate),
+            "total_samples": len(self.patch_indices),
+            "test_samples": int(len(self.patch_indices) * self.test_rate),
             "num_classes": self.num,
             "class_names": self.targets,
             "patch_size": self.patch_size
@@ -228,7 +250,7 @@ class AbstractHSDataset(ABC, Dataset):
     # Magic methods.
     def __len__(self) -> int:
         """Return number of patches in dataset"""
-        return len(self.patches)
+        return len(self.patch_indices)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -238,12 +260,11 @@ class AbstractHSDataset(ABC, Dataset):
             idx: Index of the sample to retrieve
             
         Returns:
-            Tuple containing:
-                - patch: Tensor of shape (C, H, W)
-                - label: Tensor containing class index
+            - patch: Tensor of shape (C, H, W)
+            - label: Tensor of shape (H, W) with per-pixel class indices
+                     (255 = ignore / background)
         """
         patch = self._get_patch(idx)
-        label = self.patch_labels[idx]
         
         # Convert to (C, H, W) format for PyTorch
         patch = np.transpose(patch, (2, 0, 1))
@@ -251,7 +272,9 @@ class AbstractHSDataset(ABC, Dataset):
         if self.transform:
             patch = self.transform(patch)
         
-        return torch.FloatTensor(patch), torch.LongTensor([label]).squeeze()
+        # Always return dense per-pixel labels
+        label_patch = self._get_label_patch(idx)  # [H, W]
+        return torch.FloatTensor(patch), torch.LongTensor(label_patch)
 
 class NpyHSDataset(AbstractHSDataset):
     """

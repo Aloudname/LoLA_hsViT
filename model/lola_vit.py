@@ -518,12 +518,12 @@ def window_reverse(windows, window_size, H, W):
 # Final implementation of LoLA_hsViT.
 class LoLA_hsViT(nn.Module):
     r"""
-    LoLA_hsViT model for hyperspectral image classification with:
+    LoLA_hsViT model for hyperspectral image pixel-level segmentation with:
         - SE for channel attention.
         - Band Dropout for robustness.
         - LoRA in attention and MLP layers.
-        - Local Attention for more efficient.
-        - Note: Without cross-attention.
+        - Local Attention for more efficient computation.
+        - Segmentation decoder for dense per-pixel prediction.
 
     See parameters initialization in ``__init__`` method.
 
@@ -542,8 +542,8 @@ class LoLA_hsViT(nn.Module):
                 ``X' `` --( LAViT *depth[1] + down-sampling )--> ``X''``
                 ``X''`` --( LAViT *depth[2] )--> ``X_3``
 
-        (4) Classification Head of ``[B, HW/64, 4dim] -> [B, K]``:
-                ``X_3`` --(Flatten + LN + AvePool + LoRA)--> output ``Y``
+        (4) Segmentation Head of ``[B, HW/64, 4dim] -> [B, K, H, W]``:
+                ``X_3`` --(seg_decoder + interpolate + seg_head)--> output ``Y``
     """
     def __init__(self, in_channels=15, num_classes=9, dim=96, depths=[3, 4, 5],
                  num_heads=[4, 8, 16], window_size=[7, 7, 7], mlp_ratio=4.,
@@ -551,7 +551,7 @@ class LoLA_hsViT(nn.Module):
         """
         Args:
             ``in_channels``: Number of input channels (spectral bands).
-            ``num_classes``: Number of output classes for classification.
+            ``num_classes``: Number of output classes.
             ``dim``: Base dimension for model.
             ``depths``: List of depths for each LoLA_hsViT block.
             ``num_heads``: List of number of attention heads for each LoLA_hsViT block.
@@ -565,6 +565,8 @@ class LoLA_hsViT(nn.Module):
         
         super().__init__()
         self.in_channels = in_channels
+        self.num_classes = num_classes
+        self.mode = 'segmentation'  # pixel-level only
         print(f"Model initialized with {in_channels} input channels and {depths} depths.")
         
         # Block1: Spectral processing.
@@ -651,6 +653,17 @@ class LoLA_hsViT(nn.Module):
             lora_alpha=lora_alpha, enable_gate_residual=False)
         self.lora_layers.append(self.head)
         
+        # Segmentation decoder: upsample from final feature map to input resolution
+        self.seg_decoder = nn.Sequential(
+            nn.Conv2d(self.dims[-1], 256, kernel_size=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        # 1x1 conv for per-pixel class scores
+        self.seg_head = nn.Conv2d(128, num_classes, kernel_size=1)
         
         # Initialize weights
         self.apply(self._init_weights)
@@ -683,6 +696,7 @@ class LoLA_hsViT(nn.Module):
                 self.lora_layers.append(module)
 
     def freeze_all_but_lora(self):
+        """Freeze all params except LoRA adapters and segmentation decoder/head."""
         # First, freeze everything
         for p in self.parameters():
             p.requires_grad_(False)
@@ -701,6 +715,12 @@ class LoLA_hsViT(nn.Module):
                 if hasattr(module, 'lora_residual'):
                     for p in module.lora_residual.parameters():
                         p.requires_grad_(True)
+
+        # Always keep segmentation decoder & head trainable
+        for p in self.seg_decoder.parameters():
+            p.requires_grad_(True)
+        for p in self.seg_head.parameters():
+            p.requires_grad_(True)
 
     def merge_all_lora_into_linear(self):
         for module in self.modules():
@@ -793,29 +813,37 @@ class LoLA_hsViT(nn.Module):
 
     def forward(self, x, pretrained_input=None, return_cam=False):
         """
-        FIXED: Forward pass with proper input validation for hyperspectral data
+        Pixel-level segmentation forward pass.
+
+        Args:
+            x: input [B, C, H, W]
+            pretrained_input: unused, kept for API compatibility.
+            return_cam: if True, also return CAM as second element.
+
+        Returns:
+            [B, num_classes, H, W] dense per-pixel logits.
+            If return_cam: (logits, cam)
         """
-        # Validate input shape
         if x.dim() != 4:
             raise ValueError(f"Expected 4D input [B, C, H, W], got {x.dim()}D tensor with shape {x.shape}")
         
         B, C, H, W = x.shape
         
-        # Check if input channels match expected
         if C != self.in_channels:
             print(f"WARNING: Input has {C} channels, but model expects {self.in_channels}")
-            print("This might cause issues if the number of channels is significantly different.")
         
-        # Original LoLA_hsViT forward pass
-        x = self.forward_features(x)
+        # Extract features through backbone
+        x = self.forward_features(x)  # [B, N, C_final]
         
-        # Global pooling
-        x = x.permute(0, 2, 1)  # [B, C, N]
-        x = self.avgpool(x)  # [B, C, 1]
-        x = x.flatten(1)  # [B, C]
+        # Reshape to spatial for seg decoder: [B, C_final, H_feat, W_feat]
+        H_feat, W_feat = self.final_feature_map.shape[2], self.final_feature_map.shape[3]
+        # .contiguous() required to avoid CUDA misaligned address under AMP + DataParallel
+        x = x.permute(0, 2, 1).contiguous().view(B, -1, H_feat, W_feat)
         
-        # Original classification path (pretrained and cross-attention removed)
-        output = self.head(x)
+        # Decode & upsample to original spatial resolution
+        x = self.seg_decoder(x)
+        x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
+        output = self.seg_head(x)  # [B, num_classes, H, W]
 
         if return_cam:
             cam = self.generate_cam()
@@ -823,20 +851,26 @@ class LoLA_hsViT(nn.Module):
         return output
 
 if __name__ == "__main__":
-    # Example usage and testing of the model and scheduler.
+    # Example usage and testing of the model.
     model = LoLA_hsViT(in_channels=15, num_classes=9, dim=96, depths=[3, 4, 5],
                        num_heads=[4, 8, 16], window_size=[7, 7, 7], mlp_ratio=4.,
                        drop_path_rate=0.2, spatial_size=15, r=16, lora_alpha=32)
     
-    # Create dummy input for testing
     dummy_input = torch.randn(2, 15, 15, 15)  # [B, C, H, W]
     
-    # Test forward pass
+    # Test forward pass — expect dense segmentation output
     output = model(dummy_input)
-    print(f"Output shape: {output.shape}")  # Expected: [B, num_classes]
+    print(f"  Output shape: {output.shape}")  # Expected: [2, 9, 15, 15]
     
     # Test CAM generation
     output_with_cam = model(dummy_input, return_cam=True)
     if isinstance(output_with_cam, tuple):
         output, cam = output_with_cam
-        print(f"CAM shape: {cam.shape}")  # Expected: [B, num_classes, H', W']
+        print(f"  CAM shape: {cam.shape}")  # Expected: [2, 9, H', W']
+    
+    # Show trainable params after freeze
+    model.freeze_all_but_lora()
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Trainable parameters: {trainable_params:,}")

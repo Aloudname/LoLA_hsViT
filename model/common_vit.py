@@ -156,7 +156,7 @@ class TransformerBlock(nn.Module):
 
 class CommonViT(nn.Module):
     """
-    Standard, common ViT for hyperspectral image classification.
+    Standard, common ViT for hyperspectral image pixel-level segmentation.
     Same API and params with LoLA are remaining.
     """
     
@@ -164,7 +164,7 @@ class CommonViT(nn.Module):
                  num_heads=[4, 8, 16], window_size=[7, 7, 7], mlp_ratio=4.,
                  drop_path_rate=0.2, spatial_size=15, r=16, lora_alpha=32):
         """
-        Standard, common ViT for hyperspectral image classification.
+        Standard, common ViT for hyperspectral image pixel-level segmentation.
         
         params:
             in_channels (int): 15 default.
@@ -186,6 +186,7 @@ class CommonViT(nn.Module):
         self.depths = depths
         self.num_heads = num_heads
         self.spatial_size = spatial_size
+        self.mode = 'segmentation'  # pixel-level only
         
         print(f"StandardHSITransformer initialized with {in_channels} input channels, "
               f"{num_classes} classes, depths {depths}")
@@ -266,11 +267,22 @@ class CommonViT(nn.Module):
                 )
         
         
-        # clsf heads      
+        # Kept for CAM generation compatibility
         self.final_feature_map = None  # for CAM
         self.norm = nn.LayerNorm(self.dims[-1])
         self.avgpool = nn.AdaptiveAvgPool1d(1)
         self.head = nn.Linear(self.dims[-1], num_classes)
+        
+        # Segmentation decoder: upsample from final feature map to input resolution
+        self.seg_decoder = nn.Sequential(
+            nn.Conv2d(self.dims[-1], 256, kernel_size=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        self.seg_head = nn.Conv2d(128, num_classes, kernel_size=1)
         
         self.apply(self._init_weights)
         trunc_normal_(self.pos_embed, std=.02)
@@ -288,11 +300,10 @@ class CommonViT(nn.Module):
 
     def freeze_all_but_lora(self):
         """
-        False name. This method actually freezes
-        all parameters except the cls head and norm layers.
+        Freeze all parameters except the heads, norm layers, and seg decoder/head.
         """
         for name, param in self.named_parameters():
-            if 'head' not in name and 'norm' not in name:
+            if 'head' not in name and 'norm' not in name and 'seg_' not in name:
                 param.requires_grad = False
 
     def merge_all_lora_into_linear(self):
@@ -384,15 +395,16 @@ class CommonViT(nn.Module):
 
     def forward(self, x, pretrained_input=None, return_cam=False):
         """
+        Pixel-level segmentation forward pass.
+        
         Args:
             x: input [B, C, H, W]
-            pretrained_input: Optional pretrained input.
-            return_cam: if True, return CAM
+            pretrained_input: Optional pretrained input (unused, kept for API compat).
+            return_cam: if True, also return CAM as second element.
         
         Return:
-            output: classification [B, num_classes]
-            or
-            (output, cam) if return_cam.
+            [B, num_classes, H, W] dense per-pixel logits.
+            If return_cam: (logits, cam)
         """
         if x.dim() != 4:
             raise ValueError(f"Expected 4D input [B, C, H, W], got {x.dim()}D tensor")
@@ -402,15 +414,15 @@ class CommonViT(nn.Module):
         if C != self.in_channels:
             print(f"WARNING: Input has {C} channels, but model expects {self.in_channels}")
         
-        x = self.forward_features(x)
+        x = self.forward_features(x)  # [B, N, C_final]
         
-        # global ave pooling
-        x = x.permute(0, 2, 1)  # [B, C, N]
-        x = self.avgpool(x)     # [B, C, 1]
-        x = x.flatten(1)        # [B, C]
-        
-        # classification head
-        output = self.head(x)
+        # Reshape to spatial for gradient flow: [B, C_final, H_feat, W_feat]
+        H_feat, W_feat = self.final_feature_map.shape[2], self.final_feature_map.shape[3]
+        # .contiguous() required to avoid CUDA misaligned address under AMP + DataParallel
+        x = x.permute(0, 2, 1).contiguous().view(B, -1, H_feat, W_feat)
+        x = self.seg_decoder(x)
+        x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
+        output = self.seg_head(x)  # [B, num_classes, H, W]
         
         if return_cam:
             cam = self.generate_cam()
@@ -421,30 +433,21 @@ class CommonViT(nn.Module):
 
 if __name__ == "__main__":
     model = CommonViT(
-        in_channels=15, 
-        num_classes=9, 
-        dim=96, 
-        depths=[3, 4, 5],
-        num_heads=[4, 8, 16], 
-        window_size=[7, 7, 7],
-        mlp_ratio=4.,
-        drop_path_rate=0.2, 
-        spatial_size=15, 
-        r=16, 
-        lora_alpha=32
+        in_channels=15, num_classes=9, dim=96, depths=[3, 4, 5],
+        num_heads=[4, 8, 16], window_size=[7, 7, 7], mlp_ratio=4.,
+        drop_path_rate=0.2, spatial_size=15, r=16, lora_alpha=32
     )
     
     dummy_input = torch.randn(2, 15, 15, 15)  # [B, C, H, W]
     output = model(dummy_input)
-    print(f" Output shape: {output.shape}")  # Expected: [2, 9]
+    print(f"  Output shape: {output.shape}")  # Expected: [2, 9, 15, 15]
     
     output_with_cam = model(dummy_input, return_cam=True)
     if isinstance(output_with_cam, tuple):
         output, cam = output_with_cam
-        print(f"  CAM shape: {cam.shape}")  # Expected: [2, 9, H', W']
+        print(f"  CAM shape: {cam.shape}")
     
     model.freeze_all_but_lora()
-    print(f"  Model parameters frozen (except head and norm)")
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Total parameters: {total_params:,}")
