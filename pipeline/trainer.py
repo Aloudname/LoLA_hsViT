@@ -559,8 +559,12 @@ class hsTrainer:
     
     def _generate_cam(self, epoch: int) -> None:
         """
-        Generate Class Activation Map (CAM),
-        built-in method.
+        Generate full-image Grad-CAM heatmap overlays.
+        
+        For each sample, shows:
+          1) Pseudo-RGB image
+          2) Grad-CAM heatmap (jet colormap)
+          3) Heatmap overlaid on RGB
         """
         self.model.eval()
         
@@ -573,53 +577,69 @@ class hsTrainer:
             hsi = hsi.to(self.device)
             num_samples = min(4, hsi.shape[0])
             
-            fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4*num_samples))
+            fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4 * num_samples))
             if num_samples == 1:
                 axes = axes.reshape(1, -1)
+            
+            col_titles = ['Input', 'Grad-CAM', 'Overlay']
             
             with torch.no_grad():
                 outputs = self.model(hsi[:num_samples])
                 preds = torch.argmax(outputs, dim=1)
             
             for i in range(num_samples):
-                # RGB simulation
+                # --- Build pseudo-RGB visualization ---
                 sample = hsi[i].cpu().numpy()
                 if sample.ndim == 4:
                     sample = sample[0]
+                sample_norm = (sample - sample.min()) / (sample.max() - sample.min() + 1e-8)
                 
-                sample = (sample - sample.min()) / (sample.max() - sample.min() + 1e-8)
-                
-                if sample.shape[0] >= 3:
-                    rgb = sample[:3].transpose(1, 2, 0)
+                if sample_norm.shape[0] >= 3:
+                    rgb = sample_norm[:3].transpose(1, 2, 0)  # (H, W, 3)
                 else:
-                    rgb = np.repeat(sample[0:1].transpose(1, 2, 0), 3, axis=2)
+                    rgb = np.repeat(sample_norm[0:1].transpose(1, 2, 0), 3, axis=2)
                 
+                # --- Compute Grad-CAM for the predicted class (full spatial map) ---
+                pred_class = preds[i]
+                # Use the most frequent predicted class across the patch
+                if pred_class.dim() > 0:
+                    pred_cls_idx = int(torch.mode(pred_class.flatten()).values.item())
+                else:
+                    pred_cls_idx = int(pred_class.item())
+                
+                cam = self._compute_gradcam(
+                    hsi[i:i+1], class_idx=pred_cls_idx
+                )  # (H, W), values in [0, 1]
+                
+                # Resize CAM to match spatial dims if necessary
+                h_img, w_img = rgb.shape[0], rgb.shape[1]
+                if cam.shape[0] != h_img or cam.shape[1] != w_img:
+                    cam = cv2.resize(cam, (w_img, h_img))
+                
+                # --- Create heatmap overlay ---
+                heatmap_color = plt.cm.jet(cam)[..., :3]  # (H, W, 3) float
+                overlay = 0.5 * rgb + 0.5 * heatmap_color
+                overlay = np.clip(overlay, 0, 1)
+                
+                # --- Plot ---
                 axes[i, 0].imshow(rgb)
-                # Dense labels: show center pixel label
-                center_label = labels[i][labels[i].shape[0]//2, labels[i].shape[1]//2].item()
-                axes[i, 0].set_title(f'Sample {i+1}\nCenter Label: {center_label}')
                 axes[i, 0].axis('off')
                 
-                # grayscale intensity
-                gray = sample.mean(axis=0)
-                axes[i, 1].imshow(gray, cmap='gray')
-                # Show center pixel prediction
-                center_pred = preds[i][preds[i].shape[0]//2, preds[i].shape[1]//2].item()
-                axes[i, 1].set_title(f'Intensity\nCenter Pred: {center_pred}')
+                axes[i, 1].imshow(cam, cmap='jet', vmin=0, vmax=1)
                 axes[i, 1].axis('off')
                 
-                # grayscale spectrum (center pixel)
-                center_spec = sample[:, sample.shape[1]//2, sample.shape[2]//2]
-                axes[i, 2].plot(center_spec, linewidth=2)
-                axes[i, 2].set_title(f'Spectrum (center)')
-                axes[i, 2].set_xlabel('Band')
-                axes[i, 2].grid(True, alpha=0.3)
+                axes[i, 2].imshow(overlay)
+                axes[i, 2].axis('off')
             
-            plt.suptitle(f'Epoch {epoch+1} - Sample Visualization', fontsize=14, fontweight='bold')
+            # Column titles on top row only
+            for j, title in enumerate(col_titles):
+                axes[0, j].set_title(title, fontsize=11)
+            
+            plt.suptitle(f'Epoch {epoch+1} - Grad-CAM', fontsize=14, fontweight='bold')
             plt.tight_layout()
             
             cam_path = os.path.join(self.output, 'CAM', f'epoch_{epoch+1:03d}.png')
-            plt.savefig(cam_path, dpi=100, bbox_inches='tight')
+            plt.savefig(cam_path, dpi=150, bbox_inches='tight')
             plt.close()
             
         except Exception as e:
@@ -875,7 +895,11 @@ class hsTrainer:
             print(f"   Unexpected data range - check normalization")
     
     def _compute_gradcam(self, x: torch.Tensor, class_idx: int) -> np.ndarray:
-        """Compute Grad-CAM heatmap for model interpretability"""
+        """Compute Grad-CAM heatmap for model interpretability.
+        
+        Handles DataParallel by unwrapping to the underlying module,
+        and ensures hooks are always cleaned up via try/finally.
+        """
         features = None
         gradients = None
         
@@ -887,41 +911,47 @@ class hsTrainer:
             nonlocal gradients
             gradients = grad_output[0].detach()
         
-        # Find last Conv2d layer
+        # Unwrap DataParallel to access real modules (avoids "dead Module" error)
+        base_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        
+        # Find last Conv2d layer on the unwrapped model
         target_layer = None
-        for module in self.model.modules():
+        for module in base_model.modules():
             if isinstance(module, nn.Conv2d):
                 target_layer = module
         
         if target_layer is None:
             return np.ones((x.shape[-2], x.shape[-1])) * 0.5
         
-        # Register hooks
+        # Register hooks on the unwrapped model's layer
         h_f = target_layer.register_forward_hook(forward_hook)
-        h_b = target_layer.register_backward_hook(backward_hook)
+        h_b = target_layer.register_full_backward_hook(backward_hook)
         
-        # Forward pass
-        self.model.zero_grad()
-        output = self.model(x)
-        # For segmentation output [B, K, H, W], sum spatial dims to get scalar
-        if output.dim() == 4:
-            loss = output[0, class_idx].sum()
-        else:
-            loss = output[0, class_idx]
-        loss.backward(retain_graph=True)
+        try:
+            # Forward pass through the ORIGINAL self.model (may be DataParallel)
+            self.model.zero_grad()
+            output = self.model(x)
+            # For segmentation output [B, K, H, W], sum spatial dims to get scalar
+            if output.dim() == 4:
+                loss = output[0, class_idx].sum()
+            else:
+                loss = output[0, class_idx]
+            loss.backward(retain_graph=False)
+            
+            # Compute CAM
+            if features is not None and gradients is not None:
+                weights = gradients.mean(dim=(2, 3), keepdim=True)
+                cam = (features * weights).sum(dim=1).squeeze(0)
+                cam = torch.relu(cam).cpu().numpy()
+                cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+                cam = cv2.resize(cam, (x.shape[-1], x.shape[-2])) if cam.size > 0 else np.ones((x.shape[-2], x.shape[-1])) * 0.5
+            else:
+                cam = np.ones((x.shape[-2], x.shape[-1])) * 0.5
+        finally:
+            # Always remove hooks to prevent corruption of subsequent backward passes
+            h_f.remove()
+            h_b.remove()
         
-        # Compute CAM
-        if features is not None and gradients is not None:
-            weights = gradients.mean(dim=(2, 3), keepdim=True)
-            cam = (features * weights).sum(dim=1).squeeze(0)
-            cam = torch.relu(cam).cpu().numpy()
-            cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-            cam = cv2.resize(cam, (x.shape[-1], x.shape[-2])) if cam.size > 0 else np.ones((x.shape[-2], x.shape[-1])) * 0.5
-        else:
-            cam = np.ones((x.shape[-2], x.shape[-1])) * 0.5
-        
-        h_f.remove()
-        h_b.remove()
         return cam
 
     def _plot_per_class_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> None:
@@ -930,7 +960,7 @@ class hsTrainer:
             return
         # remove BG.
         num_classes = self.config.clsf.num - 1
-        names = self.config.clsf.targets[1:num_classes]
+        names = self.config.clsf.targets[1:num_classes + 1]
 
         p, r, f1, sup = precision_recall_fscore_support(
             y_true, y_pred, labels=range(num_classes), zero_division=0)
@@ -963,7 +993,7 @@ class hsTrainer:
             return
         # remove BG.
         num_classes = self.config.clsf.num - 1
-        names = self.config.clsf.targets[1:num_classes]
+        names = self.config.clsf.targets[1:num_classes + 1]
         proba = self._last_probas
 
         y_onehot = np.zeros((len(y_true), num_classes))

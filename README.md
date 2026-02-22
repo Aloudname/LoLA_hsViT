@@ -26,9 +26,6 @@ LoLA_hsViT/
 │   ├── dataset.py
 │   ├── trainer.py
 │   └── monitor.py
-├── Utils/      # 杂项
-│   ├── __init__.py
-│   └── HDR2MAT.py      # .hdr -> .mat转换器
 ├── ablation.py # 消融实验入口
 ├── README.md
 ├── requirements.txt
@@ -164,22 +161,14 @@ output/ablation/
 
 ---
 
-## 工作日志
-### 2025.12
-
-12.26 新建GitHub项目LoLA-hsViT.
-
-
-
-
-
 ## bugs & to-do
 ### bugs
-- ``patch_size``与位置嵌入``pos_embed``维度不匹配
-```
+``patch_size``与位置嵌入``pos_embed``维度不匹配
+
 因: pos_embed由固定参数传入
-    File "./model/lola_vit.py", line 773, in ``forward_features``:
-        x = x + self.pos_embed
+```
+File "./model/lola_vit.py", line 773, in ``forward_features``:
+    x = x + self.pos_embed
 RuntimeError: The size of tensor a: x (15) must match the size of tensor b:  pos_embed (7) at non-singleton dimension 2.
 ```
 - config作为参数冗余传入多个层(LoLA-hsViT, MAThsDataLoader)

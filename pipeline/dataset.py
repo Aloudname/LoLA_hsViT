@@ -1,7 +1,7 @@
 # dataset.py - Hyperspectral Dataset Handling.
 # todo:
 # - Implement class distribution analysis and visualization methods.
-import os, torch
+import os, re, torch
 import numpy as np
 from munch import Munch
 from torch.utils.data import Dataset
@@ -303,6 +303,52 @@ class NpyHSDataset(AbstractHSDataset):
         """
         super().__init__(config, transform, **kwargs)
         self.data_path = config.path.data
+        # Assign patient groups after patches are created (by super().__init__)
+        self._assign_patient_groups()
+    
+    @staticmethod
+    def _extract_patient_id(filepath: str) -> str:
+        """
+        Extract patient ID from filename.
+        
+        Filename pattern: 'PatientName_YYYYMMDD_Direction.npy'
+        Returns normalized (lowercase) patient name to handle inconsistent casing.
+        """
+        basename = os.path.basename(filepath)
+        match = re.match(r'^(.+?)_(\d{8})_', basename)
+        if match:
+            return match.group(1).lower()
+        # Fallback: use basename without extension
+        return os.path.splitext(basename)[0].lower()
+    
+    def _assign_patient_groups(self) -> None:
+        """
+        Assign patient group index to each patch based on row position.
+        
+        Uses row ranges recorded during _load_data() to map each patch's
+        spatial position to its source patient, enabling patient-level
+        train/test splitting to prevent data leakage.
+        """
+        # Build a row-to-patient lookup array
+        total_rows = self.raw_data.shape[0]
+        row_to_patient = np.full(total_rows, -1, dtype=np.int32)
+        for row_start, row_end, pid_idx in self._patient_row_ranges:
+            row_to_patient[row_start:row_end] = pid_idx
+        
+        # Map each patch to its patient group
+        # patch_indices stores (r, c) in padded coordinates; original row = r - margin
+        orig_rows = self.patch_indices[:, 0] - self.margin
+        self.patch_patient_groups = row_to_patient[orig_rows]
+        
+        # Sanity check
+        assert np.all(self.patch_patient_groups >= 0), \
+            "Some patches could not be assigned to a patient group"
+        
+        # Print patient-level statistics
+        unique_groups, group_counts = np.unique(self.patch_patient_groups, return_counts=True)
+        print(f"Patient-level grouping: {len(unique_groups)} patients, "
+              f"patches per patient: min={group_counts.min()}, max={group_counts.max()}, "
+              f"mean={group_counts.mean():.0f}")
     
     
     def _pair_data_and_labels(self) -> List[Tuple[str, str]]:
@@ -347,6 +393,10 @@ class NpyHSDataset(AbstractHSDataset):
         self.raw_data = np.zeros((total_h, total_w, c), dtype=np.float32)
         self.raw_labels = np.zeros((total_h, total_w), dtype=np.int32)
         
+        # Track patient-level row ranges for group-aware splitting
+        self._patient_row_ranges = []  # List of (row_start, row_end, patient_group_idx)
+        _patient_id_map = {}  # patient_name -> group index
+        
         row_offset = 0
         for idx, (data_file, label_file) in enumerate(pairs):
             data = np.load(data_file)
@@ -357,17 +407,28 @@ class NpyHSDataset(AbstractHSDataset):
             if data.shape[:2] != labels.shape[:2]:
                 raise ValueError(f"Shape mismatch between {data_file} and {label_file}")
             
+            # Track patient group
+            patient_id = self._extract_patient_id(data_file)
+            if patient_id not in _patient_id_map:
+                _patient_id_map[patient_id] = len(_patient_id_map)
+            pid_idx = _patient_id_map[patient_id]
+            self._patient_row_ranges.append((row_offset, row_offset + h, pid_idx))
+            
             # Fill allocated arrays
             self.raw_data[row_offset:row_offset+h, :w, :] = data
             self.raw_labels[row_offset:row_offset+h, :w] = labels
             row_offset += h
             
-            print(f"  Loaded pair {idx+1}/{len(pairs)}: {data_file.split('/')[-1]}")
+            print(f"  Loaded pair {idx+1}/{len(pairs)}: {data_file.split('/')[-1]} (patient: {patient_id})")
             
             # Explicitly delete to free memory
             del data, labels
         
+        self._patient_names = {v: k for k, v in _patient_id_map.items()}
+        self._num_patients = len(_patient_id_map)
+        
         print(f"  Loaded {len(pairs)} pairs of .npy files")
+        print(f"  Identified {self._num_patients} unique patients")
         print(f"  Concatenated data shape: {self.raw_data.shape}, labels shape: {self.raw_labels.shape}")
         
     def _preprocess_data(self) -> None:
@@ -449,15 +510,37 @@ class NpyHSDataset(AbstractHSDataset):
             Tuple of (train_loader, test_loader)
         """
 
+        from sklearn.model_selection import GroupShuffleSplit
+        
         total_indices = np.arange(len(self.patch_indices))
         
-        train_idx, test_idx, _, _ = train_test_split(
+        # Patient-level split to prevent data leakage:
+        # All patches from the same patient go entirely into train OR test.
+        gss = GroupShuffleSplit(n_splits=1, test_size=self.test_rate, random_state=350234)
+        train_idx, test_idx = next(gss.split(
             total_indices,
             self.patch_labels,
-            test_size=self.test_rate,
-            random_state=350234,
-            stratify=self.patch_labels
-        )
+            groups=self.patch_patient_groups
+        ))
+        
+        # Verify no patient-level leakage
+        train_patients = set(self.patch_patient_groups[train_idx])
+        test_patients = set(self.patch_patient_groups[test_idx])
+        assert len(train_patients & test_patients) == 0, \
+            "Data leakage detected: patients appear in both train and test sets!"
+        print(f"Patient-level split: {len(train_patients)} train patients, "
+              f"{len(test_patients)} test patients (0 overlap)")
+        
+        # Check class coverage in both splits
+        train_classes = set(np.unique(self.patch_labels[train_idx]))
+        test_classes = set(np.unique(self.patch_labels[test_idx]))
+        all_classes = set(np.unique(self.patch_labels))
+        if train_classes != all_classes:
+            missing = all_classes - train_classes
+            print(f"  WARNING: Training set missing classes: {missing}")
+        if test_classes != all_classes:
+            missing = all_classes - test_classes
+            print(f"  WARNING: Test set missing classes: {missing}")
         
         # create an indexed subset
         train_subset = _IndexedSubset(self, train_idx)
