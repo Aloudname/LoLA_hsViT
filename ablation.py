@@ -113,9 +113,9 @@ class AblationResult:
 def build_common_vit_configs() -> List[AblationConfig]:
     """Define ablation configs for CommonViT (10 levels from heavy to light)."""
     return [
-        AblationConfig(tag="full stack",  model_type="CommonViT",
+        AblationConfig(tag="full_stack",  model_type="CommonViT",
                        dim=96, depths=[3,4,5], num_heads=[4,8,16], mlp_ratio=4.0),
-        AblationConfig(tag="shallow dim",   model_type="CommonViT",
+        AblationConfig(tag="shallow_dim",   model_type="CommonViT",
                        dim=96, depths=[2,3,3], num_heads=[4,8,16], mlp_ratio=4.0),
         AblationConfig(tag="reduced",   model_type="CommonViT",
                        dim=64, depths=[2,3,3], num_heads=[4,8,16], mlp_ratio=4.0),
@@ -132,10 +132,10 @@ def build_common_vit_configs() -> List[AblationConfig]:
 def build_lola_vit_configs() -> List[AblationConfig]:
     """Define ablation configs for LoLA_hsViT (structural + LoRA rank)."""
     return [
-        AblationConfig(tag="full stack",  model_type="LoLA_hsViT",
+        AblationConfig(tag="full_stack",  model_type="LoLA_hsViT",
                        dim=96, depths=[3,4,5], num_heads=[4,8,16], mlp_ratio=4.0,
                        r=16, lora_alpha=32),
-        AblationConfig(tag="shallow dim",   model_type="LoLA_hsViT",
+        AblationConfig(tag="shallow_dim",   model_type="LoLA_hsViT",
                        dim=96, depths=[2,3,3], num_heads=[4,8,16], mlp_ratio=4.0,
                        r=16, lora_alpha=32),
         AblationConfig(tag="reduced",   model_type="LoLA_hsViT",
