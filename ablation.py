@@ -4,34 +4,17 @@ ablation.py - Automated ablation experiment for model structure reduction.
 Progressively reduces model structure (dim, depths, mlp_ratio, LoRA rank)
 and re-trains to find the parameter-performance sweet spot where models
 no longer overfit.
-
-Usage:
-    python ablation.py -e 10 -p 4                    # Full ablation (both models)
-    python ablation.py -e 10 -p 4 --model lola        # Only LoLA_hsViT
-    python ablation.py -e 10 -p 4 --model common      # Only CommonViT
-    python ablation.py -e 10 -p 4 --dry-run            # Preview configs (no training)
-    python ablation.py -e 10 -p 4 --resume 5           # Resume from config index 5
-    python ablation.py -e 10 -p 4 --gap-threshold 8    # Max acceptable overfit gap (%)
 """
 
-import os
-import gc
-import json
-import time
-import shutil
-import argparse
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-
-import torch
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, field, asdict
+import os, gc, json, time, torch, argparse
 
 from config import load_config
-from pipeline import hsTrainer, NpyHSDataset
 from model import LoLA_hsViT, CommonViT
-
+from pipeline import hsTrainer, NpyHSDataset
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field, asdict
 
 @dataclass
 class AblationConfig:
@@ -187,8 +170,7 @@ class AblationRunner:
         self.gap_threshold = gap_threshold
         self.resume_idx = resume_idx
 
-        self.output_root = base_config.path.output
-        self.summary_dir = os.path.join(self.output_root, "ablation", "summary")
+        self.summary_dir = os.path.join(self.base_config.path.output, "ablation")
         os.makedirs(self.summary_dir, exist_ok=True)
 
         self.results: List[AblationResult] = []
