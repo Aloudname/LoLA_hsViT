@@ -33,7 +33,7 @@ class AblationConfig:
     @property
     def run_name(self) -> str:
         """Unique name for this ablation run."""
-        return f"ablation/{self.model_type}_{self.tag}"
+        return f"{self.model_type}_{self.tag}"
 
     @property
     def short_label(self) -> str:
@@ -90,7 +90,7 @@ class AblationResult:
     overfit_gap: float = 0.0          # train_acc - eval_acc at best epoch
     training_time: float = 0.0
     balance_score: float = 0.0        # composite metric
-    output_dir: str = ""
+    output_dir: str = None
 
 
 def build_common_vit_configs() -> List[AblationConfig]:
@@ -170,7 +170,7 @@ class AblationRunner:
         self.gap_threshold = gap_threshold
         self.resume_idx = resume_idx
 
-        self.summary_dir = os.path.join(self.base_config.path.output, "ablation")
+        self.summary_dir = self.base_config.path.output
         os.makedirs(self.summary_dir, exist_ok=True)
 
         self.results: List[AblationResult] = []
