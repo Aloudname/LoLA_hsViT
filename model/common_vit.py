@@ -9,13 +9,14 @@ from timm.layers import trunc_normal_, DropPath
 
 
 class Swish(nn.Module):
+    """Swish used in SwiGLU."""
     def __init__(self, beta=1):
         super().__init__()
         self.beta = beta
     
     def forward(self, x):
         return x * torch.sigmoid(self.beta * x)
-
+    
 
 class SwiGLU(nn.Module):
     """SwiGLU for MLP"""

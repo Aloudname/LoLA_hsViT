@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from timm.layers import trunc_normal_
 
 
-
 class DoubleConv(nn.Module):
     """(Conv3D -> IN -> ReLU) * 2"""
 

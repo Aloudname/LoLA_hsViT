@@ -1,8 +1,7 @@
 # dataset.py - Hyperspectral Dataset Handling.
 # todo:
 # - Implement class distribution analysis and visualization methods.
-import os
-import torch
+import os, torch
 import numpy as np
 from munch import Munch
 from torch.utils.data import Dataset

@@ -1,6 +1,5 @@
 # LoLA_hsViT.py defines model + its components.
-import math
-import torch
+import math, torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.layers import trunc_normal_, DropPath

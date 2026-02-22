@@ -7,9 +7,6 @@ CPU/GPU supported with flexible memory configuration.
 start train with:
     trainer.train()
 """
-
-
-
 import numpy as np
 import seaborn as sns
 import torch.nn as nn
@@ -23,9 +20,8 @@ from typing import Tuple, Callable, Dict
 from pipeline.dataset import AbstractHSDataset
 from torch.cuda.amp import GradScaler, autocast
 from sklearn.metrics import (accuracy_score, cohen_kappa_score, confusion_matrix,
-                             precision_recall_fscore_support, roc_curve, auc,
-                             average_precision_score, precision_recall_curve)
-import cv2, os, time, torch, traceback, warnings, json
+                             precision_recall_fscore_support, roc_curve, auc)
+import cv2, os, time, torch, traceback, warnings
 
 warnings.filterwarnings("ignore")
 
