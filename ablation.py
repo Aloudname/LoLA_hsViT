@@ -1,6 +1,8 @@
 """
 ablation.py - Automated ablation experiment for model structure reduction.
 
+    python ablation.py -e 4 -m common -t mini
+
 Progressively reduces model structure (dim, depths, mlp_ratio, LoRA rank)
 and re-trains to find the parameter-performance sweet spot where models
 no longer overfit.
@@ -20,6 +22,8 @@ from model import LoLA_hsViT, CommonViT
 from pipeline import hsTrainer, NpyHSDataset, tprint
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field, asdict
+
+os.setpgrp() # prevent Ctrl+C from killing the whole terminal session when running long ablation schedules
 
 @dataclass
 class AblationConfig:
@@ -787,11 +791,11 @@ def _run_smoke_test(args) -> bool:
         dataset = SyntheticHSDataset()
         assert len(dataset) == n_samples
         assert len(np.unique(dataset.patch_labels)) == num_classes
-        tprint(f"  ✓ Synthetic dataset: {n_samples} samples, {num_classes} classes, "
+        tprint(f"    Synthetic dataset: {n_samples} samples, {num_classes} classes, "
                f"{dataset._num_patients} patients")
 
         # DataLoader
-        tprint("\n[Phase 3/8] DataLoader construction...")
+        tprint("\n  DataLoader construction...")
         train_idx = np.arange(0, 60)
         test_idx = np.arange(60, 80)
 
@@ -805,12 +809,12 @@ def _run_smoke_test(args) -> bool:
         batch_x, batch_y = next(iter(train_loader))
         assert batch_x.shape == (4, n_channels, patch_size, patch_size), \
             f"Unexpected batch shape: {batch_x.shape}"
-        tprint(f"  ✓ Train loader: {len(train_loader)} batches, "
+        tprint(f"    Train loader: {len(train_loader)} batches, "
                f"batch shape: {tuple(batch_x.shape)}")
-        tprint(f"  ✓ Test loader:  {len(test_loader)} batches")
+        tprint(f"    Test loader:  {len(test_loader)} batches")
 
         # Model Instantiation
-        tprint("\n[Phase 4/8] Model instantiation & forward/backward...")
+        tprint("\n  Model instantiation & forward/backward...")
         tiny_kwargs = dict(
             in_channels=n_channels,
             num_classes=num_classes,
@@ -853,7 +857,7 @@ def _run_smoke_test(args) -> bool:
             model=model_fn,
             model_name="smoke_single",
             debug_mode=False,
-            num_gpus=min(args.parallel, 1),
+            num_gpus=min(config.memory.parallel_gpu, 1),
             train_loader=train_loader,
             test_loader=test_loader,
         )
@@ -898,7 +902,7 @@ def _run_smoke_test(args) -> bool:
             epochs=1,
             model=model_fn,
             model_name="smoke_cv",
-            num_gpus=min(args.parallel, 1),
+            num_gpus=min(config.memory.parallel_gpu, 1),
             debug_mode=False,
             _fold_loaders_override=fold_loaders,
         )
@@ -914,7 +918,7 @@ def _run_smoke_test(args) -> bool:
             torch.cuda.empty_cache()
 
         # Ablation Runner (dry-run) 
-        tprint("\n[Phase 7/8] Ablation runner (dry-run)...")
+        tprint("\n  Ablation runner (dry-run)...")
         smoke_configs = [
             AblationConfig(tag="smoke", model_type="CommonViT",
                            dim=16, depths=[1, 1], num_heads=[2, 4],
@@ -1052,7 +1056,7 @@ def main():
         base_config=config,
         dataLoader=dataLoader,
         epochs=args.epoch,
-        num_gpus=args.parallel,
+        num_gpus=config.memory.parallel_gpu,
         gap_threshold=args.gap_threshold,
         resume_idx=args.resume,
         n_folds=n_folds,

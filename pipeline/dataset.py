@@ -118,26 +118,33 @@ class AbstractHSDataset(ABC, Dataset):
         OPTIMIZATION: Chunked finite-value check avoids allocating a full
         boolean array the size of raw_data.
         """
+        tprint("Validating raw data...")
         # Check data and label spatial dimensions match
+        print("Validating spatial shape...")
         if self.raw_data.shape[:2] != self.raw_labels.shape[:2]:
             raise ValueError(
                 f"Spatial dimensions mismatch: data {self.raw_data.shape[:2]}, "
                 f"labels {self.raw_labels.shape[:2]}"
             )
+        print("Shape validated!")
             
         # Check for non-finite values — chunked to avoid huge intermediate array
+        print("Validating raw values...")
         flat = self.raw_data.reshape(-1)
         chunk = 1_000_000
         for i in range(0, flat.size, chunk):
             if not np.isfinite(flat[i:i + chunk]).all():
                 raise ValueError("Raw data contains non-finite values (NaN/inf)")
+        print("Value validated!")
             
         # Validate label range
+        print("Validating raw label...")
         unique_labels = np.unique(self.raw_labels)
         if not np.all((unique_labels >= 0) & (unique_labels <= self.num)):
             raise ValueError(
                 f"Labels contain values outside valid range [0, {self.num}]"
             )
+        print("Raw label validated!")
 
     def _create_patches(self) -> None:
         """
@@ -440,7 +447,7 @@ class NpyHSDataset(AbstractHSDataset):
         
         OPTIMIZATION:
         - Global StandardScaler for consistent normalization.
-        - Randomized SVD: O(n·k²) instead of full SVD O(n·c²), ideal when
+        - Random SVD: O(n*k^2) instead of full SVD O(n*c^2), ideal when
           n_components(15) << n_features(64).
         - Subsampled fit: fit PCA on a random subsample of pixels (max 500k),
           then project all pixels. Spatial correlation makes this near-lossless.
@@ -449,51 +456,65 @@ class NpyHSDataset(AbstractHSDataset):
         from sklearn.decomposition import PCA
         from sklearn.preprocessing import StandardScaler
         
+        tprint("Processing raw data...")
         h, w, c = self.raw_data.shape
-        n_pixels = h * w
+        flat = self.raw_data.reshape(-1, c).astype(np.float32)
+        n_pixels = flat.shape[0]
+        print("Reshaped to (n_pixels, n_channels):", flat.shape)
+
+        tprint("Batching for StandardScaler fit...")
+        max_fit_samples = 500_000
+        if n_pixels > max_fit_samples:
+            rng = np.random.RandomState(350235)
+            fit_idx = rng.choice(n_pixels, max_fit_samples, replace=False)
+            fit_data = flat[fit_idx]
+        else:
+            fit_data = flat
         
+            
+        mean = fit_data.mean(axis=0)           # (c,) float32
+        std = fit_data.std(axis=0) + 1e-8      # (c,) float32, avoid div-by-zero
+        flat = (flat - mean) / std             # in-place normalization float32
+            
         # global normalization
-        tprint("Normalizing data (global StandardScaler)...")
-        flat_data = self.raw_data.reshape(-1, c).astype(np.float32)
-        scaler = StandardScaler()
-        flat_data = scaler.fit_transform(flat_data).astype(np.float32)
+        tprint(f"  StandardScaler fit on {len(fit_data):,} / {n_pixels:,} pixels.")
         
         # PCA
-        if self.pca_component and self.pca_component < c:
-            tprint(f"Applying PCA: {c} -> {self.pca_component} components (randomized SVD)...")
-            
-            # Subsample for faster fit: 500k pixels is more than enough
-            # to capture principal directions from spatially correlated data
-            max_fit_samples = 500_000
-            if n_pixels > max_fit_samples:
+        # float32 subsample fit.
+        n_components = self.config.preprocess.pca_components
+        if n_components and n_components < c:
+            from sklearn.decomposition import PCA
+            max_pca_samples = 500_000
+            if n_pixels > max_pca_samples:
                 rng = np.random.RandomState(42)
-                fit_idx = rng.choice(n_pixels, max_fit_samples, replace=False)
-                fit_data = flat_data[fit_idx]
-                print(f"  Subsampled {max_fit_samples}/{n_pixels} pixels for PCA fit")
+                pca_idx = rng.choice(n_pixels, max_pca_samples, replace=False)
+                pca_fit_data = flat[pca_idx]
             else:
-                fit_data = flat_data
-            
-            # SVD, fast when k << c
-            pca = PCA(n_components=self.pca_component,
-                      svd_solver='randomized', random_state=350234)
-            pca.fit(fit_data)
-            print(f"  Explained variance ratio: {pca.explained_variance_ratio_.sum():.4f}")
-            
-            # manual projection in float32: X_pca = (X - mean) @ components.T
-            # avoids sklearn transform()'s internal float64 upcast.
-            components = pca.components_.astype(np.float32)     # (k, c)
-            mean = pca.mean_.astype(np.float32)                 # (c,)
-            pca_data = (flat_data - mean) @ components.T        # (n, k), stays float32
-            self.processed_data = pca_data.reshape(h, w, self.pca_component)
-            
-            tprint(f"  Applied PCA: reduced from {c} to {self.pca_component} components")
-            del fit_data, pca_data, components, mean
+                pca_fit_data = flat
+
+            pca = PCA(n_components=n_components, svd_solver='randomized', random_state=350234)
+            pca.fit(pca_fit_data)
+
+            # Manual transform in float32 (avoid sklearn's float64 cast)
+            components = pca.components_.astype(np.float32)   # (n_components, c)
+            pca_mean = pca.mean_.astype(np.float32)           # (c,)
+            flat = (flat - pca_mean) @ components.T            # (n_pixels, n_components) float32
+
+            explained = sum(pca.explained_variance_ratio_) * 100
+            tprint(f"  Conducted PCA: {c} -> {n_components} channels, "
+                   f"explained variance: {explained:.1f}%, "
+                   f"fit on {len(pca_fit_data):,} pixels")
+            c = n_components
+
+            self.processed_data = flat.reshape(h, w, c)
+            print(f"  Final shape: {self.processed_data.shape}, dtype: {self.processed_data.dtype}")
+            del fit_data, pca_fit_data, components, mean, pca_mean  # free memory
         else:
-            self.processed_data = flat_data.reshape(h, w, c)
-            tprint("  PCA not applied, using all original components")
+            self.processed_data = flat.reshape(h, w, c)
+            print("  PCA not applied, using all original components")
         
         # release memory 
-        del flat_data  
+        del flat  
             
     def validate_data_quality(self) -> None:
         """Check data quality: distribution, ranges, duplicates"""
