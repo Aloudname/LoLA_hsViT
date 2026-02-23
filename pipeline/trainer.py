@@ -5,25 +5,185 @@ Optimization includes gradient accumulation, mixed precision training, learning 
 CPU/GPU supported with flexible memory configuration.
 
 start train with:
-    trainer.train()
+    trainer.cross_validate()
 """
 import numpy as np
 import seaborn as sns
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
+import cv2, gc, json, os, time, torch, traceback, warnings, copy, matplotlib
 
 from tqdm import tqdm
 from munch import Munch
 from torch.nn import Module
+from pipeline.monitor import tprint
 from typing import Tuple, Callable, Dict
 from pipeline.dataset import AbstractHSDataset
 from torch.cuda.amp import GradScaler, autocast
-from sklearn.metrics import (accuracy_score, cohen_kappa_score, confusion_matrix,
-                             precision_recall_fscore_support, roc_curve, auc)
-import cv2, os, time, torch, traceback, warnings, copy
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from sklearn.metrics import (accuracy_score, cohen_kappa_score,
+                             confusion_matrix as _cm, roc_curve,
+                             precision_recall_fscore_support, auc)
 
 warnings.filterwarnings("ignore")
+
+
+def _worker_plot_training_curves(train_losses, eval_losses, train_accs,
+                                 eval_accs, eval_interval, debug_mode,
+                                 best_acc, model_name, output):
+    """Worker: training loss/accuracy curves."""
+    matplotlib.use('Agg')
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+    total_epochs = len(train_losses)
+    eval_epochs = []
+    for e in range(total_epochs):
+        should = ((e + 1) % eval_interval == 0) or (e + 1 == total_epochs)
+        if should or debug_mode:
+            eval_epochs.append(e)
+    eval_epochs = eval_epochs[:len(eval_losses)]
+
+    axes[0].plot(train_losses, label='Train Loss', marker='o', markersize=4)
+    if eval_losses:
+        axes[0].plot(eval_epochs, eval_losses, label='Test Loss', marker='s', markersize=4)
+    axes[0].set_xlabel('Epoch'); axes[0].set_ylabel('Loss')
+    axes[0].set_title('Training Loss Curve'); axes[0].legend(); axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(train_accs, label='Train Acc', marker='o', markersize=4)
+    if eval_accs:
+        axes[1].plot(eval_epochs, eval_accs, label='Test Acc', marker='s', markersize=4)
+    axes[1].axhline(y=best_acc, color='r', linestyle='--', label=f'Best: {best_acc:.2f}%')
+    axes[1].set_xlabel('Epoch'); axes[1].set_ylabel('Accuracy (%)')
+    axes[1].set_title('Training Accuracy Curve'); axes[1].legend(); axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output, 'training_curve.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def _worker_plot_confusion_matrix(y_true, y_pred, num_classes, class_names,
+                                  model_name, output):
+    """Worker: confusion matrix."""
+    matplotlib.use('Agg')
+
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=range(num_classes), zero_division=0)
+    report_lines = []
+    for i in range(num_classes):
+        name = class_names[i] if i < len(class_names) else f'Class_{i}'
+        report_lines.append(f"{name}: P={precision[i]:.4f}, R={recall[i]:.4f}, F1={f1[i]:.4f}")
+    with open(os.path.join(output, 'classification_metrics.txt'), 'w') as f:
+        f.write('\n'.join(report_lines) + '\n')
+
+    cm = _cm(y_true, y_pred)
+    cm_norm = cm.astype('float') / (cm.sum(axis=1, keepdims=True) + 1e-8)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[0])
+    axes[0].set_title('Confusion Matrix (Count)'); axes[0].set_ylabel('True'); axes[0].set_xlabel('Predicted')
+    sns.heatmap(cm_norm, annot=True, fmt='.1%', cmap='Greens', ax=axes[1])
+    axes[1].set_title('Confusion Matrix (Normalized)'); axes[1].set_ylabel('True'); axes[1].set_xlabel('Predicted')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output, 'confusion_matrix.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def _worker_plot_per_class_metrics(y_true, y_pred, num_classes, class_names,
+                                   model_name, output):
+    """Worker: per-class P/R/F1 bar chart."""
+    matplotlib.use('Agg')
+
+    p, r, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=range(num_classes), zero_division=0)
+    x = np.arange(num_classes)
+    w = 0.25
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.bar(x - w, p, w, label='Precision', color='#2196F3', alpha=0.85)
+    ax.bar(x, r, w, label='Recall', color='#FF5722', alpha=0.85)
+    ax.bar(x + w, f1, w, label='F1-Score', color='#4CAF50', alpha=0.85)
+    ax.set_xticks(x)
+    ax.set_xticklabels(class_names[:num_classes], rotation=45, ha='right', fontsize=9)
+    ax.set_ylim(0, 1.1); ax.set_ylabel('Score')
+    ax.set_title(f'{model_name} — Per-Class Metrics', fontsize=13, fontweight='bold')
+    ax.legend(); ax.grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output, 'per_class_metrics.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def _worker_plot_roc_curves(y_true, probas, num_classes, class_names,
+                            model_name, output):
+    """Worker: per-class ROC."""
+    matplotlib.use('Agg')
+
+    if probas is None:
+        return
+    y_onehot = np.zeros((len(y_true), num_classes))
+    for i, t in enumerate(y_true):
+        if 0 <= t < num_classes:
+            y_onehot[i, t] = 1
+    fig, ax = plt.subplots(figsize=(8, 7))
+    for cls_i in range(num_classes):
+        fpr, tpr, _ = roc_curve(y_onehot[:, cls_i], probas[:, cls_i])
+        roc_auc = auc(fpr, tpr)
+        ax.plot(fpr, tpr, label=f'{class_names[cls_i]} (AUC={roc_auc:.3f})', linewidth=1.3)
+    ax.plot([0, 1], [0, 1], 'k--', alpha=0.4)
+    ax.set_xlabel('False Positive Rate'); ax.set_ylabel('True Positive Rate')
+    ax.set_title(f'{model_name} — Per-Class ROC Curves', fontsize=13, fontweight='bold')
+    ax.legend(fontsize=8, loc='lower right'); ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output, 'roc_curves.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def _worker_plot_grad_norm(grad_norms, model_name, output):
+    """Worker: gradient L2 norm."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    if not grad_norms:
+        return
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(grad_norms, marker='o', markersize=3, linewidth=1.5, color='#FF5722')
+    ax.set_xlabel('Epoch'); ax.set_ylabel('Gradient L2 Norm')
+    ax.set_title(f'{model_name} — Gradient Norm', fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output, 'gradient_norm.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def _worker_plot_lr(lr_history, model_name, output):
+    """Worker: LR schedule."""
+    matplotlib.use('Agg')
+
+    if not lr_history:
+        return
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(lr_history, linewidth=1.5, color='#2196F3')
+    ax.set_xlabel('Epoch'); ax.set_ylabel('Learning Rate'); ax.set_yscale('log')
+    ax.set_title(f'{model_name} — Learning Rate Schedule', fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output, 'lr_schedule.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def _worker_plot_epoch_time(epoch_times, model_name, output):
+    """Worker: epoch wall-clock time."""
+    matplotlib.use('Agg')
+
+    if not epoch_times:
+        return
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.bar(range(len(epoch_times)), epoch_times, color='#4CAF50', alpha=0.8)
+    ax.set_xlabel('Epoch'); ax.set_ylabel('Time (s)')
+    ax.set_title(f'{model_name} — Per-Epoch Wall-Clock Time', fontsize=13, fontweight='bold')
+    ax.grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output, 'epoch_times.png'), dpi=150, bbox_inches='tight')
+    plt.close()
 
 
 class ModelEMA:
@@ -73,7 +233,9 @@ class hsTrainer:
         model: Callable[..., Module] = None,
         model_name: str = "model",
         debug_mode: bool = False,
-        num_gpus: int = 1
+        num_gpus: int = 1,
+        train_loader=None,
+        test_loader=None,
     ):
         
         self.config = config
@@ -91,7 +253,14 @@ class hsTrainer:
         
         # training workflow
         self._setup_device()
-        self._load_data()
+        if train_loader is not None and test_loader is not None:
+            self.train_loader = train_loader
+            self.test_loader = test_loader
+            tprint(f"  Using injected data loaders "
+                  f"(train: {len(train_loader)} batches, "
+                  f"test: {len(test_loader)} batches)")
+        else:
+            self._load_data()
         self._create_model()
         self._setup_multi_gpu()
         self._setup_training()
@@ -105,12 +274,12 @@ class hsTrainer:
         self.best_epoch = 0
         self.best_model_state = None
         
-        # enhanced tracking for richer visualizations
+        # memory-efficient tracking for visualizations
         self.lr_history = []          # lr per epoch
         self.grad_norms = []          # gradient L2 norm per epoch
         self.epoch_times = []         # wall-clock time per epoch
 
-        print(f"Trainer Initialized successfully with:")
+        tprint(f"Trainer Initialized successfully with:")
         print(f"  model: {self.model_name}")
         print(f"  epoch: {self.epochs}")
         print(f"  device: {self.device}")
@@ -123,29 +292,19 @@ class hsTrainer:
         try:
             self.device = torch.device(device_type)
             if device_type == 'cuda':
-                # Get available GPU count
                 self.available_gpus = torch.cuda.device_count()
-                
-                # Validate num_gpus
                 if self.num_gpus > self.available_gpus:
                     raise RuntimeError(
-                        f"Requested {self.num_gpus} GPUs but only {self.available_gpus} available. "
-                        f"Please set --parallel to a value <= {self.available_gpus}"
-                    )
-                
+                        f"Requested {self.num_gpus} GPUs but only {self.available_gpus} available.")
                 if self.num_gpus < 1:
                     raise RuntimeError(f"num_gpus must be >= 1, got {self.num_gpus}")
-                
-                # Store GPU IDs to use
                 self.gpu_ids = list(range(self.num_gpus))
-                
-                print(f"  Available GPUs: {self.available_gpus}")
-                print(f"  Using {self.num_gpus} GPU(s): {self.gpu_ids}")
-                for gpu_id in self.gpu_ids:
-                    print(f"    GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)} - "
-                          f"{torch.cuda.get_device_properties(gpu_id).total_memory / (1024**3):.2f} GB")
-                print(f"  CUDA version: {torch.version.cuda}")
+                gpu_name = torch.cuda.get_device_name(0)
+                gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                print(f"  Device: {self.num_gpus}x {gpu_name} ({gpu_mem:.1f}GB), CUDA {torch.version.cuda}")
+                tprint('cuda.empty_cache() performing...')
                 torch.cuda.empty_cache()
+                tprint('cuda.empty_cache() performed!')
         except Exception as e:
             print(f"Initialization on CPU due to {e}")
             self.device = torch.device('cpu')
@@ -153,18 +312,17 @@ class hsTrainer:
             self.gpu_ids = []
             self.available_gpus = 0
         
-        # limit CPU threads to prevent oversubscription.
         os.environ['OMP_NUM_THREADS'] = '4'
         os.environ['MKL_NUM_THREADS'] = '4'
     
     def _load_data(self) -> None:
         """load & create data loaders with optimized performance settings"""
-        print("Loading data and creating data loaders with:")
+        tprint("Loading data and creating data loaders with:")
         try:
             # Optimize data loading for multi-GPU
             num_workers = self.config.memory.num_workers
             batch_size = self.config.split.batch_size
-            prefetch_factor = 0
+            prefetch_factor = 2
             persistent_workers = False
             
             if self.num_gpus > 1:
@@ -202,7 +360,7 @@ class hsTrainer:
     
     def _create_model(self) -> None:
         """create model and print parameter count"""
-        print("Creating model with:")
+        tprint("Creating model with:")
         try:
             self.model = self.model()
             self.model.to(self.device)
@@ -219,73 +377,85 @@ class hsTrainer:
     def _setup_multi_gpu(self) -> None:
         """Setup DataParallel for multi-GPU training if num_gpus > 1"""
         if self.num_gpus > 1 and self.device.type == 'cuda':
-            print("Setting up DataParallel for multi-GPU training:")
             try:
-                # Use DataParallel with explicit device IDs
                 self.model = nn.DataParallel(self.model, device_ids=self.gpu_ids, output_device=self.gpu_ids[0])
-                print(f"  Model wrapped with DataParallel using {self.num_gpus} GPU(s): {self.gpu_ids}")
+                print(f"  DataParallel: {self.num_gpus} GPUs")
             except Exception as e:
-                print(f"Warning: Failed to setup DataParallel: {e}")
-                print(f"  Continuing with single GPU training")
+                print(f"  Warning: DataParallel failed ({e}), using single GPU")
     
     def _setup_training(self) -> None:
         """Initialize training components: optimizer, scheduler, loss, precision"""
-        print("Initializing training components with:")
+        print("Training components:")
         
-        # Optimizer - AdamW for better generalization
+        # Optimizer
         lr = self.config.common.lr
         weight_decay = self.config.common.weight_decay
-        
         self.optimizer = optim.AdamW(
-            self.model.parameters(),
-            lr=lr,
-            weight_decay=weight_decay,
-            betas=(0.9, 0.999)
-        )
-        print(f"  optimizer: AdamW (lr={lr}, weight_decay={weight_decay})")
+            self.model.parameters(), lr=lr,
+            weight_decay=weight_decay, betas=(0.9, 0.999))
         
-        # lr scheduler (Cosine Annealing with Warm Restarts)
-        scheduler_config = self.config.common.scheduler
-        T_0 = scheduler_config.T_0 if hasattr(scheduler_config, 'T_0') else 10
-        T_mult = scheduler_config.T_mult if hasattr(scheduler_config, 'T_mult') else 2
-        eta_min = scheduler_config.eta_min if hasattr(scheduler_config, 'eta_min') else 1e-6
-        
+        # LR scheduler
+        sc = self.config.common.scheduler
+        T_0 = getattr(sc, 'T_0', 10)
+        T_mult = getattr(sc, 'T_mult', 2)
+        eta_min = getattr(sc, 'eta_min', 1e-6)
         self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer,
-            T_0=T_0,
-            T_mult=T_mult,
-            eta_min=eta_min
-        )
-        print(f"  lr scheduler: CosineAnnealingWarmRestarts (T_0={T_0}, T_mult={T_mult}, eta_min={eta_min})")
+            self.optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min)
         
-        # loss function — always use ignore_index=255 for background/padding
-        label_smoothing = self.config.common.label_smoothing if hasattr(self.config.common, 'label_smoothing') else 0.1
+        print(f"  AdamW(lr={lr}, wd={weight_decay}) + CosineWR(T0={T_0}, Tm={T_mult})")
+        
+        # Class-weighted CrossEntropyLoss
+        label_smoothing = getattr(self.config.common, 'label_smoothing', 0.1)
+        class_weights = None
+        try:
+            train_labels = self.dataLoader.patch_labels[
+                self.train_loader.dataset.indices]
+            num_cls = self.config.clsf.num
+            class_counts = np.bincount(train_labels, minlength=num_cls).astype(np.float64)
+            total_samples = class_counts.sum()
+            raw_weights = total_samples / (num_cls * class_counts + 1e-8)
+            raw_weights = raw_weights / raw_weights.mean()
+            class_weights = torch.FloatTensor(raw_weights).to(self.device)
+            imbalance = class_counts.max() / (class_counts.min() + 1)
+            print(f"  Class weights: imbalance ratio {imbalance:.1f}x, {num_cls} classes")
+        except Exception as e:
+            print(f"  Warning: uniform class weights ({e})")
+        
         self.criterion = nn.CrossEntropyLoss(
+            weight=class_weights,
             label_smoothing=label_smoothing, ignore_index=255)
-        print(f"  loss function: CrossEntropyLoss (label_smoothing={label_smoothing}, ignore_index=255)")
         
-        # mixed precision training on GPU
+        # Mixed precision
         use_amp = self.config.common.use_amp and self.device.type == 'cuda'
         self.scaler = GradScaler() if use_amp else None
         self.use_amp = use_amp
-        if use_amp:
-            print(f"  mixed precision training enabled with GradScaler")
         
-        # other hyperparameters
-        self.grad_clip = self.config.common.grad_clip if hasattr(self.config.common, 'grad_clip') else 1.0
-        self.warmup_epochs = self.config.common.warmup_epochs if hasattr(self.config.common, 'warmup_epochs') else 5
-        self.patience = self.config.common.patience if hasattr(self.config.common, 'patience') else 20
-        self.eval_interval = self.config.common.eval_interval if hasattr(self.config.common, 'eval_interval') else 1
+        # Hyperparameters
+        self.grad_clip = getattr(self.config.common, 'grad_clip', 1.0)
+        self.warmup_epochs = getattr(self.config.common, 'warmup_epochs', 5)
+        self.patience = getattr(self.config.common, 'patience', 20)
+        self.eval_interval = getattr(self.config.common, 'eval_interval', 1)
 
-        # EMA (Exponential Moving Average) for better generalization
-        ema_decay = self.config.common.ema_decay if hasattr(self.config.common, 'ema_decay') else 0.999
+        # EMA
+        ema_decay = getattr(self.config.common, 'ema_decay', 0.999)
         self.ema = ModelEMA(self.model, decay=ema_decay)
-        print(f"  EMA enabled (decay={ema_decay})")
+        
+        if use_amp:
+            print(f"  AMP enabled, EMA(decay={ema_decay}), patience={self.patience}")
+        else:
+            print(f"  EMA(decay={ema_decay}), patience={self.patience}")
 
     
     def train_epoch(self, epoch: int) -> Tuple[float, float]:
         """
         Train for a single epoch.
+        This method uses indexed batch unpacking and non-blocking transfers,
+            which are crucial for memory and time efficiency.
+            
+        NOTE: A POSSIBLE **MEMORY FATAL ERROR**
+        hsi.permute() in the method may cause incontinuous memory,
+        try hsi.permute().contiguous() if goes wrong.
+        see https://blog.csdn.net/weixin_42046845/article/details/134667338.
         
         Return: Tuple (``loss``, ``accuracy``)
         """
@@ -303,18 +473,19 @@ class hsTrainer:
         
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{self.epochs}', leave=False)
         
+        # use idx to unpack batch-by-batch.
         for batch_idx, batch_data in enumerate(pbar):
             hsi, labels = self._unpack_batch(batch_data)
-            # non_blocking=True to transfer data parallel with last GPU caculation.
+            # non_blocking=True to:
+            # transfer new batch from memory to GPU parallel with last GPU conduct.
             hsi = hsi.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
             
-            # check up data format
+            # NOTE: method permute() may cause incontinuous memory, FATAL ERROR.
+            # try permute().contiguous() if goes wrong.
+            # see https://blog.csdn.net/weixin_42046845/article/details/134667338.
             if hsi.dim() == 4 and hsi.shape[-1] <= 16:  # [B, H, W, C]
                 hsi = hsi.permute(0, 3, 1, 2)  # [B, C, H, W]
-            
-            # norm & forward pass
-            hsi = self._normalize(hsi)
             
             self.optimizer.zero_grad()
             
@@ -336,7 +507,7 @@ class hsTrainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 self.optimizer.step()
             
-            # Update EMA shadow weights (negligible overhead)
+            # update EMA shadow weights (negligible overhead)
             self.ema.update(self.model)
             
             # update lr after warmup
@@ -359,8 +530,11 @@ class hsTrainer:
                 'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
             })
             
-            # NOTE: torch.cuda.empty_cache() removed here — it forces
-            # a device sync every 5 steps and is counter-productive.
+            # NOTE:
+            # torch.cuda.empty_cache() removed here.
+            # it forces a device sync every 5 steps,
+            # resulting in a significant shutdown for GPU units,
+            # which is time counter-productive.
         
         epoch_loss = total_loss / len(self.train_loader)
         epoch_acc = 100.0 * correct / total if total > 0 else 0.0
@@ -378,7 +552,7 @@ class hsTrainer:
         return epoch_loss, epoch_acc
     
     @torch.no_grad()
-    def evaluate(self, collect_extra: bool = False
+    def evaluate(self, collect_extra: bool = False, use_ema: bool = False
                  ) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
         """
         Evaluate on the test set with optimized performance.
@@ -386,12 +560,20 @@ class hsTrainer:
         Args:
             collect_extra: if True, also collect softmax probabilities and
                            penultimate-layer features (for ROC / t-SNE).
+            use_ema: if True, temporarily swap in EMA shadow weights for
+                     evaluation, then restore original weights.
         
         Return:
             Tuple (``loss``, ``accuracy``, ``kappa``, ``predictions``, ``labels``)
             When collect_extra is True, also stores self._last_probas and
             self._last_features for consumption by the comparator.
         """
+        # Optionally swap in EMA weights
+        _ema_backup = None
+        if use_ema:
+            _ema_backup = copy.deepcopy(self.model.state_dict())
+            self.model.load_state_dict(self.ema.state_dict())
+        
         self.model.eval()
         total_loss = 0.0
         predictions_list = []   # GPU tensors, moved to CPU at end
@@ -427,8 +609,6 @@ class hsTrainer:
                 if hsi.dim() == 4 and hsi.shape[-1] <= 16:
                     hsi = hsi.permute(0, 3, 1, 2)
                 
-                hsi = self._normalize(hsi)
-                
                 # Use AMP for evaluation (match training precision)
                 if self.use_amp:
                     with autocast():
@@ -446,9 +626,11 @@ class hsTrainer:
                 predictions_list.append(predicted[valid_mask])
                 targets_list.append(labels[valid_mask])
                 
-                # Skip collecting probabilities to save memory (dense output)
+                # Collect softmax probabilities for valid pixels (ROC curves)
                 if collect_extra:
-                    pass  # probabilities not collected for dense predictions
+                    proba = outputs.softmax(dim=1)          # [B, K, H, W]
+                    proba_bhwk = proba.permute(0, 2, 3, 1)  # [B, H, W, K]
+                    probas_list.append(proba_bhwk[valid_mask].cpu().numpy())
         
         if _feat_hook is not None:
             _feat_hook.remove()
@@ -479,41 +661,28 @@ class hsTrainer:
                 self._last_features = None
                 self._last_feature_labels = None
         
+        # Restore original weights after EMA evaluation
+        if _ema_backup is not None:
+            self.model.load_state_dict(_ema_backup)
+        
         return loss, acc, kappa, predictions, targets
     
-    def evaluate_ema(self, collect_extra: bool = False
-                     ) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
-        """
-        Evaluate using EMA shadow weights for better generalization.
-        Temporarily swaps model weights with EMA weights, evaluates, then restores.
-        """
-        # Save current model state and swap in EMA weights
-        original_state = copy.deepcopy(self.model.state_dict())
-        self.model.load_state_dict(self.ema.state_dict())
-        
-        result = self.evaluate(collect_extra=collect_extra)
-        
-        # Restore original training weights
-        self.model.load_state_dict(original_state)
-        return result
-    
-    def train(self) -> Dict[str, float]:
+    def train(self, _cv_mode: bool = False) -> Dict[str, float]:
         """
         Training loop with optional data validation.
+        
+        Args:
+            _cv_mode: When True (called from cross_validate), skip per-fold
+                      visualizations; aggregated CV plots are generated later.
         
         Returns:
             Dict[``str``, ``float``] of final results.
         """
-        # Validate data quality on first epoch
-        if not hasattr(self, '_data_validated'):
-            self._validate_data_quality()
-            self._data_validated = True
-        
-        print(f"\n{'='*20}")
+        print("\n")
         if self.debug_mode:
-            print(f"Debug mode enabled: CAM and visualizations enabled every epoch.")
+            tprint(f"Debug mode enabled: CAM and visualizations enabled every epoch.")
         print(f"Training ({self.model_name})")
-        print(f"{'='*20}\n")
+        print("\n")
         
         tic = time.perf_counter()
         
@@ -529,7 +698,7 @@ class hsTrainer:
             should_eval = ((epoch + 1) % self.eval_interval == 0) or (epoch + 1 == self.epochs)
             
             if should_eval or self.debug_mode:
-                eval_loss, eval_acc, kappa, pred, target = self.evaluate_ema()
+                eval_loss, eval_acc, kappa, pred, target = self.evaluate(use_ema=True)
                 self.eval_losses.append(eval_loss)
                 self.eval_accs.append(eval_acc)
                 
@@ -537,7 +706,7 @@ class hsTrainer:
                 if hasattr(self, '_last_miou'):
                     miou_str = f' mIoU: {self._last_miou:6.2f}%'
                 
-                print(f"\n[Epoch {epoch+1:3d}] "
+                tprint(f"\n[Epoch {epoch+1:3d}] "
                       f"Train Loss: {train_loss:.4f} Acc: {train_acc:6.2f}% | "
                       f"Test Loss: {eval_loss:.4f} Acc: {eval_acc:6.2f}% Kappa: {kappa:6.2f}%{miou_str}")
                 
@@ -552,30 +721,30 @@ class hsTrainer:
                         'kappa': kappa
                     }
                     self._save_model()
-                    print(f"  Best model saved (Acc: {eval_acc:.2f}%) at {os.path.join(self.output, 'models', f'{self.model_name}_best.pth')}")
+                    tprint(f"  Best model saved (Acc: {eval_acc:.2f}%) at {os.path.join(self.output, 'models', f'{self.model_name}_best.pth')}")
                 else:
                     # early stopping check
                     if epoch - self.best_epoch > self.patience:
-                        print(f"\n  Early stopping: {epoch - self.best_epoch} epochs without improvement")
+                        tprint(f"\n  Early stopping: {epoch - self.best_epoch} epochs without improvement")
                         break
             else:
-                print(f"[Epoch {epoch+1:3d}] Train Loss: {train_loss:.4f} Acc: {train_acc:6.2f}%", end='')
+                tprint(f"[Epoch {epoch+1:3d}] Train Loss: {train_loss:.4f} Acc: {train_acc:6.2f}%", end='')
             
             # Generate visualizations
             if self.debug_mode or (should_eval and (epoch + 1) % 2 == 0):
                 try:
                     self._generate_cam(epoch)
                 except Exception as e:
-                    print(f"  CAM error: {e}")
+                    tprint(f"  CAM error: {e}")
         
         toc = time.perf_counter()
         training_time = toc - tic
         
-        print(f"\n{'='*20}")
-        print(f"Training completed with:")
+        print("\n")
+        tprint(f"Training completed with:")
         print(f"  Best epoch: {self.best_epoch + 1} (Acc: {self.best_acc:.2f}%)")
         print(f"  Total time: {training_time:.2f}s")
-        print(f"{'='*20}\n")
+        print("\n")
         
         # load best model for final evaluation
         if self.best_model_state is not None:
@@ -585,6 +754,10 @@ class hsTrainer:
         final_loss, final_acc, final_kappa, final_pred, final_target = self.evaluate(
             collect_extra=True)
         
+        # Store for CV aggregation (accessed before trainer is deleted)
+        self._final_pred = final_pred
+        self._final_target = final_target
+        
         # measure inference time (average over a few batches)
         self._inference_time = self._measure_inference_time()
         
@@ -593,14 +766,9 @@ class hsTrainer:
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         self._param_counts = {'total': total_params, 'trainable': trainable_params}
         
-        # single-model visualizations 
-        self._plot_training_curves()
-        self._plot_confusion_matrix(final_target, final_pred)
-        self._plot_per_class_metrics(final_target, final_pred)
-        self._plot_roc_curves(final_target)
-        self._plot_grad_norm_curve()
-        self._plot_lr_curve()
-        self._plot_epoch_time_curve()
+        # single-model visualizations, skip in CV mode for aggregated plots
+        if not _cv_mode:
+            self._save_all_plots(final_target, final_pred)
         
         results = {
             'best_epoch': self.best_epoch + 1,
@@ -614,7 +782,592 @@ class hsTrainer:
         if hasattr(self, '_last_miou'):
             results['final_miou'] = self._last_miou
         return results
-    
+
+    #  Cross-Validation
+    @staticmethod
+    def cross_validate(
+        config: Munch,
+        dataLoader: AbstractHSDataset,
+        n_folds: int,
+        epochs: int,
+        model: Callable[..., Module],
+        model_name: str = "model",
+        num_gpus: int = 1,
+        debug_mode: bool = False,
+        _fold_loaders_override=None,
+    ) -> Dict[str, float]:
+        """
+        Grouped K-Fold cross-validation with patient-level grouping.
+
+        Data is loaded and preprocessed ONCE by ``dataLoader``; only the
+        train/test index split changes per fold.  Each fold trains a fresh
+        model from scratch (new weights, optimizer, EMA, etc.).
+
+        The return dict is **compatible** with the single-train ``train()``
+        return format so that ``AblationRunner`` can consume either one
+        without changes to its result-gathering logic.
+
+        Args:
+            config: Global Munch config.
+            dataLoader: An already-loaded ``NpyHSDataset``.
+            n_folds: Number of CV folds (typically 5).
+            epochs: Training epochs per fold.
+            model: **Callable** that returns a fresh ``nn.Module``.
+            model_name: Name prefix for output dirs.
+            num_gpus: GPU count.
+            debug_mode: Enable per-epoch CAM / viz.
+
+        Returns:
+            Dict with aggregated mean/std results plus per-fold details.
+        """
+        cv_output = os.path.join(config.path.output, f'{model_name}')
+        os.makedirs(cv_output, exist_ok=True)
+
+        num_workers = config.memory.num_workers
+        batch_size = config.split.batch_size
+        prefetch_factor = 2
+        persistent_workers = False
+
+        if num_gpus > 1:
+            available_cpus = os.cpu_count() or 4
+            num_workers = min(available_cpus // 2, 8, num_gpus * 2)
+            batch_size = config.split.batch_size * num_gpus
+            prefetch_factor = config.memory.prefetch_factor
+            persistent_workers = True
+
+        print("\n")
+        tprint(f"Initializing {n_folds}-Fold Grouped Cross-Validation: {model_name}")
+        if _fold_loaders_override is None:
+            print(f"  Total patches: {len(dataLoader)}, "
+                  f"Unique patients: {dataLoader._num_patients}")
+        print("\n")
+
+        if _fold_loaders_override is not None:
+            fold_loaders = _fold_loaders_override
+            n_folds = len(fold_loaders)
+            print(f"  Using injected fold loaders ({n_folds} folds)")
+        else:
+            fold_loaders = dataLoader.create_cv_data_loaders(
+                n_folds=n_folds,
+                num_workers=num_workers,
+                batch_size=batch_size,
+                pin_memory=config.memory.pin_memory,
+                prefetch_factor=prefetch_factor,
+                persistent_workers=persistent_workers,
+            )
+
+        num_classes = config.clsf.num
+        common_fpr = np.linspace(0, 1, 200)
+
+        fold_results = []
+        fold_curves = []     # lightweight: only epoch-level scalars per fold
+        all_accs = []
+        all_kappas = []
+        all_mious = []
+        all_train_accs = []
+        total_time = 0.0
+
+        # Incremental accumulators for mean/std of confusion matrix, precision, recall, F1, ROC curves
+        sum_cm_norm = np.zeros((num_classes, num_classes), dtype=np.float64)
+        sum_cm_norm_sq = np.zeros((num_classes, num_classes), dtype=np.float64)
+        fold_precisions = []   # list of (num_classes,) arrays
+        fold_recalls = []
+        fold_f1s = []
+        roc_tprs = [[] for _ in range(num_classes)]  # interpolated TPR per class
+        roc_aucs = [[] for _ in range(num_classes)]
+
+        for fold_idx, (f_train_loader, f_test_loader) in enumerate(fold_loaders):
+            print("\n")
+            tprint(f"Performing Fold {fold_idx + 1}/{n_folds}")
+            print("\n")
+
+            fold_name = f"{model_name}_fold{fold_idx + 1}"
+
+            # Per-fold config: redirect output into the CV directory
+            fold_config = copy.deepcopy(config)
+            fold_config.path.output = cv_output
+
+            # Create a fresh trainer with injected loaders (skips _load_data)
+            trainer = hsTrainer(
+                config=fold_config,
+                dataLoader=dataLoader,
+                epochs=epochs,
+                model=model,            # callable -> _create_model calls it
+                model_name=fold_name,
+                debug_mode=debug_mode,
+                num_gpus=num_gpus,
+                train_loader=f_train_loader,
+                test_loader=f_test_loader,
+            )
+
+            result = trainer.train(_cv_mode=True)
+
+            # Scalar metrics
+            fold_results.append(result)
+            all_accs.append(result['final_accuracy'])
+            all_kappas.append(result['final_kappa'])
+            if 'final_miou' in result:
+                all_mious.append(result['final_miou'])
+
+            best_idx = trainer.best_epoch
+            if best_idx < len(trainer.train_accs):
+                all_train_accs.append(trainer.train_accs[best_idx])
+            else:
+                all_train_accs.append(
+                    trainer.train_accs[-1] if trainer.train_accs else 0.0)
+
+            total_time += result['training_time']
+
+            # curve data
+            fold_curves.append({
+                'train_losses': list(trainer.train_losses),
+                'train_accs': list(trainer.train_accs),
+                'eval_losses': list(trainer.eval_losses),
+                'eval_accs': list(trainer.eval_accs),
+                'grad_norms': list(trainer.grad_norms),
+                'eval_interval': trainer.eval_interval,
+            })
+
+            # classification summaries
+            pred = trainer._final_pred
+            target = trainer._final_target
+
+            cm = _cm(target, pred, labels=range(num_classes))
+            cm_norm = cm.astype(np.float64) / (cm.sum(axis=1, keepdims=True) + 1e-8)
+            sum_cm_norm += cm_norm
+            sum_cm_norm_sq += cm_norm ** 2
+
+            p, r, f1, _ = precision_recall_fscore_support(
+                target, pred, labels=range(num_classes), zero_division=0)
+            fold_precisions.append(p)
+            fold_recalls.append(r)
+            fold_f1s.append(f1)
+
+            # release output label memory
+            if hasattr(trainer, '_last_probas') and trainer._last_probas is not None:
+                probas = trainer._last_probas
+                for cls_i in range(num_classes):
+                    y_bin = (target == cls_i).astype(int)
+                    if y_bin.sum() > 0:
+                        fpr_arr, tpr_arr, _ = roc_curve(y_bin, probas[:, cls_i])
+                        roc_tprs[cls_i].append(
+                            np.interp(common_fpr, fpr_arr, tpr_arr))
+                        roc_aucs[cls_i].append(auc(fpr_arr, tpr_arr))
+                del probas
+
+            del pred, target
+
+            # release trainer (model, EMA, optimizer, heavy arrays) memory
+            del trainer
+            gc.collect()
+            if torch.cuda.is_available():
+                tprint('cuda.empty_cache() performing...')
+                torch.cuda.empty_cache()
+                tprint('cuda.empty_cache() performed!')
+
+        accs = np.array(all_accs)
+        kappas = np.array(all_kappas)
+        train_accs_arr = np.array(all_train_accs)
+        overfit_gaps = np.maximum(train_accs_arr - accs, 0.0)
+
+        best_fold_idx = int(np.argmax(accs))
+
+        summary = {
+            # Compatible with single-train return dict
+            'best_epoch': int(np.mean([r['best_epoch'] for r in fold_results])),
+            'best_accuracy': float(np.max(accs)),
+            'final_accuracy': float(np.mean(accs)),
+            'final_kappa': float(np.mean(kappas)),
+            'training_time': total_time,
+            'model_path': fold_results[best_fold_idx].get('model_path', ''),
+            'output_dir': cv_output,
+            # Cross-validation specifics
+            'cv_folds': n_folds,
+            'cv_accuracy_mean': float(np.mean(accs)),
+            'cv_accuracy_std': float(np.std(accs)),
+            'cv_kappa_mean': float(np.mean(kappas)),
+            'cv_kappa_std': float(np.std(kappas)),
+            'cv_overfit_gap_mean': float(np.mean(overfit_gaps)),
+            'cv_train_acc_mean': float(np.mean(train_accs_arr)),
+            'cv_fold_accuracies': accs.tolist(),
+            'cv_fold_kappas': kappas.tolist(),
+        }
+
+        if all_mious:
+            mious = np.array(all_mious)
+            summary['final_miou'] = float(np.mean(mious))
+            summary['cv_miou_mean'] = float(np.mean(mious))
+            summary['cv_miou_std'] = float(np.std(mious))
+
+        # summary
+        print(f"\n")
+        print(f"  Cross-Validation Summary ({n_folds} folds): {model_name}")
+        print(f"  Accuracy: {np.mean(accs):.2f}% ± {np.std(accs):.2f}%")
+        print(f"  Kappa:    {np.mean(kappas):.2f}% ± {np.std(kappas):.2f}%")
+        if all_mious:
+            print(f"  mIoU:     {np.mean(all_mious):.2f}% ± {np.std(all_mious):.2f}%")
+        print(f"  Gap:      {np.mean(overfit_gaps):.2f}%")
+        for i, r in enumerate(fold_results):
+            miou_s = (f" mIoU:{r.get('final_miou', 0):.1f}%"
+                      if 'final_miou' in r else "")
+            print(f"    Fold {i+1}: Acc={r['final_accuracy']:.2f}% "
+                  f"Kappa={r['final_kappa']:.2f}%{miou_s} "
+                  f"({r['training_time']:.0f}s)")
+        print(f"  Total time: {total_time:.0f}s")
+        print(f"\n")
+
+        # save summary JSON
+        summary_path = os.path.join(cv_output, f'{model_name}_cv_summary.json')
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        tprint(f"  Cross validation summary saved to {summary_path}")
+
+        # generate all plots in parallel, fast
+        class_names = list(config.clsf.targets[:num_classes])
+        mious_arr = np.array(all_mious) if all_mious else None
+
+        # Derive mean/std confusion matrix from running sums
+        mean_cm = sum_cm_norm / n_folds
+        std_cm = np.sqrt(np.maximum(
+            sum_cm_norm_sq / n_folds - mean_cm ** 2, 0.0))
+
+        plot_tasks = [
+            (hsTrainer._plot_summary,
+             (accs, kappas, mious_arr, model_name, cv_output)),
+            (hsTrainer._plot_training_curves,
+             (fold_curves, model_name, cv_output)),
+            (hsTrainer._plot_confusion_matrix,
+             (mean_cm, std_cm, num_classes, class_names,
+              model_name, cv_output)),
+            (hsTrainer._plot_per_class_metrics,
+             (fold_precisions, fold_recalls, fold_f1s,
+              num_classes, class_names, model_name, cv_output)),
+            (hsTrainer._plot_roc_curves,
+             (roc_tprs, roc_aucs, common_fpr,
+              num_classes, class_names, model_name, cv_output)),
+            (hsTrainer._plot_grad_norms,
+             (fold_curves, model_name, cv_output)),
+        ]
+
+        t0 = time.perf_counter()
+        max_workers = min(len(plot_tasks), (os.cpu_count() or 4))
+        with ProcessPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(fn, *args): fn.__name__
+                       for fn, args in plot_tasks}
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as exc:
+                    print(f"  Warning: {futures[fut]} failed: {exc}")
+        tprint(f"  CV plots generated in {time.perf_counter() - t0:.1f}s "
+              f"({max_workers} workers)")
+
+        return summary
+
+    @staticmethod
+    def _plot_summary(accs, kappas, mious, model_name, output_dir):
+        """Bar chart of per-fold Accuracy and Kappa with mean±std lines."""
+        n = len(accs)
+        x = np.arange(n)
+
+        ncols = 3 if mious is not None else 2
+        fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 5))
+
+        # Accuracy
+        axes[0].bar(x, accs, color='#2196F3', alpha=0.85,
+                    edgecolor='k', linewidth=0.5)
+        axes[0].axhline(y=np.mean(accs), color='r', linestyle='--',
+                        label=f'Mean: {np.mean(accs):.2f}% ± {np.std(accs):.2f}%')
+        axes[0].set_xlabel('Fold')
+        axes[0].set_ylabel('Accuracy (%)')
+        axes[0].set_title(f'{model_name} — CV Accuracy')
+        axes[0].set_xticks(x)
+        axes[0].set_xticklabels([f'F{i+1}' for i in range(n)])
+        axes[0].legend(fontsize=9)
+        axes[0].grid(axis='y', alpha=0.3)
+
+        # Kappa
+        axes[1].bar(x, kappas, color='#4CAF50', alpha=0.85,
+                    edgecolor='k', linewidth=0.5)
+        axes[1].axhline(y=np.mean(kappas), color='r', linestyle='--',
+                        label=f'Mean: {np.mean(kappas):.2f}% ± {np.std(kappas):.2f}%')
+        axes[1].set_xlabel('Fold')
+        axes[1].set_ylabel('Kappa (%)')
+        axes[1].set_title(f'{model_name} — CV Kappa')
+        axes[1].set_xticks(x)
+        axes[1].set_xticklabels([f'F{i+1}' for i in range(n)])
+        axes[1].legend(fontsize=9)
+        axes[1].grid(axis='y', alpha=0.3)
+
+        # mIoU (optional)
+        if mious is not None:
+            axes[2].bar(x, mious, color='#FF5722', alpha=0.85,
+                        edgecolor='k', linewidth=0.5)
+            axes[2].axhline(y=np.mean(mious), color='r', linestyle='--',
+                            label=f'Mean: {np.mean(mious):.2f}% ± {np.std(mious):.2f}%')
+            axes[2].set_xlabel('Fold')
+            axes[2].set_ylabel('mIoU (%)')
+            axes[2].set_title(f'{model_name} — CV mIoU')
+            axes[2].set_xticks(x)
+            axes[2].set_xticklabels([f'F{i+1}' for i in range(n)])
+            axes[2].legend(fontsize=9)
+            axes[2].grid(axis='y', alpha=0.3)
+
+        plt.tight_layout()
+        path = os.path.join(output_dir, f'{model_name}_cv_metrics.png')
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close()
+        tprint(f"  CV metrics plot saved to {path}")
+
+    # Aggregated CV Visualizations (mean ± bounds)
+    @staticmethod
+    def _plot_training_curves(fold_curves, model_name, output_dir):
+        """Training loss/accuracy averaged across CV folds with min-max shading.
+
+        Handles folds of different lengths (due to early stopping) by
+        padding shorter sequences with NaN and using ``np.nanmean``, etc.
+        """
+        max_epochs = max(len(fd['train_losses']) for fd in fold_curves)
+
+        def _pad(lists, length):
+            out = np.full((len(lists), length), np.nan)
+            for i, lst in enumerate(lists):
+                out[i, :len(lst)] = lst
+            return out
+
+        train_losses = _pad([fd['train_losses'] for fd in fold_curves], max_epochs)
+        train_accs = _pad([fd['train_accs'] for fd in fold_curves], max_epochs)
+        max_eval_pts = max(len(fd['eval_losses']) for fd in fold_curves)
+        eval_losses = _pad([fd['eval_losses'] for fd in fold_curves], max_eval_pts)
+        eval_accs = _pad([fd['eval_accs'] for fd in fold_curves], max_eval_pts)
+
+        epochs = np.arange(max_epochs)
+        eval_interval = fold_curves[0].get('eval_interval', 4)
+        eval_epochs = [e for e in range(max_epochs)
+                       if (e + 1) % eval_interval == 0 or e + 1 == max_epochs]
+        eval_epochs = eval_epochs[:max_eval_pts]
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+        # loss
+        mean_tl = np.nanmean(train_losses, axis=0)
+        axes[0].plot(epochs, mean_tl, color='#2196F3', lw=2, label='Train (mean)')
+        axes[0].fill_between(epochs, np.nanmin(train_losses, 0),
+                             np.nanmax(train_losses, 0),
+                             color='#2196F3', alpha=0.15, label='Train (min–max)')
+        if eval_epochs:
+            mean_el = np.nanmean(eval_losses, axis=0)[:len(eval_epochs)]
+            axes[0].plot(eval_epochs, mean_el, color='#FF5722', lw=2,
+                         label='Test (mean)')
+            axes[0].fill_between(eval_epochs,
+                                 np.nanmin(eval_losses, 0)[:len(eval_epochs)],
+                                 np.nanmax(eval_losses, 0)[:len(eval_epochs)],
+                                 color='#FF5722', alpha=0.15,
+                                 label='Test (min-max)')
+        axes[0].set_xlabel('Epoch')
+        axes[0].set_ylabel('Loss')
+        axes[0].set_title(f'{model_name} — CV Loss (mean ± range)')
+        axes[0].legend(fontsize=8)
+        axes[0].grid(True, alpha=0.3)
+
+        # acc
+        mean_ta = np.nanmean(train_accs, axis=0)
+        axes[1].plot(epochs, mean_ta, color='#2196F3', lw=2, label='Train (mean)')
+        axes[1].fill_between(epochs, np.nanmin(train_accs, 0),
+                             np.nanmax(train_accs, 0),
+                             color='#2196F3', alpha=0.15, label='Train (min-max)')
+        if eval_epochs:
+            mean_ea = np.nanmean(eval_accs, axis=0)[:len(eval_epochs)]
+            axes[1].plot(eval_epochs, mean_ea, color='#FF5722', lw=2,
+                         label='Test (mean)')
+            axes[1].fill_between(eval_epochs,
+                                 np.nanmin(eval_accs, 0)[:len(eval_epochs)],
+                                 np.nanmax(eval_accs, 0)[:len(eval_epochs)],
+                                 color='#FF5722', alpha=0.15,
+                                 label='Test (min-max)')
+        axes[1].set_xlabel('Epoch')
+        axes[1].set_ylabel('Accuracy (%)')
+        axes[1].set_title(f'{model_name} — CV Accuracy (mean ± range)')
+        axes[1].legend(fontsize=8)
+        axes[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        path = os.path.join(output_dir, f'{model_name}_cv_training_curves.png')
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close()
+        tprint(f"  CV training curves saved to {path}")
+
+    @staticmethod
+    def _plot_confusion_matrix(mean_cm, std_cm, num_classes, class_names,
+                                  model_name, output_dir):
+        """Plot averaged normalized confusion matrix from pre-computed mean/std."""
+        annot = np.empty_like(mean_cm, dtype=object)
+        for i in range(num_classes):
+            for j in range(num_classes):
+                annot[i, j] = f'{mean_cm[i, j]:.1%}\n±{std_cm[i, j]:.1%}'
+
+        fig, ax = plt.subplots(figsize=(8, 7))
+        sns.heatmap(mean_cm, annot=annot, fmt='', cmap='Greens', ax=ax,
+                    xticklabels=class_names, yticklabels=class_names,
+                    vmin=0, vmax=1)
+        ax.set_ylabel('True')
+        ax.set_xlabel('Predicted')
+        ax.set_title(f'{model_name} — CV Confusion Matrix (mean ± std)',
+                     fontsize=13, fontweight='bold')
+        plt.tight_layout()
+        path = os.path.join(output_dir,
+                            f'{model_name}_cv_confusion_matrix.png')
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close()
+        tprint(f"  CV confusion matrix saved to {path}")
+
+    @staticmethod
+    def _plot_per_class_metrics(fold_precisions, fold_recalls, fold_f1s,
+                                   num_classes, class_names, model_name,
+                                   output_dir):
+        """Per-class P/R/F1 from pre-computed per-fold arrays with min-max error bars."""
+        all_p = np.array(fold_precisions)   # (K, num_classes)
+        all_r = np.array(fold_recalls)
+        all_f1 = np.array(fold_f1s)
+        mean_p, mean_r, mean_f1 = all_p.mean(0), all_r.mean(0), all_f1.mean(0)
+
+        x = np.arange(num_classes)
+        w = 0.25
+        fig, ax = plt.subplots(figsize=(12, 5))
+        ax.bar(x - w, mean_p, w, label='Precision', color='#2196F3', alpha=0.85,
+               yerr=[mean_p - all_p.min(0), all_p.max(0) - mean_p],
+               capsize=3, error_kw={'linewidth': 1})
+        ax.bar(x, mean_r, w, label='Recall', color='#FF5722', alpha=0.85,
+               yerr=[mean_r - all_r.min(0), all_r.max(0) - mean_r],
+               capsize=3, error_kw={'linewidth': 1})
+        ax.bar(x + w, mean_f1, w, label='F1-Score', color='#4CAF50', alpha=0.85,
+               yerr=[mean_f1 - all_f1.min(0), all_f1.max(0) - mean_f1],
+               capsize=3, error_kw={'linewidth': 1})
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(class_names, rotation=45, ha='right', fontsize=9)
+        ax.set_ylim(0, 1.15)
+        ax.set_ylabel('Score')
+        ax.set_title(f'{model_name} — CV Per-Class Metrics '
+                     f'(mean, error bars = range)',
+                     fontsize=12, fontweight='bold')
+        ax.legend()
+        ax.grid(axis='y', alpha=0.3)
+        plt.tight_layout()
+        path = os.path.join(output_dir,
+                            f'{model_name}_cv_per_class_metrics.png')
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close()
+        tprint(f"  CV per-class metrics saved to {path}")
+
+    @staticmethod
+    def _plot_roc_curves(roc_tprs, roc_aucs, common_fpr,
+                            num_classes, class_names, model_name, output_dir):
+        """Per-class ROC from pre-interpolated TPR arrays with min-max bands."""
+        has_any = any(len(tprs) > 0 for tprs in roc_tprs)
+        if not has_any:
+            return
+
+        colors = plt.cm.tab10(np.linspace(0, 1, num_classes))
+        fig, ax = plt.subplots(figsize=(8, 7))
+
+        for cls_i in range(num_classes):
+            if not roc_tprs[cls_i]:
+                continue
+            tprs = np.array(roc_tprs[cls_i])
+            mean_auc_val = np.mean(roc_aucs[cls_i])
+            ax.plot(common_fpr, tprs.mean(0), color=colors[cls_i], lw=1.5,
+                    label=f'{class_names[cls_i]} '
+                          f'(AUC={mean_auc_val:.3f}±{np.std(roc_aucs[cls_i]):.3f})')
+            ax.fill_between(common_fpr, tprs.min(0), tprs.max(0),
+                            color=colors[cls_i], alpha=0.1)
+
+        ax.plot([0, 1], [0, 1], 'k--', alpha=0.4)
+        ax.set_xlabel('False Positive Rate')
+        ax.set_ylabel('True Positive Rate')
+        ax.set_title(f'{model_name} — CV ROC Curves (mean ± range)',
+                     fontsize=13, fontweight='bold')
+        ax.legend(fontsize=7, loc='lower right')
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        path = os.path.join(output_dir, f'{model_name}_cv_roc_curves.png')
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close()
+        tprint(f"  CV ROC curves saved to {path}")
+
+    @staticmethod
+    def _plot_grad_norms(fold_curves, model_name, output_dir):
+        """Gradient L2 norms averaged across CV folds with min-max band."""
+        max_len = max(len(fd['grad_norms']) for fd in fold_curves)
+        padded = np.full((len(fold_curves), max_len), np.nan)
+        for i, fd in enumerate(fold_curves):
+            padded[i, :len(fd['grad_norms'])] = fd['grad_norms']
+
+        epochs = np.arange(max_len)
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(epochs, np.nanmean(padded, 0), color='#FF5722', lw=2,
+                label='Mean')
+        ax.fill_between(epochs, np.nanmin(padded, 0), np.nanmax(padded, 0),
+                        color='#FF5722', alpha=0.15, label='Min-Max')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Gradient L2 Norm')
+        ax.set_title(f'{model_name} — CV Gradient Norm (mean ± range)',
+                     fontsize=13, fontweight='bold')
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        path = os.path.join(output_dir,
+                            f'{model_name}_cv_gradient_norm.png')
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close()
+        tprint(f"  CV gradient norm saved to {path}")
+
+    def _save_all_plots(self, final_target, final_pred):
+        """Generate all single-model plots in parallel using ProcessPoolExecutor.
+
+        Each plot is dispatched to a separate process so that 7 matplotlib
+        renders happen concurrently instead of sequentially.
+        """
+        num_classes = self.config.clsf.num
+        class_names = list(self.config.clsf.targets[:num_classes])
+        probas = getattr(self, '_last_probas', None)
+
+        tasks = [
+            (_worker_plot_training_curves,
+             (list(self.train_losses), list(self.eval_losses),
+              list(self.train_accs), list(self.eval_accs),
+              self.eval_interval, self.debug_mode,
+              self.best_acc, self.model_name, self.output)),
+            (_worker_plot_confusion_matrix,
+             (final_target, final_pred, num_classes, class_names,
+              self.model_name, self.output)),
+            (_worker_plot_per_class_metrics,
+             (final_target, final_pred, num_classes, class_names,
+              self.model_name, self.output)),
+            (_worker_plot_roc_curves,
+             (final_target, probas, num_classes, class_names,
+              self.model_name, self.output)),
+            (_worker_plot_grad_norm,
+             (list(self.grad_norms), self.model_name, self.output)),
+            (_worker_plot_lr,
+             (list(self.lr_history), self.model_name, self.output)),
+            (_worker_plot_epoch_time,
+             (list(self.epoch_times), self.model_name, self.output)),
+        ]
+
+        t0 = time.perf_counter()
+        max_workers = min(len(tasks), (os.cpu_count() or 4))
+        with ProcessPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(fn, *args): fn.__name__
+                       for fn, args in tasks}
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as exc:
+                    print(f"  Warning: {futures[fut]} failed: {exc}")
+        tprint(f"  All plots generated in {time.perf_counter() - t0:.1f}s "
+              f"({max_workers} workers)")
+
     def _generate_cam(self, epoch: int) -> None:
         """
         Generate full-image Grad-CAM heatmap overlays.
@@ -646,7 +1399,7 @@ class hsTrainer:
                 preds = torch.argmax(outputs, dim=1)
             
             for i in range(num_samples):
-                # --- Build pseudo-RGB visualization ---
+                # pseudo-RGB visualization
                 sample = hsi[i].cpu().numpy()
                 if sample.ndim == 4:
                     sample = sample[0]
@@ -657,9 +1410,9 @@ class hsTrainer:
                 else:
                     rgb = np.repeat(sample_norm[0:1].transpose(1, 2, 0), 3, axis=2)
                 
-                # --- Compute Grad-CAM for the predicted class (full spatial map) ---
+                # Grad-CAM for the predicted class (full spatial map)
                 pred_class = preds[i]
-                # Use the most frequent predicted class across the patch
+                # use the most frequent predicted class across the patch
                 if pred_class.dim() > 0:
                     pred_cls_idx = int(torch.mode(pred_class.flatten()).values.item())
                 else:
@@ -669,17 +1422,16 @@ class hsTrainer:
                     hsi[i:i+1], class_idx=pred_cls_idx
                 )  # (H, W), values in [0, 1]
                 
-                # Resize CAM to match spatial dims if necessary
+                # resize CAM to match spatial dims
                 h_img, w_img = rgb.shape[0], rgb.shape[1]
                 if cam.shape[0] != h_img or cam.shape[1] != w_img:
                     cam = cv2.resize(cam, (w_img, h_img))
                 
-                # --- Create heatmap overlay ---
+                # heatmap overlay
                 heatmap_color = plt.cm.jet(cam)[..., :3]  # (H, W, 3) float
                 overlay = 0.5 * rgb + 0.5 * heatmap_color
                 overlay = np.clip(overlay, 0, 1)
                 
-                # --- Plot ---
                 axes[i, 0].imshow(rgb)
                 axes[i, 0].axis('off')
                 
@@ -689,151 +1441,20 @@ class hsTrainer:
                 axes[i, 2].imshow(overlay)
                 axes[i, 2].axis('off')
             
-            # Column titles on top row only
+            # column titles on top row only
             for j, title in enumerate(col_titles):
                 axes[0, j].set_title(title, fontsize=11)
             
             plt.suptitle(f'Epoch {epoch+1} - Grad-CAM', fontsize=14, fontweight='bold')
             plt.tight_layout()
             
-            cam_path = os.path.join(self.output, 'CAM', f'epoch_{epoch+1:03d}.png')
+            cam_path = os.path.join(self.output, 'Grad-CAM', f'epoch_{epoch+1:03d}.png')
             plt.savefig(cam_path, dpi=150, bbox_inches='tight')
             plt.close()
             
         except Exception as e:
-            print(f"Error during generating CAM: {e}")
+            tprint(f"Error during generating CAM: {e}")
             traceback.print_exc()
-    
-    def _plot_training_curves(self) -> None:
-        """Plot training loss and accuracy curves."""
-        fig, axes = plt.subplots(1, 2, figsize=(14, 4))
-        
-        # Build actual eval epoch indices to avoid x-axis mismatch
-        # (debug_mode evaluates every epoch regardless of eval_interval)
-        eval_epochs = []
-        total_epochs = len(self.train_losses)
-        for e in range(total_epochs):
-            should_eval = ((e + 1) % self.eval_interval == 0) or (e + 1 == total_epochs)
-            if should_eval or self.debug_mode:
-                eval_epochs.append(e)
-        # Trim to match actual eval_losses length (handles early stopping)
-        eval_epochs = eval_epochs[:len(self.eval_losses)]
-        
-        # loss curve
-        axes[0].plot(self.train_losses, label='Train Loss', marker='o', markersize=4)
-        if self.eval_losses:
-            axes[0].plot(eval_epochs,
-                        self.eval_losses, label='Test Loss', marker='s', markersize=4)
-        axes[0].set_xlabel('Epoch')
-        axes[0].set_ylabel('Loss')
-        axes[0].set_title('Training Loss Curve')
-        axes[0].legend()
-        axes[0].grid(True, alpha=0.3)
-        
-        # acc curve
-        axes[1].plot(self.train_accs, label='Train Acc', marker='o', markersize=4)
-        if self.eval_accs:
-            axes[1].plot(eval_epochs,
-                        self.eval_accs, label='Test Acc', marker='s', markersize=4)
-        axes[1].axhline(y=self.best_acc, color='r', linestyle='--', label=f'Best: {self.best_acc:.2f}%')
-        axes[1].set_xlabel('Epoch')
-        axes[1].set_ylabel('Accuracy (%)')
-        axes[1].set_title('Training Accuracy Curve')
-        axes[1].legend()
-        axes[1].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        path = os.path.join(self.output, 'training_curve.png')
-        plt.savefig(path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"  Curve saved to {path}")
-
-    def _plot_confusion_matrix(self, y_true: np.ndarray, y_pred: np.ndarray) -> None:
-        """Confusion matrix per class"""
-        if not hasattr(self.config.clsf, 'targets'):
-            return
-        
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            y_true, y_pred, labels=range(self.config.clsf.num), zero_division=0
-        )
-        
-        print("\n[Classification Metrics]")
-        for i in range(self.config.clsf.num):
-            name = self.config.clsf.targets[i] if i < len(self.config.clsf.targets) else f"Class_{i}"
-            print(f"  {i:1d}. {name:10s} | P:{precision[i]:.4f} | R:{recall[i]:.4f} | F1:{f1[i]:.4f}")
-        
-        # Plot enhanced confusion matrix
-        cm = confusion_matrix(y_true, y_pred)
-        cm_norm = cm.astype('float') / (cm.sum(axis=1, keepdims=True) + 1e-8)
-
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-        # Count
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[0])
-        axes[0].set_title('Confusion Matrix (Count)')
-        axes[0].set_ylabel('True')
-        axes[0].set_xlabel('Predicted')
-        
-        # Normalized
-        sns.heatmap(cm_norm, annot=True, fmt='.1%', cmap='Greens', ax=axes[1])
-        axes[1].set_title('Confusion Matrix (Normalized)')
-        axes[1].set_ylabel('True')
-        axes[1].set_xlabel('Predicted')
-
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.output, 'confusion_matrix.png'), dpi=150, bbox_inches='tight')
-        plt.close()
-
-    def _visualize_layer_activations(self) -> None:
-        """Visualize layer activation statistics for debugging"""
-        self.model.eval()
-        try:
-            sample, _ = self.test_loader.dataset[0]
-            sample = sample.unsqueeze(0).to(self.device)
-            
-            activation_stats = {}
-            hooks = []
-            
-            def hook_fn(name):
-                def hook(module, input, output):
-                    if isinstance(output, torch.Tensor):
-                        activation_stats[name] = {
-                            'mean': output.mean().item(),
-                            'std': output.std().item(),
-                        }
-                return hook
-            
-            # Register hooks for Conv and Linear layers
-            for name, module in self.model.named_modules():
-                if isinstance(module, (nn.Linear, nn.Conv2d)):
-                    hooks.append(module.register_forward_hook(hook_fn(name)))
-            
-            with torch.no_grad():
-                _ = self.model(sample)
-            
-            # Clean up hooks
-            for h in hooks:
-                h.remove()
-            
-            # Visualize if we have data
-            if len(activation_stats) > 0:
-                layers = list(activation_stats.keys())[:15]
-                means = [activation_stats[l]['mean'] for l in layers]
-                stds = [activation_stats[l]['std'] for l in layers]
-                
-                fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-                axes[0].bar(range(len(means)), means, alpha=0.7, color='steelblue')
-                axes[0].set_title('Mean Activation by Layer')
-                axes[0].set_xlabel('Layer Index')
-                axes[1].bar(range(len(stds)), stds, alpha=0.7, color='coral')
-                axes[1].set_title('Std Activation by Layer')
-                axes[1].set_xlabel('Layer Index')
-                plt.tight_layout()
-                save_path = os.path.join(self.output, 'layer_activations.png')
-                plt.savefig(save_path, dpi=150, bbox_inches='tight')
-                plt.close()
-        except Exception as e:
-            print(f"  Layer visualization skipped: {e}")
     
     def _unpack_batch(self, batch_data) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -853,14 +1474,6 @@ class hsTrainer:
             raise TypeError(f"batch must be list or tuple, got: {type(batch_data)}")
         
         return hsi, labels
-    
-    def _normalize(self, hsi: torch.Tensor) -> torch.Tensor:
-        """Normalize with shape:
-            [B, C, H, W] -> [B, C, H, W]
-        """
-        mean = hsi.mean(dim=(2, 3), keepdim=True)
-        std = hsi.std(dim=(2, 3), keepdim=True)
-        return (hsi - mean) / (std + 1e-8)
     
     def _compute_miou(self, y_true: np.ndarray, y_pred: np.ndarray,
                       num_classes: int) -> float:
@@ -891,7 +1504,7 @@ class hsTrainer:
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         
         torch.save(state_dict, model_path)
-        print(f"  Model saved to: {model_path}")
+        tprint(f"  Model saved to: {model_path}")
     
     def load_best_model(self) -> Module:
         model_path = os.path.join(self.output, 'models', f'{self.model_name}_best.pth')
@@ -909,7 +1522,7 @@ class hsTrainer:
                     state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
             
             self.model.load_state_dict(state_dict)
-            print(f"  Loaded best model from: {model_path}")
+            tprint(f"  Loaded best model from: {model_path}")
         else:
             print(f"  Warning: Model file not found: {model_path}")
         
@@ -932,36 +1545,11 @@ class hsTrainer:
                 hsi = hsi.permute(0, 3, 1, 2)
             
             hsi = hsi.to(self.device)
-            hsi = self._normalize(hsi)
             
             outputs = self.model(hsi)
             predictions = torch.argmax(outputs, dim=1)
         
         return predictions
-    
-    def _validate_data_quality(self) -> None:
-        """Validate dataset quality: distribution, ranges, duplicates"""
-        print("\n[Data Quality Check]")
-        labels = self.dataLoader.patch_labels[1:]
-        
-        # Class distribution
-        unique_labels, counts = np.unique(labels, return_counts=True)
-        print(f"  Label distribution:")
-        for lbl, cnt in zip(unique_labels, counts):
-            pct = cnt / len(labels) * 100
-            print(f"    Class {lbl}: {cnt:6d} ({pct:5.1f}%)")
-        
-        # Imbalance ratio
-        imbalance = counts.max() / counts.min()
-        if imbalance > 10:
-            print(f"   Class imbalance ratio: {imbalance:.1f}x")
-        
-        # Data range check
-        sample_patch = self.dataLoader._get_patch(0)
-        data_min, data_max = sample_patch.min(), sample_patch.max()
-        print(f"  Data range: [{data_min:.4f}, {data_max:.4f}]")
-        if data_max > 1.5 or data_min < -0.5:
-            print(f"   Unexpected data range - check normalization")
     
     def _compute_gradcam(self, x: torch.Tensor, class_idx: int) -> np.ndarray:
         """Compute Grad-CAM heatmap for model interpretability.
@@ -1023,126 +1611,6 @@ class hsTrainer:
         
         return cam
 
-    def _plot_per_class_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> None:
-        """Bar chart of per-class Precision / Recall / F1."""
-        if not hasattr(self.config.clsf, 'targets'):
-            return
-        # remove BG (class 0) — evaluate classes 1..num-1 only
-        num_classes = self.config.clsf.num
-        non_bg_labels = list(range(1, num_classes))
-        names = self.config.clsf.targets[1:]
-
-        p, r, f1, sup = precision_recall_fscore_support(
-            y_true, y_pred, labels=non_bg_labels, zero_division=0)
-
-        x = np.arange(len(non_bg_labels))
-        width = 0.25
-
-        fig, ax = plt.subplots(figsize=(12, 5))
-        ax.bar(x - width, p, width, label='Precision', color='#2196F3', alpha=0.85)
-        ax.bar(x, r, width, label='Recall', color='#FF5722', alpha=0.85)
-        ax.bar(x + width, f1, width, label='F1-Score', color='#4CAF50', alpha=0.85)
-
-        ax.set_xticks(x)
-        ax.set_xticklabels(names, rotation=45, ha='right', fontsize=9)
-        ax.set_ylim(0, 1.1)
-        ax.set_ylabel('Score')
-        ax.set_title(f'{self.model_name} — Per-Class Metrics', fontsize=13, fontweight='bold')
-        ax.legend()
-        ax.grid(axis='y', alpha=0.3)
-
-        plt.tight_layout()
-        path = os.path.join(self.output, 'per_class_metrics.png')
-        plt.savefig(path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"  Per-class metrics saved to {path}")
-
-    def _plot_roc_curves(self, y_true: np.ndarray) -> None:
-        """Per-class ROC curves with AUC for the current model."""
-        if not hasattr(self, '_last_probas') or self._last_probas is None:
-            return
-        # remove BG (class 0) — plot classes 1..num-1 only
-        num_classes = self.config.clsf.num
-        non_bg_labels = list(range(1, num_classes))
-        names = self.config.clsf.targets[1:]
-        proba = self._last_probas
-
-        n_non_bg = len(non_bg_labels)
-        y_onehot = np.zeros((len(y_true), n_non_bg))
-        for i, t in enumerate(y_true):
-            mapped = t - 1  # class 1 -> index 0, class 2 -> index 1, ...
-            if 0 <= mapped < n_non_bg:
-                y_onehot[i, mapped] = 1
-
-        fig, ax = plt.subplots(figsize=(8, 7))
-        for cls_i in range(n_non_bg):
-            fpr, tpr, _ = roc_curve(y_onehot[:, cls_i], proba[:, non_bg_labels[cls_i]])
-            roc_auc = auc(fpr, tpr)
-            ax.plot(fpr, tpr, label=f'{names[cls_i]} (AUC={roc_auc:.3f})', linewidth=1.3)
-
-        ax.plot([0, 1], [0, 1], 'k--', alpha=0.4)
-        ax.set_xlabel('False Positive Rate')
-        ax.set_ylabel('True Positive Rate')
-        ax.set_title(f'{self.model_name} — Per-Class ROC Curves', fontsize=13, fontweight='bold')
-        ax.legend(fontsize=8, loc='lower right')
-        ax.grid(True, alpha=0.3)
-
-        plt.tight_layout()
-        path = os.path.join(self.output, 'roc_curves.png')
-        plt.savefig(path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"  ROC curves saved to {path}")
-
-    def _plot_grad_norm_curve(self) -> None:
-        """Gradient L2 norm across training epochs."""
-        if not self.grad_norms:
-            return
-        fig, ax = plt.subplots(figsize=(10, 4))
-        ax.plot(self.grad_norms, marker='o', markersize=3, linewidth=1.5, color='#FF5722')
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Gradient L2 Norm')
-        ax.set_title(f'{self.model_name} — Gradient Norm', fontsize=13, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-        path = os.path.join(self.output, 'gradient_norm.png')
-        plt.savefig(path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"  Gradient norm curve saved to {path}")
-
-    def _plot_lr_curve(self) -> None:
-        """Learning rate schedule over training epochs."""
-        if not self.lr_history:
-            return
-        fig, ax = plt.subplots(figsize=(10, 4))
-        ax.plot(self.lr_history, linewidth=1.5, color='#2196F3')
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Learning Rate')
-        ax.set_yscale('log')
-        ax.set_title(f'{self.model_name} — Learning Rate Schedule', fontsize=13, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-        path = os.path.join(self.output, 'lr_schedule.png')
-        plt.savefig(path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"  LR schedule saved to {path}")
-
-    def _plot_epoch_time_curve(self) -> None:
-        """Wall-clock time per epoch."""
-        if not self.epoch_times:
-            return
-        fig, ax = plt.subplots(figsize=(10, 4))
-        ax.bar(range(len(self.epoch_times)), self.epoch_times,
-               color='#4CAF50', alpha=0.8)
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Time (s)')
-        ax.set_title(f'{self.model_name} — Per-Epoch Wall-Clock Time', fontsize=13, fontweight='bold')
-        ax.grid(axis='y', alpha=0.3)
-        plt.tight_layout()
-        path = os.path.join(self.output, 'epoch_times.png')
-        plt.savefig(path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"  Epoch time chart saved to {path}")
-
     def _measure_inference_time(self, num_batches: int = 10) -> float:
         """
         Measure average inference latency in ms per batch.
@@ -1160,7 +1628,6 @@ class hsTrainer:
                 hsi = hsi.to(self.device, non_blocking=True)
                 if hsi.dim() == 4 and hsi.shape[-1] <= 16:
                     hsi = hsi.permute(0, 3, 1, 2)
-                hsi = self._normalize(hsi)
 
                 if self.device.type == 'cuda':
                     torch.cuda.synchronize()

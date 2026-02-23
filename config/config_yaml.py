@@ -30,7 +30,9 @@ def check_form(config: Munch = None) -> bool:
     if config.split.patch_size % 2 == 0:
         raise ValueError(f"patch_size must be odd, got {config.split.patch_size}")
     if config.clsf.num != len(config.clsf.targets):
-        raise ValueError(f"num must match the length of targets, got {config.clsf.num} and {len(config.clsf.targets)}")
+        raise ValueError(f"clsf.num must match length of targets, got {config.clsf.num} and {len(config.clsf.targets)}")
+    if config.clsf.num < 2:
+        raise ValueError(f"clsf.num must be >= 2, got {config.clsf.num}")
     return True
     # Add more checks as needed
 

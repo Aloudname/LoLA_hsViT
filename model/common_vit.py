@@ -161,7 +161,7 @@ class CommonViT(nn.Module):
     Same API and params with LoLA are remaining.
     """
     
-    def __init__(self, in_channels=15, num_classes=9, dim=96, depths=[3, 4, 5],
+    def __init__(self, in_channels=15, num_classes=8, dim=96, depths=[3, 4, 5],
                  num_heads=[4, 8, 16], window_size=[7, 7, 7], mlp_ratio=4.,
                  drop_path_rate=0.2, spatial_size=15, r=16, lora_alpha=32):
         """
@@ -169,7 +169,7 @@ class CommonViT(nn.Module):
         
         params:
             in_channels (int): 15 default.
-            num_classes (int): 9 default.
+            num_classes (int): 8 default.
             dim (int): dim of feature maps, 96 default.
             depths (list): num of transformer blocks, [3, 4, 5] default.
             num_heads (list): attention head for layers, [4, 8, 16] default.
@@ -434,14 +434,14 @@ class CommonViT(nn.Module):
 
 if __name__ == "__main__":
     model = CommonViT(
-        in_channels=15, num_classes=9, dim=96, depths=[3, 4, 5],
+        in_channels=15, num_classes=8, dim=96, depths=[3, 4, 5],
         num_heads=[4, 8, 16], window_size=[7, 7, 7], mlp_ratio=4.,
         drop_path_rate=0.2, spatial_size=15, r=16, lora_alpha=32
     )
     
     dummy_input = torch.randn(2, 15, 15, 15)  # [B, C, H, W]
     output = model(dummy_input)
-    print(f"  Output shape: {output.shape}")  # Expected: [2, 9, 15, 15]
+    print(f"  Output shape: {output.shape}")  # Expected: [2, 8, 15, 15]
     
     output_with_cam = model(dummy_input, return_cam=True)
     if isinstance(output_with_cam, tuple):

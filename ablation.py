@@ -13,10 +13,11 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources
 import numpy as np
 import matplotlib.pyplot as plt
 import os, gc, json, time, torch, argparse
+from datetime import datetime
 
 from config import load_config
 from model import LoLA_hsViT, CommonViT
-from pipeline import hsTrainer, NpyHSDataset
+from pipeline import hsTrainer, NpyHSDataset, tprint
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field, asdict
 
@@ -52,7 +53,7 @@ class AblationConfig:
         """Return a callable that constructs the model."""
         kwargs = dict(
             in_channels=15,   # from config.yaml: pca_components
-            num_classes=9,     # from config.yaml: clsf.num
+            num_classes=8,     # from config.yaml: clsf.num (8 tissue classes, BG excluded)
             dim=self.dim,
             depths=self.depths,
             num_heads=self.num_heads,
@@ -166,13 +167,15 @@ class AblationRunner:
     """Orchestrates the full ablation experiment."""
 
     def __init__(self, base_config, dataLoader, epochs: int, num_gpus: int,
-                 gap_threshold: float = 8.0, resume_idx: int = 0):
+                 gap_threshold: float = 8.0, resume_idx: int = 0,
+                 n_folds: int = 0):
         self.base_config = base_config
         self.dataLoader = dataLoader
         self.epochs = epochs
         self.num_gpus = num_gpus
         self.gap_threshold = gap_threshold
         self.resume_idx = resume_idx
+        self.n_folds = n_folds
 
         self.summary_dir = self.base_config.path.output
         os.makedirs(self.summary_dir, exist_ok=True)
@@ -186,55 +189,89 @@ class AblationRunner:
 
     def dry_run(self, configs: List[AblationConfig]) -> None:
         """Print parameter counts for all configs without training."""
-        print(f"  DRY RUN: Parameter Count Preview")
-        print(f"{'#':>3} {'Model':<12} {'Tag':<16} {'dim':>4} {'depths':<12} "
+        tprint(f"  DRY RUN: Parameter Count Preview")
+        tprint(f"{'#':>3} {'Model':<12} {'Tag':<16} {'dim':>4} {'depths':<12} "
               f"{'mlp':>4} {'r':>3} {'Total Params':>14} {'Trainable':>14}")
 
         for i, cfg in enumerate(configs):
             total, trainable = cfg.count_params()
             depths_str = str(cfg.depths)
             r_str = str(cfg.r) if cfg.model_type == "LoLA_hsViT" else "-"
-            print(f"{i:3d} {cfg.model_type:<12} {cfg.tag:<16} {cfg.dim:4d} "
+            tprint(f"{i:3d} {cfg.model_type:<12} {cfg.tag:<16} {cfg.dim:4d} "
                   f"{depths_str:<12} {cfg.mlp_ratio:4.1f} {r_str:>3} "
                   f"{total:>14,} {trainable:>14,}")
 
-        print(f"Total configs: {len(configs)}")
-        print(f"Estimated training time: ~{len(configs) * self.epochs * 2:.0f} min "
+        tprint(f"Total configs: {len(configs)}")
+        tprint(f"Estimated training time: ~{len(configs) * self.epochs * 2:.0f} min "
               f"(rough, depends on data & hardware)\n")
 
     def run_single(self, idx: int, cfg: AblationConfig) -> Optional[AblationResult]:
-        """Train one configuration and return the result."""
-        print(f"  ABLATION [{idx+1}] {cfg.model_type} / {cfg.tag}")
-        print(f"  dim={cfg.dim}, depths={cfg.depths}, mlp_ratio={cfg.mlp_ratio}", end="")
+        """Train one configuration and return the result.
+
+        When ``self.n_folds > 1``, this uses K-Fold cross-validation
+        via ``hsTrainer.cross_validate()`` instead of a single hold-out
+        train/test split.
+        """
+        tprint(f"  ABLATION [{idx+1}] {cfg.model_type} / {cfg.tag}")
+        tprint(f"  dim={cfg.dim}, depths={cfg.depths}, mlp_ratio={cfg.mlp_ratio}", end="")
         if cfg.model_type == "LoLA_hsViT":
-            print(f", r={cfg.r}, alpha={cfg.lora_alpha}", end="")
+            tprint(f", r={cfg.r}, alpha={cfg.lora_alpha}", end="")
+        if self.n_folds > 1:
+            tprint(f" [CV={self.n_folds}]", end="")
+        tprint()  # finish the line
 
         try:
-            trainer = hsTrainer(
-                config=self.base_config,
-                dataLoader=self.dataLoader,
-                epochs=self.epochs,
-                model=cfg.build_model_fn(),
-                model_name=cfg.run_name,
-                debug_mode=False,
-                num_gpus=self.num_gpus,
-            )
+            # Param counts (lightweight dry-run, no GPU needed)
+            total_params, trainable_params = cfg.count_params()
 
-            results = trainer.train()
+            if self.n_folds > 1:
+                # ── Cross-Validation mode ──
+                results = hsTrainer.cross_validate(
+                    config=self.base_config,
+                    dataLoader=self.dataLoader,
+                    n_folds=self.n_folds,
+                    epochs=self.epochs,
+                    model=cfg.build_model_fn(),
+                    model_name=cfg.run_name,
+                    num_gpus=self.num_gpus,
+                    debug_mode=False,
+                )
 
-            # Collect metrics
-            total_params = sum(p.numel() for p in trainer.model.parameters())
-            trainable_params = sum(
-                p.numel() for p in trainer.model.parameters() if p.requires_grad)
-
-            # Compute overfit gap at best epoch
-            best_epoch_idx = trainer.best_epoch
-            if best_epoch_idx < len(trainer.train_accs):
-                best_train_acc = trainer.train_accs[best_epoch_idx]
+                best_eval_acc = results['cv_accuracy_mean']
+                best_train_acc = results.get('cv_train_acc_mean', best_eval_acc)
+                overfit_gap = results.get('cv_overfit_gap_mean', 0.0)
+                best_epoch = results.get('best_epoch', 0)
+                output_dir = results.get('output_dir', '')
             else:
-                best_train_acc = trainer.train_accs[-1] if trainer.train_accs else 0.0
-            best_eval_acc = trainer.best_acc
-            overfit_gap = max(0.0, best_train_acc - best_eval_acc)
+                # ── Single hold-out mode (original behaviour) ──
+                trainer = hsTrainer(
+                    config=self.base_config,
+                    dataLoader=self.dataLoader,
+                    epochs=self.epochs,
+                    model=cfg.build_model_fn(),
+                    model_name=cfg.run_name,
+                    debug_mode=False,
+                    num_gpus=self.num_gpus,
+                )
+
+                results = trainer.train()
+
+                # Overwrite param counts from actual model (includes DP wrapper)
+                total_params = sum(p.numel() for p in trainer.model.parameters())
+                trainable_params = sum(
+                    p.numel() for p in trainer.model.parameters()
+                    if p.requires_grad)
+
+                best_epoch_idx = trainer.best_epoch
+                if best_epoch_idx < len(trainer.train_accs):
+                    best_train_acc = trainer.train_accs[best_epoch_idx]
+                else:
+                    best_train_acc = (
+                        trainer.train_accs[-1] if trainer.train_accs else 0.0)
+                best_eval_acc = trainer.best_acc
+                overfit_gap = max(0.0, best_train_acc - best_eval_acc)
+                best_epoch = trainer.best_epoch + 1
+                output_dir = trainer.output
 
             balance = compute_balance_score(
                 best_eval_acc, overfit_gap, total_params, self.gap_threshold)
@@ -245,7 +282,7 @@ class AblationRunner:
                 short_label=cfg.short_label,
                 total_params=total_params,
                 trainable_params=trainable_params,
-                best_epoch=trainer.best_epoch + 1,
+                best_epoch=best_epoch,
                 best_train_acc=best_train_acc,
                 best_eval_acc=best_eval_acc,
                 final_eval_acc=results.get('final_accuracy', 0.0),
@@ -253,19 +290,20 @@ class AblationRunner:
                 overfit_gap=overfit_gap,
                 training_time=results.get('training_time', 0.0),
                 balance_score=balance,
-                output_dir=trainer.output,
+                output_dir=output_dir,
             )
 
             self.results.append(result)
             self._save_results()
 
             # Print summary
-            print(f"\n Result: Acc={best_eval_acc:.2f}%, "
+            cv_tag = f" (CV {self.n_folds}-fold mean)" if self.n_folds > 1 else ""
+            tprint(f"\n Result{cv_tag}: Acc={best_eval_acc:.2f}%, "
                   f"Gap={overfit_gap:.1f}%, Params={total_params:,}, "
                   f"Balance={balance:.2f}")
 
         except Exception as e:
-            print(f"\n FAILED: {e}")
+            tprint(f"\n FAILED: {e}")
             import traceback
             traceback.print_exc()
             result = None
@@ -283,24 +321,24 @@ class AblationRunner:
     def run_all(self, configs: List[AblationConfig]) -> None:
         """Execute the full ablation schedule."""
         total = len(configs)
-        print("\n")
-        print(f"  Starting Ablation: {total} experiments, {self.epochs} epochs each")
-        print(f"  Gap threshold: {self.gap_threshold}%")
-        print("\n")
+        tprint("\n")
+        tprint(f"  Starting Ablation: {total} experiments, {self.epochs} epochs each")
+        tprint(f"  Gap threshold: {self.gap_threshold}%")
+        tprint("\n")
 
         tic = time.perf_counter()
 
         # run in sequence.
         for i, cfg in enumerate(configs):
             if i < self.resume_idx:
-                print(f"  [Skipping {i+1}/{total}] {cfg.run_name} (resume)")
+                tprint(f"  [Skipping {i+1}/{total}] {cfg.run_name} (resume)")
                 continue
             self.run_single(i, cfg)
 
         elapsed = time.perf_counter() - tic
-        print(f"\n")
-        print(f"  Ablation Complete: {len(self.results)} runs in {elapsed:.1f}s")
-        print(f"\n")
+        tprint(f"\n")
+        tprint(f"  Ablation Complete: {len(self.results)} runs in {elapsed:.1f}s")
+        tprint(f"\n")
 
     def run_tag(self, tag: str, all_configs: List[AblationConfig]) -> None:
         """
@@ -316,25 +354,25 @@ class AblationRunner:
         matched = [c for c in all_configs if c.tag == tag]
         if not matched:
             available_tags = sorted(set(c.tag for c in all_configs))
-            print(f"  ERROR: No config found with tag '{tag}'.")
-            print(f"  Available tags: {available_tags}")
+            tprint(f"  ERROR: No config found with tag '{tag}'.")
+            tprint(f"  Available tags: {available_tags}")
             return
 
         model_types_found = [c.model_type for c in matched]
-        print(f"\n")
-        print(f"  Tag Run: '{tag}' — {len(matched)} config(s) matched")
+        tprint(f"\n")
+        tprint(f"  Tag Run: '{tag}' — {len(matched)} config(s) matched")
         for c in matched:
-            print(f"    {c.model_type}/{c.tag}  dim={c.dim} depths={c.depths}")
-        print(f"\n")
+            tprint(f"    {c.model_type}/{c.tag}  dim={c.dim} depths={c.depths}")
+        tprint(f"\n")
 
         tic = time.perf_counter()
         for i, cfg in enumerate(matched):
             self.run_single(i, cfg)
         elapsed = time.perf_counter() - tic
 
-        print(f"\n")
-        print(f"  Tag Run Complete: {len(matched)} run(s) in {elapsed:.1f}s")
-        print(f"\n")
+        tprint(f"\n")
+        tprint(f"  Tag Run Complete: {len(matched)} run(s) in {elapsed:.1f}s")
+        tprint(f"\n")
 
     def analyze(self) -> Dict[str, Optional[AblationResult]]:
         """
@@ -347,7 +385,7 @@ class AblationRunner:
         Returns dict of {model_type: best AblationResult}.
         """
         if not self.results:
-            print("No results to analyze.")
+            tprint("No results to analyze.")
             return {}
 
         best_models = {}
@@ -362,11 +400,11 @@ class AblationRunner:
             best = type_results[0]
             best_models[model_type] = best
 
-            print(f"  Best {model_type}: [{best.config_tag}]")
-            print(f"    Acc: {best.best_eval_acc:.2f}%, "
+            tprint(f"  Best {model_type}: [{best.config_tag}]")
+            tprint(f"    Acc: {best.best_eval_acc:.2f}%, "
                   f"Gap: {best.overfit_gap:.1f}%, "
                   f"Params: {best.total_params:,}")
-            print(f"    Balance Score: {best.balance_score:.2f}")
+            tprint(f"    Balance Score: {best.balance_score:.2f}")
 
         # Generate visualizations
         self._plot_param_vs_accuracy()
@@ -419,7 +457,7 @@ class AblationRunner:
         path = os.path.join(self.summary_dir, "param_vs_accuracy.png")
         fig.savefig(path, dpi=150)
         plt.close(fig)
-        print(f"  Saved: {path}")
+        tprint(f"  Saved: {path}")
 
     def _plot_overfit_analysis(self) -> None:
         """Bar chart: overfit gap per config, with threshold line."""
@@ -448,7 +486,7 @@ class AblationRunner:
         path = os.path.join(self.summary_dir, "overfit_analysis.png")
         fig.savefig(path, dpi=150)
         plt.close(fig)
-        print(f"  Saved: {path}")
+        tprint(f"  Saved: {path}")
 
     def _plot_pareto_frontier(self) -> None:
         """Pareto frontier: parameter count vs eval accuracy."""
@@ -497,7 +535,7 @@ class AblationRunner:
         path = os.path.join(self.summary_dir, "pareto_frontier.png")
         fig.savefig(path, dpi=150)
         plt.close(fig)
-        print(f"  Saved: {path}")
+        tprint(f"  Saved: {path}")
 
     def _plot_balance_scores(self) -> None:
         """Bar chart of balance scores per config."""
@@ -530,7 +568,7 @@ class AblationRunner:
         path = os.path.join(self.summary_dir, "balance_scores.png")
         fig.savefig(path, dpi=150)
         plt.close(fig)
-        print(f"  Saved: {path}")
+        tprint(f"  Saved: {path}")
 
     def _plot_ablation_table(self) -> None:
         """Generate a styled summary table as an image."""
@@ -598,7 +636,7 @@ class AblationRunner:
         path = os.path.join(self.summary_dir, "ablation_table.png")
         fig.savefig(path, dpi=150, bbox_inches='tight')
         plt.close(fig)
-        print(f"  Saved: {path}")
+        tprint(f"  Saved: {path}")
 
     def _cleanup_models(self, best_models: Dict[str, AblationResult]) -> None:
         """
@@ -622,8 +660,8 @@ class AblationRunner:
                         os.remove(fpath)
                         removed += 1
 
-        print(f"\n  Cleanup: removed {removed} non-optimal model checkpoint(s).")
-        print(f"  All visualization outputs are preserved.")
+        tprint(f"\n  Cleanup: removed {removed} non-optimal model checkpoint(s).")
+        tprint(f"  All visualization outputs are preserved.")
 
     def _save_results(self) -> None:
         """Save current results to JSON."""
@@ -637,9 +675,9 @@ class AblationRunner:
             with open(self.results_file, 'r') as f:
                 data = json.load(f)
             self.results = [AblationResult(**d) for d in data]
-            print(f"  Loaded {len(self.results)} previous results from {self.results_file}")
+            tprint(f"  Loaded {len(self.results)} previous results from {self.results_file}")
         except Exception as e:
-            print(f"  Warning: Could not load previous results: {e}")
+            tprint(f"  Warning: Could not load previous results: {e}")
 
     def _save_summary(self, best_models: Dict[str, AblationResult]) -> None:
         """Save human-readable summary."""
@@ -677,7 +715,269 @@ class AblationRunner:
                         f"Params={r.total_params/1e6:6.2f}M | "
                         f"Balance={r.balance_score:6.1f}\n")
 
-        print(f"  Saved: {path}")
+        tprint(f"  Saved: {path}")
+
+
+def _run_smoke_test(args) -> bool:
+    """
+    light-weight smoke test.
+
+    Returns:
+        True if all phases pass, False otherwise.
+    """
+    import copy, tempfile, shutil
+    from torch.utils.data import DataLoader, Dataset, Subset
+    from sklearn.model_selection import GroupKFold
+
+    tprint("  Running quick test")
+
+    errors = []
+    tmpdir = tempfile.mkdtemp(prefix="smoke_test_")
+    tprint(f"  Temp dir: {tmpdir}")
+
+    try:
+        # Config
+        tprint("\n Config loading...")
+        config = load_config()
+        config.path.output = tmpdir
+        config.split.batch_size = 4
+        config.split.eval_batch_size = 4
+        config.memory.num_workers = 0
+        config.memory.pin_memory = False
+        config.common.gradient_accumulation_steps = 1
+        config.common.eval_interval = 1
+        config.common.patience = 999           # No early stopping
+        config.common.use_amp = False
+        config.memory.use_amp = False
+        tprint("   Config loaded and overridden")
+
+        # Synthetic Dataset
+        tprint("\n Creating synthetic dataset...")
+        n_samples = 80
+        n_channels = config.preprocess.pca_components   # 15
+        patch_size = config.split.patch_size             # 15
+        num_classes = config.clsf.num                    # 8
+
+        class SyntheticHSDataset(Dataset):
+            """Minimal synthetic dataset mimicking NpyHSDataset interface."""
+            def __init__(self):
+                # Per-patch label (for CV split & class-weight computation)
+                self.patch_labels = np.random.randint(0, num_classes, size=n_samples)
+                for c in range(num_classes):
+                    self.patch_labels[c] = c
+                np.random.shuffle(self.patch_labels)
+                self.patch_patient_groups = np.array([i % 10 for i in range(n_samples)])
+                self._num_patients = len(np.unique(self.patch_patient_groups))
+                self.data = torch.randn(n_samples, n_channels, patch_size, patch_size)
+                # (B, H, W)
+                self.labels = torch.tensor(self.patch_labels, dtype=torch.long) \
+                    .unsqueeze(-1).unsqueeze(-1).expand(-1, patch_size, patch_size).clone()
+                self.num = num_classes
+
+            def __len__(self):
+                return n_samples
+
+            def __getitem__(self, idx):
+                return self.data[idx], self.labels[idx]
+
+            def _get_patch(self, idx):
+                """Return raw patch data for given index."""
+                return self.data[idx]
+
+        dataset = SyntheticHSDataset()
+        assert len(dataset) == n_samples
+        assert len(np.unique(dataset.patch_labels)) == num_classes
+        tprint(f"  ✓ Synthetic dataset: {n_samples} samples, {num_classes} classes, "
+               f"{dataset._num_patients} patients")
+
+        # DataLoader
+        tprint("\n[Phase 3/8] DataLoader construction...")
+        train_idx = np.arange(0, 60)
+        test_idx = np.arange(60, 80)
+
+        train_loader = DataLoader(
+            Subset(dataset, train_idx), batch_size=4,
+            shuffle=True, num_workers=0, drop_last=True)
+        test_loader = DataLoader(
+            Subset(dataset, test_idx), batch_size=4,
+            shuffle=False, num_workers=0, drop_last=False)
+
+        batch_x, batch_y = next(iter(train_loader))
+        assert batch_x.shape == (4, n_channels, patch_size, patch_size), \
+            f"Unexpected batch shape: {batch_x.shape}"
+        tprint(f"  ✓ Train loader: {len(train_loader)} batches, "
+               f"batch shape: {tuple(batch_x.shape)}")
+        tprint(f"  ✓ Test loader:  {len(test_loader)} batches")
+
+        # Model Instantiation
+        tprint("\n[Phase 4/8] Model instantiation & forward/backward...")
+        tiny_kwargs = dict(
+            in_channels=n_channels,
+            num_classes=num_classes,
+            dim=16,
+            depths=[1, 1],
+            num_heads=[2, 4],
+            window_size=[7, 7],
+            mlp_ratio=2.0,
+            drop_path_rate=0.1,
+            spatial_size=patch_size,
+            r=4,
+            lora_alpha=8,
+        )
+
+        for model_cls, name in [(CommonViT, "CommonViT"), (LoLA_hsViT, "LoLA_hsViT")]:
+            model = model_cls(**tiny_kwargs)
+            n_params = sum(p.numel() for p in model.parameters())
+            n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+            # Forward pass
+            out = model(batch_x)
+            loss = torch.nn.functional.cross_entropy(out, batch_y)
+
+            # Backward pass
+            loss.backward()
+
+            tprint(f"    {name}: {n_params:,} params ({n_trainable:,} trainable), "
+                   f"output={list(out.shape)}, loss={loss.item():.4f}")
+            del model, out, loss
+            gc.collect()
+
+        # single training, run 1 epoch
+        tprint("\nSingle training run (1 epoch)...")
+        model_fn = lambda: LoLA_hsViT(**tiny_kwargs)
+
+        trainer = hsTrainer(
+            config=config,
+            dataLoader=dataset,
+            epochs=1,
+            model=model_fn,
+            model_name="smoke_single",
+            debug_mode=False,
+            num_gpus=min(args.parallel, 1),
+            train_loader=train_loader,
+            test_loader=test_loader,
+        )
+
+        results = trainer.train()
+        assert 'final_accuracy' in results, "Missing final_accuracy in results"
+        assert 'final_kappa' in results, "Missing final_kappa in results"
+        tprint(f"    Training done: acc={results['final_accuracy']:.2f}%, "
+               f"kappa={results['final_kappa']:.2f}%")
+
+        model_dir = os.path.join(trainer.output, 'smoke_test')
+        model_files = [f for f in os.listdir(model_dir) if f.endswith('.pth')] \
+            if os.path.isdir(model_dir) else []
+        tprint(f"    Model saved: {len(model_files)} checkpoint(s)")
+
+        del trainer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Cross-Validation for 2 folds
+        tprint("\n Cross-validation for 2 folds, 1 epoch each")
+
+        gkf = GroupKFold(n_splits=2)
+        fold_loaders = []
+        for tr_i, te_i in gkf.split(
+                np.arange(n_samples), dataset.patch_labels,
+                dataset.patch_patient_groups):
+            tr_ld = DataLoader(Subset(dataset, tr_i), batch_size=4,
+                               shuffle=True, num_workers=0, drop_last=True)
+            te_ld = DataLoader(Subset(dataset, te_i), batch_size=4,
+                               shuffle=False, num_workers=0, drop_last=False)
+            fold_loaders.append((tr_ld, te_ld))
+
+        cv_config = copy.deepcopy(config)
+        cv_config.path.output = tmpdir
+
+        cv_results = hsTrainer.cross_validate(
+            config=cv_config,
+            dataLoader=dataset,
+            n_folds=2,
+            epochs=1,
+            model=model_fn,
+            model_name="smoke_cv",
+            num_gpus=min(args.parallel, 1),
+            debug_mode=False,
+            _fold_loaders_override=fold_loaders,
+        )
+
+        assert 'cv_accuracy_mean' in cv_results, "Missing cv_accuracy_mean"
+        assert 'cv_accuracy_std' in cv_results, "Missing cv_accuracy_std"
+        tprint(f"    CV done: acc={cv_results['cv_accuracy_mean']:.2f}% "
+               f"± {cv_results['cv_accuracy_std']:.2f}%")
+
+        del cv_results
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Ablation Runner (dry-run) 
+        tprint("\n[Phase 7/8] Ablation runner (dry-run)...")
+        smoke_configs = [
+            AblationConfig(tag="smoke", model_type="CommonViT",
+                           dim=16, depths=[1, 1], num_heads=[2, 4],
+                           window_size=[7, 7], mlp_ratio=2.0),
+            AblationConfig(tag="smoke", model_type="LoLA_hsViT",
+                           dim=16, depths=[1, 1], num_heads=[2, 4],
+                           window_size=[7, 7], mlp_ratio=2.0, r=4, lora_alpha=8),
+        ]
+
+        runner = AblationRunner(
+            base_config=config,
+            dataLoader=None,
+            epochs=1,
+            num_gpus=1,
+            n_folds=0,
+        )
+        runner.dry_run(smoke_configs)
+        tprint("    Dry-run complete")
+
+        # Check Outputs 
+        tprint("\n Checking outputs...")
+        all_files = []
+        for root, dirs, files in os.walk(tmpdir):
+            for f in files:
+                rel = os.path.relpath(os.path.join(root, f), tmpdir)
+                all_files.append(rel)
+
+        png_files = [f for f in all_files if f.endswith('.png')]
+        json_files = [f for f in all_files if f.endswith('.json')]
+        pth_files = [f for f in all_files if f.endswith('.pth')]
+
+        tprint(f"  Output files: {len(all_files)} total")
+        tprint(f"    .png plots:  {len(png_files)}")
+        tprint(f"    .json data:  {len(json_files)}")
+        tprint(f"    .pth models: {len(pth_files)}")
+
+        if png_files:
+            for f in sorted(png_files)[:12]:
+                tprint(f"      {f}")
+            if len(png_files) > 12:
+                tprint(f"      ... and {len(png_files) - 12} more")
+
+    except Exception as e:
+        import traceback as tb
+        errors.append(f"{type(e).__name__}: {e}")
+        tprint(f"\n    ERROR: {e}")
+        tb.print_exc()
+
+    finally:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            tprint(f"\n  Temp dir cleaned: {tmpdir}")
+        except Exception:
+            pass
+
+    if errors:
+        tprint(f"    SMOKE TEST FAILED — {len(errors)} error(s):")
+        for e in errors:
+            tprint(f"    {e}")
+    else:
+        tprint("    SMOKE TEST PASSED — All phases OK")
+
+    return len(errors) == 0
 
 
 def main():
@@ -688,8 +988,6 @@ def main():
     )
     parser.add_argument('--epoch', '-e', type=int, default=10,
                         help='Epochs per ablation run (default: 10)')
-    parser.add_argument('--parallel', '-p', type=int, default=1,
-                        help='Number of GPUs (default: 1)')
     parser.add_argument('--model', '-m', type=str, default='both',
                         choices=['lola', 'common', 'both'],
                         help='Which model(s) to ablate (default: both)')
@@ -702,15 +1000,20 @@ def main():
                         help='Resume from config index (0-based)')
     parser.add_argument('--gap-threshold', type=float, default=8.0,
                         help='Max acceptable overfit gap %% (default: 8)')
+    parser.add_argument('--smoke-test', '-s', action='store_true',
+                        help='Quick end-to-end validation with synthetic data. '
+                             'Runs 1 epoch, 2-fold CV, tiny model. Finishes in <60s.')
 
     args = parser.parse_args()
 
-    # Build full config pool (both model types always, for tag lookup)
+    if args.smoke_test:
+        ok = _run_smoke_test(args)
+        raise SystemExit(0 if ok else 1)
+
     all_configs: List[AblationConfig] = []
     all_configs.extend(build_common_vit_configs())
     all_configs.extend(build_lola_vit_configs())
 
-    # Filter by --model flag for full ablation (not tag mode)
     configs: List[AblationConfig] = []
     if args.model in ('common', 'both'):
         configs.extend(build_common_vit_configs())
@@ -718,11 +1021,14 @@ def main():
         configs.extend(build_lola_vit_configs())
 
     if not configs:
-        print("No configs to run.")
+        tprint("No configs to run.")
         return
 
-    # Load base config
     config = load_config()
+
+    # Resolve n_folds: CLI --cv overrides config.yaml if non-zero
+    n_folds = config.common.cv_folds
+    parallel = config.memory.parallel_gpu
 
     # Dry-run: skip data loading, just show parameter counts
     if args.dry_run:
@@ -731,9 +1037,10 @@ def main():
             base_config=config,
             dataLoader=None,
             epochs=args.epoch,
-            num_gpus=args.parallel,
+            num_gpus=parallel,
             gap_threshold=args.gap_threshold,
             resume_idx=args.resume,
+            n_folds=n_folds,
         )
         runner.dry_run(show_configs)
         return
@@ -748,6 +1055,7 @@ def main():
         num_gpus=args.parallel,
         gap_threshold=args.gap_threshold,
         resume_idx=args.resume,
+        n_folds=n_folds,
     )
 
     # Tag mode: train only the matching configs
@@ -756,9 +1064,9 @@ def main():
         if len(runner.results) >= 2:
             runner.analyze()
         else:
-            print(f"  Skipping full analysis (need >=2 results, got {len(runner.results)})")
+            tprint(f"  Skipping full analysis (need >=2 results, got {len(runner.results)})")
             for r in runner.results:
-                print(f"  {r.model_type}/{r.config_tag}: "
+                tprint(f"  {r.model_type}/{r.config_tag}: "
                       f"Acc={r.best_eval_acc:.2f}% Gap={r.overfit_gap:.1f}% "
                       f"Params={r.total_params:,}")
         return
@@ -771,10 +1079,10 @@ def main():
 
     # Final summary
     print("\n")
-    print("  ABLATION COMPLETE")
+    tprint("  ABLATION COMPLETE")
     for model_type, result in best.items():
         if result:
-            print(f"  {model_type}: [{result.config_tag}] "
+            tprint(f"  {model_type}: [{result.config_tag}] "
                   f"Acc={result.best_eval_acc:.2f}% "
                   f"Params={result.total_params:,} "
                   f"Gap={result.overfit_gap:.1f}%")

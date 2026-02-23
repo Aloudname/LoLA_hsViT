@@ -4,7 +4,7 @@ common:
   lr: 0.0001
   weight_decay: 0.05
   eval_interval: 4  # Evaluate every x epoch
-  label_smoothing: 0.2
+  label_smoothing: 0.1
   patience: 20  # More patience for patient-level split
   use_wandb: false  # Disabled by default for stability
   use_amp: true  # Enable mixed precision (will auto-disable on CPU)
@@ -16,6 +16,7 @@ common:
   grad_clip: 0.5  # mixed precision settings
   fast_eval: true  # Evaluate on full test set during training
   gradient_accumulation_steps: 2  # Reduced for CPU training
+  cv_folds: 5  # Default number of folds for cross-validation (0 = disabled, use hold-out)
 lora:
   lora_dropout: 0.2
   lora_rank: 16
@@ -23,6 +24,7 @@ lora:
   merge_lora_for_inference: false
 split:
   test_rate: 0.2 # 0.2 default.
+  n_folds: 5  # Number of folds for cross-validation (0 = disabled, use hold-out)
   batch_size: 1024  # This refers to the size on a single GPU.
   patch_size: 15  # Pixel size of image patches.
   eval_batch_size: 1024  # Smaller eval batch size for CPU training
@@ -33,6 +35,7 @@ memory:
   pin_memory: true  # true is faster but may cause memoleak in distant server.
   num_workers: 4  # Workers on single GPU. More memory usage to accelerate data loading.
   max_workers: 8  # max threads.
+  parallel_gpu: 4  # Number of parallel GPU device. This influence many worker params.
   prefetch_factor: 4  # Prefetch batches to speed up training.
 path:
   data: /data/xjz/houCT/CRCFound-main/dinov3-main/dinov3/data/processed_npy_64_norm
@@ -42,9 +45,8 @@ key: # keys to access data and label in .mat files.
   data: 'hyperspectral_data'
   label: 'hyperspectral_data'
 clsf:
-  num: 9
+  num: 8
   targets:
-    - 'BG'   # Background
     - 'PG'   # ⭐Parathyroid gland
     - 'FAT'
     - 'TG'   # ⭐Thyroid gland

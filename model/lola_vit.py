@@ -547,7 +547,7 @@ class LoLA_hsViT(nn.Module):
         (4) Segmentation Head of ``[B, HW/64, 4dim] -> [B, K, H, W]``:
                 ``X_3`` --(seg_decoder + interpolate + seg_head)--> output ``Y``
     """
-    def __init__(self, in_channels=15, num_classes=9, dim=96, depths=[3, 4, 5],
+    def __init__(self, in_channels=15, num_classes=8, dim=96, depths=[3, 4, 5],
                  num_heads=[4, 8, 16], window_size=[7, 7, 7], mlp_ratio=4.,
                  drop_path_rate=0.2, spatial_size=15, r=16, lora_alpha=32):
         """
@@ -854,7 +854,7 @@ class LoLA_hsViT(nn.Module):
 
 if __name__ == "__main__":
     # Example usage and testing of the model.
-    model = LoLA_hsViT(in_channels=15, num_classes=9, dim=96, depths=[3, 4, 5],
+    model = LoLA_hsViT(in_channels=15, num_classes=8, dim=96, depths=[3, 4, 5],
                        num_heads=[4, 8, 16], window_size=[7, 7, 7], mlp_ratio=4.,
                        drop_path_rate=0.2, spatial_size=15, r=16, lora_alpha=32)
     
@@ -862,13 +862,13 @@ if __name__ == "__main__":
     
     # Test forward pass — expect dense segmentation output
     output = model(dummy_input)
-    print(f"  Output shape: {output.shape}")  # Expected: [2, 9, 15, 15]
+    print(f"  Output shape: {output.shape}")  # Expected: [2, 8, 15, 15]
     
     # Test CAM generation
     output_with_cam = model(dummy_input, return_cam=True)
     if isinstance(output_with_cam, tuple):
         output, cam = output_with_cam
-        print(f"  CAM shape: {cam.shape}")  # Expected: [2, 9, H', W']
+        print(f"  CAM shape: {cam.shape}")  # Expected: [2, 8, H', W']
     
     # Show trainable params after freeze
     model.freeze_all_but_lora()

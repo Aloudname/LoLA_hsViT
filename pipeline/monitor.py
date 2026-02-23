@@ -13,6 +13,9 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
+def tprint(*args, **kwargs):
+    """Print with [HH:MM:SS] timestamp prefix."""
+    print(datetime.now().strftime('[%H:%M:%S]'), *args, **kwargs)
 
 @dataclass
 class MemorySnapshot:
@@ -45,7 +48,8 @@ class Monitor:
                  show_gpu_process: bool = True,
                  threshold_warning: float = 80.0,
                  threshold_critical: float = 90.0,
-                 enable_gpu: bool = True):
+                 enable_gpu: bool = True,
+                 enable_log: bool = False):
         
         self.log_file = log_file
         self.interval = interval
@@ -54,6 +58,7 @@ class Monitor:
         self.peak_sys_memory = 0.0
         self.peak_gpu_memory = 0.0
         self.enable_gpu = enable_gpu and self._check_gpu_available()
+        self.enable_log = enable_log
         
         self.gpu_ids = gpu_ids
         self.show_gpu_process = show_gpu_process
@@ -297,9 +302,7 @@ class Monitor:
         os.system('clear' if os.name == 'posix' else 'cls')
         
         # header
-        print('\033[1;36m' + '=' * 20 + '\033[0m')
-        print(f'\033[1;33m Resource monitoring - {snapshot.timestamp} | interval: {self.interval}s\033[0m')
-        print('\033[1;36m' + '=' * 20 + '\033[0m')
+        print(f'\033[1;33m Resource monitoring - {snapshot.timestamp} | interval: {self.interval}s | if_log: {self.enable_log}\033[0m')
         
         sys_bar = self.get_progress_bar(snapshot.sys_percent)
         sys_color = self.get_color(snapshot.sys_percent)
@@ -359,7 +362,8 @@ class Monitor:
     def stop_monitoring(self):
         self.monitoring = False
         print("\nmonitoring stopped.")
-        self.save_log()
+        if self.enable_log:
+            self.save_log()
     
     def save_log(self):
         """
@@ -392,12 +396,13 @@ class Monitor:
 def monitor():
     parser = argparse.ArgumentParser(description='GPU and memory monitor')
     parser.add_argument('--interval', '-i', type=float, default=2.0, help='monitor interval (seconds)')
-    parser.add_argument('--log', '-l', type=str, default='outputs/logs/monitor.log', help='log file path')
+    parser.add_argument('--log', '-l', type=bool, default=False, help='enable logging')
     parser.add_argument('--gpus', type=str, default='all', help='gpu ids to monitor, separated by commas')
     parser.add_argument('--no-gpu', action='store_true', help='disable gpu monitoring')
     parser.add_argument('--no-process', action='store_true', help='disable gpu process monitoring')
     parser.add_argument('--warning', type=float, default=80.0, help='warning threshold (percentage)')
     parser.add_argument('--critical', type=float, default=90.0, help='critical threshold (percentage)')
+    
     
     args = parser.parse_args()
     
@@ -407,13 +412,13 @@ def monitor():
         gpu_ids = [int(x.strip()) for x in args.gpus.split(',')]
     
     monitor = Monitor(
-        log_file=args.log,
         interval=args.interval,
         gpu_ids=gpu_ids,
         show_gpu_process=not args.no_process,
         threshold_warning=args.warning,
         threshold_critical=args.critical,
-        enable_gpu=not args.no_gpu
+        enable_gpu=not args.no_gpu,
+        enable_log=args.log
     )
     
     try:

@@ -1,11 +1,15 @@
 # dataset.py - Hyperspectral Dataset Handling.
 # todo:
 # - Implement class distribution analysis and visualization methods.
+# - Try various seeds for a balanced label distribution in line 542 create_dataloader.
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources.*")
 
 import os, re, torch
+from datetime import datetime
+from pipeline.monitor import tprint
+
 import numpy as np
 from munch import Munch
 from torch.utils.data import Dataset
@@ -158,7 +162,7 @@ class AbstractHSDataset(ABC, Dataset):
         
         # Convert labels to 0-based index
         self.patch_labels = (self.raw_labels[rows, cols] - 1).astype(np.int32)
-        print(f"Created {len(self.patch_indices)} indices for patch.")
+        tprint(f"Created {len(self.patch_indices)} indices for patch.")
         print(f"Cached padded data shape: {self.padded_data.shape} (padding happens once at init)")
 
         # Pad labels for dense segmentation
@@ -173,7 +177,7 @@ class AbstractHSDataset(ABC, Dataset):
         label_region[self.raw_labels == 0] = 255
         self.padded_labels[self.margin:self.margin + self.raw_labels.shape[0],
                            self.margin:self.margin + self.raw_labels.shape[1]] = label_region
-        print(f"Created padded label map: {self.padded_labels.shape}")
+        tprint(f"Created padded label map: {self.padded_labels.shape}")
 
     def _get_patch(self, idx: int) -> np.ndarray:
         """
@@ -372,7 +376,7 @@ class NpyHSDataset(AbstractHSDataset):
             if label_file in label_files:
                 pairs.append((os.path.join(self.data_path, data_file), os.path.join(self.data_path, label_file)))
             else:
-                print(f"Warning: No label file found for {data_file}")
+                tprint(f"Warning: No label file found for {data_file}")
         return pairs
     
     def _load_data(self) -> None:
@@ -389,12 +393,12 @@ class NpyHSDataset(AbstractHSDataset):
         
         print(f"Detected concatenation shape: ({total_h}, {total_w}, {c})")
         
-        # Second pass: allocate once and fill
+        # allocate once and fill
         self.raw_data = np.zeros((total_h, total_w, c), dtype=np.float32)
         self.raw_labels = np.zeros((total_h, total_w), dtype=np.int32)
         
-        # Track patient-level row ranges for group-aware splitting
-        self._patient_row_ranges = []  # List of (row_start, row_end, patient_group_idx)
+        # track patient for group splitting
+        self._patient_row_ranges = []  # List [row_start, row_end, patient_group_idx]
         _patient_id_map = {}  # patient_name -> group index
         
         row_offset = 0
@@ -407,21 +411,20 @@ class NpyHSDataset(AbstractHSDataset):
             if data.shape[:2] != labels.shape[:2]:
                 raise ValueError(f"Shape mismatch between {data_file} and {label_file}")
             
-            # Track patient group
             patient_id = self._extract_patient_id(data_file)
             if patient_id not in _patient_id_map:
                 _patient_id_map[patient_id] = len(_patient_id_map)
             pid_idx = _patient_id_map[patient_id]
             self._patient_row_ranges.append((row_offset, row_offset + h, pid_idx))
             
-            # Fill allocated arrays
+            # fill allocated arrays
             self.raw_data[row_offset:row_offset+h, :w, :] = data
             self.raw_labels[row_offset:row_offset+h, :w] = labels
             row_offset += h
             
-            print(f"  Loaded pair {idx+1}/{len(pairs)}: {data_file.split('/')[-1]} (patient: {patient_id})")
+            tprint(f"  Loaded pair {idx+1}/{len(pairs)}: {data_file.split('/')[-1]} (patient: {patient_id})")
             
-            # Explicitly delete to free memory
+            # free memory
             del data, labels
         
         self._patient_names = {v: k for k, v in _patient_id_map.items()}
@@ -449,15 +452,15 @@ class NpyHSDataset(AbstractHSDataset):
         h, w, c = self.raw_data.shape
         n_pixels = h * w
         
-        # --- Global normalization (single scaler, consistent statistics) ---
-        print("Normalizing data (global StandardScaler)...")
+        # global normalization
+        tprint("Normalizing data (global StandardScaler)...")
         flat_data = self.raw_data.reshape(-1, c).astype(np.float32)
         scaler = StandardScaler()
         flat_data = scaler.fit_transform(flat_data).astype(np.float32)
         
-        # Apply PCA if specified
+        # PCA
         if self.pca_component and self.pca_component < c:
-            print(f"Applying PCA: {c} -> {self.pca_component} components (randomized SVD)...")
+            tprint(f"Applying PCA: {c} -> {self.pca_component} components (randomized SVD)...")
             
             # Subsample for faster fit: 500k pixels is more than enough
             # to capture principal directions from spatially correlated data
@@ -470,26 +473,27 @@ class NpyHSDataset(AbstractHSDataset):
             else:
                 fit_data = flat_data
             
-            # Randomized SVD — dramatically faster when k << c
+            # SVD, fast when k << c
             pca = PCA(n_components=self.pca_component,
-                      svd_solver='randomized', random_state=42)
+                      svd_solver='randomized', random_state=350234)
             pca.fit(fit_data)
             print(f"  Explained variance ratio: {pca.explained_variance_ratio_.sum():.4f}")
             
-            # Manual projection in float32: X_pca = (X - mean) @ components.T
-            # Avoids sklearn transform()'s internal float64 upcast.
+            # manual projection in float32: X_pca = (X - mean) @ components.T
+            # avoids sklearn transform()'s internal float64 upcast.
             components = pca.components_.astype(np.float32)     # (k, c)
             mean = pca.mean_.astype(np.float32)                 # (c,)
             pca_data = (flat_data - mean) @ components.T        # (n, k), stays float32
             self.processed_data = pca_data.reshape(h, w, self.pca_component)
             
-            print(f"  Applied PCA: reduced from {c} to {self.pca_component} components")
+            tprint(f"  Applied PCA: reduced from {c} to {self.pca_component} components")
             del fit_data, pca_data, components, mean
         else:
             self.processed_data = flat_data.reshape(h, w, c)
-            print("  PCA not applied, using all original components")
-            
-        del flat_data  # release normalized data
+            tprint("  PCA not applied, using all original components")
+        
+        # release memory 
+        del flat_data  
             
     def validate_data_quality(self) -> None:
         """Check data quality: distribution, ranges, duplicates"""
@@ -497,12 +501,12 @@ class NpyHSDataset(AbstractHSDataset):
         unique_labels, counts = np.unique(self.patch_labels, return_counts=True)
         print(f"  Class distribution: {dict(zip(unique_labels, counts))}")
         
-        # Check imbalance
+        # check imbalance
         imbalance = counts.max() / counts.min() if len(counts) > 0 else 1
         if imbalance > 10:
-            print(f"  Class imbalance detected (ratio: {imbalance:.1f}x)")
+            print(f"  WARNING: Class imbalance detected (ratio: {imbalance:.1f}x)")
         
-        # Check data range
+        # check value range
         sample = self._get_patch(0)
         print(f"  Data range: [{sample.min():.4f}, {sample.max():.4f}]")
     
@@ -516,9 +520,9 @@ class NpyHSDataset(AbstractHSDataset):
                         Recommended: 4 for optimal throughput (prevents I/O bottleneck).
                         Set to 0 only to debug or on single-core systems.
             batch_size: Batch size for each iteration. If None, uses config value or 32.
-            pin_memory: Whether to pin memory for GPU transfer (True recommended on GPU systems).
-            prefetch_factor: preload batches per worker(default=2).
-            persistent_workers: keep workers from frequent recreation (default=False).
+            pin_memory: Whether to pin memory for GPU transfer, better True on GPU.
+            prefetch_factor: preload batches per worker.
+            persistent_workers: keep workers from frequent recreation.
         
         Returns:
             Tuple of (train_loader, test_loader)
@@ -527,28 +531,52 @@ class NpyHSDataset(AbstractHSDataset):
         from sklearn.model_selection import GroupShuffleSplit
         
         total_indices = np.arange(len(self.patch_indices))
+        all_classes = set(np.unique(self.patch_labels))
         
-        # Patient-level split to prevent data leakage:
-        # All patches from the same patient go entirely into train OR test.
-        gss = GroupShuffleSplit(n_splits=1, test_size=self.test_rate, random_state=350234)
-        train_idx, test_idx = next(gss.split(
-            total_indices,
-            self.patch_labels,
-            groups=self.patch_patient_groups
-        ))
+        # Patient-level split to prevent data leakage.
+        # NOTE: Retry with different seeds to find a split where ALL classes
+        # appear in both train and test sets (rare class 3, 7 may only exist in
+        # a few patients (need check), so some seeds will strand them in one set).
+        best_split = None
+        best_missing = len(all_classes)  # worst case
+        base_seed = 350234
+        
+        for seed in range(base_seed, base_seed + 100):
+            gss = GroupShuffleSplit(n_splits=1, test_size=self.test_rate,
+                                   random_state=seed)
+            t_idx, v_idx = next(gss.split(
+                total_indices, self.patch_labels,
+                groups=self.patch_patient_groups
+            ))
+            
+            test_cls = set(np.unique(self.patch_labels[v_idx]))
+            train_cls = set(np.unique(self.patch_labels[t_idx]))
+            n_missing = len(all_classes - test_cls) + len(all_classes - train_cls)
+            
+            if n_missing == 0:
+                train_idx, test_idx = t_idx, v_idx
+                tprint(f"  GroupShuffleSplit: found full-coverage split (seed={seed})")
+                break
+            if n_missing < best_missing:
+                best_missing = n_missing
+                best_split = (t_idx, v_idx, seed)
+        else:
+            # No perfect split found — use the best one
+            train_idx, test_idx, seed = best_split
+            tprint(f"  WARNING: No split covers all classes in both sets after 100 seeds. "
+                  f"Using best seed={seed} ({best_missing} missing class(es)).")
         
         # Verify no patient-level leakage
         train_patients = set(self.patch_patient_groups[train_idx])
         test_patients = set(self.patch_patient_groups[test_idx])
         assert len(train_patients & test_patients) == 0, \
             "Data leakage detected: patients appear in both train and test sets!"
-        print(f"Patient-level split: {len(train_patients)} train patients, "
+        tprint(f"Patient-level split: {len(train_patients)} train patients, "
               f"{len(test_patients)} test patients (0 overlap)")
         
         # Check class coverage in both splits
         train_classes = set(np.unique(self.patch_labels[train_idx]))
         test_classes = set(np.unique(self.patch_labels[test_idx]))
-        all_classes = set(np.unique(self.patch_labels))
         if train_classes != all_classes:
             missing = all_classes - train_classes
             print(f"  WARNING: Training set missing classes: {missing}")
@@ -568,7 +596,7 @@ class NpyHSDataset(AbstractHSDataset):
         test_subset = _IndexedSubset(self, test_idx)
         print(f"Training augmentations enabled: flip, rotate, spectral noise, band dropout, cutout")
         
-        # Determine batch size and pin_memory settings
+        # memory settings
         if batch_size is None:
             batch_size = self.batch_size if hasattr(self, 'batch_size') else 32
         
@@ -580,7 +608,7 @@ class NpyHSDataset(AbstractHSDataset):
             shuffle=True,
             num_workers=num_workers,
             pin_memory=actual_pin_memory,
-            prefetch_factor=prefetch_factor if num_workers > 0 else 1,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
             persistent_workers=persistent_workers and (num_workers > 0),
             drop_last=True,  # drop last batch if it's smaller than batch_size
             timeout=60 if num_workers > 0 else 0
@@ -592,18 +620,111 @@ class NpyHSDataset(AbstractHSDataset):
             shuffle=False,
             num_workers=num_workers,
             pin_memory=actual_pin_memory,
-            prefetch_factor=prefetch_factor if num_workers > 0 else 1,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
             persistent_workers=persistent_workers and (num_workers > 0),
             drop_last=False,
             timeout=60 if num_workers > 0 else 0
         )
         
+        tprint('\n')
         print(f"Training set: {len(train_loader)} batches ({len(train_idx)} samples)")
         print(f"Test set: {len(test_loader)} batches ({len(test_idx)} samples)")
         print(f"DataLoader config: num_workers={num_workers}, batch_size={batch_size}, pin_memory={actual_pin_memory}")
         print(f"  prefetch_factor={prefetch_factor}, persistent_workers={persistent_workers and (num_workers > 0)}")
         
         return train_loader, test_loader
+
+    def create_cv_data_loaders(self, n_folds=5, num_workers=4, batch_size=None,
+                               pin_memory=True, prefetch_factor=2,
+                               persistent_workers=False):
+        """
+        Create K-fold cross-validation DataLoaders with patient-level grouping.
+
+        Uses ``GroupKFold`` to guarantee zero patient overlap between
+        train and test sets across all folds.
+
+        Args:
+            n_folds: Number of cross-validation folds.
+
+        Returns:
+            List of ``(train_loader, test_loader)`` tuples, one per fold.
+        """
+        from sklearn.model_selection import GroupKFold
+
+        total_indices = np.arange(len(self.patch_indices))
+        all_classes = set(np.unique(self.patch_labels))
+
+        gkf = GroupKFold(n_splits=n_folds)
+
+        if batch_size is None:
+            batch_size = self.batch_size if hasattr(self, 'batch_size') else 32
+        actual_pin_memory = pin_memory and torch.cuda.is_available()
+
+        fold_loaders = []
+
+        tprint(f"\n[Cross-Validation Split] {n_folds} folds, "
+              f"patient-level GroupKFold")
+
+        for fold_idx, (train_idx, test_idx) in enumerate(
+                gkf.split(total_indices, self.patch_labels,
+                          groups=self.patch_patient_groups)):
+
+            # Verify no patient-level leakage
+            train_patients = set(self.patch_patient_groups[train_idx])
+            test_patients = set(self.patch_patient_groups[test_idx])
+            assert len(train_patients & test_patients) == 0, \
+                f"Fold {fold_idx+1}: Patient leakage detected!"
+
+            # Check class coverage
+            train_classes = set(np.unique(self.patch_labels[train_idx]))
+            test_classes = set(np.unique(self.patch_labels[test_idx]))
+            if train_classes != all_classes:
+                tprint(f"[WARNING] Fold {fold_idx+1}: Training missing classes: "
+                      f"{all_classes - train_classes}")
+            if test_classes != all_classes:
+                tprint(f"[WARNING] Fold {fold_idx+1}: Test missing classes: "
+                      f"{all_classes - test_classes}")
+
+            tprint(f"  Fold {fold_idx+1}/{n_folds}: "
+                  f"train={len(train_idx)} ({len(train_patients)} patients), "
+                  f"test={len(test_idx)} ({len(test_patients)} patients)")
+
+            # subsets
+            train_subset = _AugmentedSubset(
+                self, train_idx,
+                noise_std=0.02,
+                band_drop_rate=0.05,
+                cutout_ratio=0.15
+            )
+            test_subset = _IndexedSubset(self, test_idx)
+
+            train_loader = torch.utils.data.DataLoader(
+                train_subset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=num_workers,
+                pin_memory=actual_pin_memory,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                persistent_workers=persistent_workers and (num_workers > 0),
+                drop_last=True,
+                timeout=60 if num_workers > 0 else 0
+            )
+            test_loader = torch.utils.data.DataLoader(
+                test_subset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=actual_pin_memory,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                persistent_workers=persistent_workers and (num_workers > 0),
+                drop_last=False,
+                timeout=60 if num_workers > 0 else 0
+            )
+
+            fold_loaders.append((train_loader, test_loader))
+
+        tprint(f"  Created {n_folds} fold DataLoader pairs\n")
+        return fold_loaders
 
 class MatHSDataset(AbstractHSDataset):
     """
@@ -655,7 +776,7 @@ class MatHSDataset(AbstractHSDataset):
             if self.raw_labels.ndim == 3 and self.raw_labels.shape[-1] == 1:
                 self.raw_labels = self.raw_labels.squeeze(-1)
                 
-            print(f"Loaded .mat data: {self.raw_data.shape}, labels: {self.raw_labels.shape}")
+            tprint(f"Loaded .mat data: {self.raw_data.shape}, labels: {self.raw_labels.shape}")
             
         except KeyError as e:
             raise ValueError(f"Missing key in .mat file: {e}")
@@ -695,7 +816,7 @@ class MatHSDataset(AbstractHSDataset):
 
     def validate_data_quality(self) -> None:
         """Check data quality: distribution, ranges, duplicates"""
-        print("\n[Dataset Quality Check]")
+        tprint("\n[Dataset Quality Check]")
         unique_labels, counts = np.unique(self.patch_labels, return_counts=True)
         print(f"  Class distribution: {dict(zip(unique_labels, counts))}")
         
@@ -819,7 +940,7 @@ class TiffHSDataset(AbstractHSDataset):
                 # Read label band and squeeze to (H, W)
                 self.raw_labels = src.read(1).squeeze()
                 
-            print(f"Loaded TIFF data: {self.raw_data.shape}, labels: {self.raw_labels.shape}")
+            tprint(f"Loaded TIFF data: {self.raw_data.shape}, labels: {self.raw_labels.shape}")
             
         except Exception as e:
             raise RuntimeError(f"Error loading TIFF files: {e}")
@@ -829,6 +950,7 @@ class TiffHSDataset(AbstractHSDataset):
         Preprocess data with band selection and normalization.
         """
         from sklearn.preprocessing import StandardScaler
+        tprint("Preprocessing TIFF data: band selection and normalization...")
         
         # Select specific spectral bands if requested
         if self.spectral_subset is not None:
