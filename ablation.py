@@ -1007,11 +1007,28 @@ def main():
     parser.add_argument('--smoke-test', '-s', action='store_true',
                         help='Quick end-to-end validation with synthetic data. '
                              'Runs 1 epoch, 2-fold CV, tiny model. Finishes in <60s.')
+    parser.add_argument('--analyze_dataset', '-a', action='store_true',
+                        help='Analyze dataset distribution and generate plots.')
 
     args = parser.parse_args()
 
+    if args.analyze_dataset:
+        tprint("Analyzing mode enabled.")
+        from config import load_config
+        from pipeline import NpyHSDataset
+        from pipeline import analyze_dataset
+        
+        config = load_config()
+        print(f"Loading dataset from: {config.path.data}")
+        dataset = NpyHSDataset(config=config)
+        analyze_dataset(dataset, show_split=True)
+        tprint("Dataset analysis complete.")
+        raise SystemExit(0)
+
     if args.smoke_test:
+        tprint("Smoke test mode enabled.")
         ok = _run_smoke_test(args)
+        tprint("Smoke test complete.")
         raise SystemExit(0 if ok else 1)
 
     all_configs: List[AblationConfig] = []

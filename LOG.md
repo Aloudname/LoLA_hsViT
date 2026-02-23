@@ -3,14 +3,14 @@
 ### 12.20
 
 - 确定技术路线：
-``[1] Zidi, Fadi Abdeladhim et al. LoLA-SpecViT: Local Attention SwiGLU Vision Transformer with LoRA for Hyperspectral Imaging``
+`[1] Zidi, Fadi Abdeladhim et al. LoLA-SpecViT: Local Attention SwiGLU Vision Transformer with LoRA for Hyperspectral Imaging`
 - 研究文献提供的LoLA结构，其含有**低秩适配(Low Rank adaption)**＋**局部注意力机制(Local Attention)**。
 
 ### 12.26 
-- 新建GitHub项目LoLA-hsViT(结构如**图1**)
+- 新建GitHub项目LoLA-hsViT(结构如**图1**);
 - 采用公开地理遥感高光谱数据集：
 https://rsidea.whu.edu.cn/resource_WHUHi_sharing.htm
-- 定义了``HDR2MAT.py``、``LoLA_hsViT.py``、``training.py``, 分别完成了对原始高光谱数据集的读取、处理、转换，模型的构建、训练和可视化。训练的参数完全内置于类和函数内部，超参数全部定义在``training.py``文件头部，且需要在文件内手动注册数据集格式（如**图2**）
+- 定义了`HDR2MAT.py`、`LoLA_hsViT.py`、`training.py`, 分别完成了对原始高光谱数据集的读取、处理、转换，模型的构建、训练和可视化。训练的参数完全内置于类和函数内部，超参数全部定义在`training.py`文件头部，且需要在文件内手动注册数据集格式（如**图2**）。
 
 **图1**
 ![12.26项目结构](src/img_1226.png)
@@ -18,7 +18,7 @@ https://rsidea.whu.edu.cn/resource_WHUHi_sharing.htm
 ![数据集的手动注册](src/handmade_dataset.png)
 
 ### 12.28
-- 用公开数据集``WHU-Hi-LongKou``在组服务器上跑通了程序，包括原始数据转换、数据集构建、特征波段筛选、服务器部署训练。
+- 用公开数据集`WHU-Hi-LongKou`在组服务器上跑通了程序，包括原始数据转换、数据集构建、特征波段筛选、服务器部署训练。
 - **问题**: 原程序提供的结果展示和可视化方法太少，接口不明显。尝试改进，引入CAM。
 
 ## 2026.1
@@ -49,15 +49,15 @@ graph LR
 
 ### 1.11
 - 毕设项目背景研究：
-``[1] 高光谱遥感图像处理方法及应用, 赵春晖`` 前两章：理论基础、特征提取技术
-``[2] Woo, S., Park, J., (2018). CBAM: Convolutional Block Attention Module.vol 11211. Springer, Cham``
+`[1] 高光谱遥感图像处理方法及应用, 赵春晖` 前两章：理论基础、特征提取技术;
+`[2] Woo, S., Park, J., (2018). CBAM: Convolutional Block Attention Module.vol 11211. Springer, Cham`;
 - 撰写开题报告；
 
 ### 1.20
 - 毕设项目部署技术研究：
-边缘部署和``Nvidia Jetson Orin NX``
+边缘部署和`Nvidia Jetson Orin NX`
 - 毕设项目技术路线研究：
-``[1] ZHANG Bing. Advancement of hyperspectral image processing and information extraction[J]. Journal of Remote Sensing``
+`[1] ZHANG Bing. Advancement of hyperspectral image processing and information extraction[J]. Journal of Remote Sensing`
 - 研究在抽象基类基础上构建各类(`.mat`, `.tiff`等)数据集的方法，共用接口：
 ```python
 class AbstractHyperspectralDataset(ABC, Dataset):
@@ -127,3 +127,45 @@ LoLA_hsViT/
 - 在固定参数对比训练的基础上，增添针对两种ViT的消融实验，以确定最简结构的有效模型；
 - 准备`TensorRT`推理部署；
 - 系统整理收集到的临床理论文献，准备写作论文初稿。
+### 2.23
+- 采用小批次优化了数据标准化的执行速度和资源占用。
+- 修改了一些BUG：
+  1) 优化没删干净的全局标准化代码，致标准化两次，执行很慢；
+  2) 新增受试者批处理，避免同一受试者数据泄露致测试精度虚高。
+- **问题**： 引入强正则化后，训练集和验证集的`accuracy gap`仍然差30%，
+`test acc`在65%停滞，其余提高泛化能力的手段(**Model EMA**，Exponential Moving Average)作用不明显。怀疑是数据集划分和样本偏差问题。
+
+### 2.24
+分析了数据集样本和标签分布。
+- 整体类别分布（383 万样本，112 位受试者）
+
+| 类别           |    样本数 | 占比 |
+| ------------- | -------- | --- |
+| TG (甲状腺)     | 1,300,832 | 33.9% |
+| Tra (气管)      | 1,156,124 | 30.2% |
+| MS (肌肉)       |   773,472 | 20.2% |
+| PG (甲状旁腺)   |   289,773 |  7.6% |
+| FAT            |   168,961 |  4.4% |
+| ES (食管)      |    83,148 |  2.2% |
+| Blood          |    41,598 |  1.1% |
+| LN (淋巴结)     |    18,871 |  0.5% |
+
+不平衡比 68.9x（TG : LN），极端长尾分布。
+Train/Test 划分偏斜（patient-level split）
+
+- 两个类出现 >5% 的占比偏移：
+
+|类别 | train    |     test              |
+| --  | ------  | ---------------------- |
+|Tra  |  27.1%  |  40.4% (Δ = -13.3%)    |
+|MS   |  21.6%  | test 15.5% (Δ = +6.1%) |
+
+这意味着测试集中气管样本严重过多，而肌肉样本偏少。
+
+- 受试者级别:
+大量受试者缺失多数类别。例如 16 位受试者只含 PG 一个类（其余 7 类全部 missing）。LN、Blood、ES 三个稀有类仅分布在少部分受试者中，patient-level split 时极易导致某些类在测试集中几乎消失。
+
+这解释了 30% accuracy gap 的根因
+68.9x 不平衡：模型偏向预测 TG/Tra/MS 三大类即可获得 ~84% 的表面准确率，但泛化能力差
+Patient-level split 造成的分布偏移：Tra 在测试集占 40%（训练集仅 27%），模型没见过足够多样的 Tra 样本
+稀有类的受试者稀疏性：LN/Blood/ES 仅存在于少数受试者中，划分后某一侧样本极少，模型学不到有效特征

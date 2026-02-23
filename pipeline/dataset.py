@@ -341,7 +341,8 @@ class NpyHSDataset(AbstractHSDataset):
         train/test splitting to prevent data leakage.
         """
         # Build a row-to-patient lookup array
-        total_rows = self.raw_data.shape[0]
+        # Derive total_rows from _patient_row_ranges (raw_data may already be freed)
+        total_rows = max(end for _, end, _ in self._patient_row_ranges)
         row_to_patient = np.full(total_rows, -1, dtype=np.int32)
         for row_start, row_end, pid_idx in self._patient_row_ranges:
             row_to_patient[row_start:row_end] = pid_idx
@@ -461,6 +462,8 @@ class NpyHSDataset(AbstractHSDataset):
         flat = self.raw_data.reshape(-1, c).astype(np.float32)
         n_pixels = flat.shape[0]
         print("Reshaped to (n_pixels, n_channels):", flat.shape)
+        
+        del self.raw_data  # free memory
 
         tprint("Batching for StandardScaler fit...")
         max_fit_samples = 500_000
@@ -470,7 +473,6 @@ class NpyHSDataset(AbstractHSDataset):
             fit_data = flat[fit_idx]
         else:
             fit_data = flat
-        
             
         mean = fit_data.mean(axis=0)           # (c,) float32
         std = fit_data.std(axis=0) + 1e-8      # (c,) float32, avoid div-by-zero

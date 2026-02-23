@@ -1448,7 +1448,7 @@ class hsTrainer:
             plt.suptitle(f'Epoch {epoch+1} - Grad-CAM', fontsize=14, fontweight='bold')
             plt.tight_layout()
             
-            cam_path = os.path.join(self.output, 'Grad-CAM', f'epoch_{epoch+1:03d}.png')
+            cam_path = os.path.join(self.output, 'CAM', f'epoch_{epoch+1:03d}.png')
             plt.savefig(cam_path, dpi=150, bbox_inches='tight')
             plt.close()
             
