@@ -57,7 +57,6 @@ class LoRALinear(nn.Module):
         self.out_features = out_features
         self.r = r
         self.lora_alpha = lora_alpha
-        self.lora_dropout = lora_dropout
         self.enable_gate_residual = enable_gate_residual
         
         # Main linear layer (frozen during training)
@@ -587,9 +586,6 @@ class LoLA_hsViT(nn.Module):
         self.band_dropout = BandDropout(drop_rate=0.1)
         self.spectral_attention = AdaptiveSqueezeExcitation(dim)
         
-        # Store LoRA layers for CLR updates
-        self.lora_layers = []
-        
 
         # Block2: Patch embedding.
         self.patch_embed = nn.Sequential(
@@ -653,7 +649,6 @@ class LoLA_hsViT(nn.Module):
         self.head = LoRALinear(
             self.dims[-1], num_classes, r=r, 
             lora_alpha=lora_alpha, enable_gate_residual=False)
-        self.lora_layers.append(self.head)
         
         # Segmentation decoder: upsample from final feature map to input resolution
         self.seg_decoder = nn.Sequential(
@@ -723,17 +718,6 @@ class LoLA_hsViT(nn.Module):
             p.requires_grad_(True)
         for p in self.seg_head.parameters():
             p.requires_grad_(True)
-
-    def merge_all_lora_into_linear(self):
-        for module in self.modules():
-            if isinstance(module, LoRALinear):
-                module.merge_into_linear_()
-                
-    def update_lora_scale(self, factor):
-        """Update scaling factor for all LoRA layers based on CLR cycle"""
-        for layer in self.lora_layers:
-            if hasattr(layer, 'set_cycle_factor'):
-                layer.set_cycle_factor(factor)
 
     def generate_cam(self, class_idx=None):
         """

@@ -139,12 +139,6 @@ class Unet(nn.Module):
         """
         pass
 
-    def merge_all_lora_into_linear(self):
-        """
-        Null compatible with LoLA interface.
-        """
-        pass
-
     def generate_cam(self, class_idx=None):
         """
         Return:

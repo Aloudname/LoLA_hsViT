@@ -8,31 +8,6 @@ import torch.nn.functional as F
 from timm.layers import trunc_normal_, DropPath
 
 
-class Swish(nn.Module):
-    """Swish used in SwiGLU."""
-    def __init__(self, beta=1):
-        super().__init__()
-        self.beta = beta
-    
-    def forward(self, x):
-        return x * torch.sigmoid(self.beta * x)
-    
-
-class SwiGLU(nn.Module):
-    """SwiGLU for MLP"""
-    def __init__(self, in_features, hidden_features=None, out_features=None, drop=0.):
-        super().__init__()
-        hidden_features = hidden_features or in_features
-        out_features = out_features or in_features
-        self.w1 = nn.Linear(in_features, hidden_features)
-        self.w2 = nn.Linear(in_features, hidden_features)
-        self.W = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x):
-        gate = F.silu(self.w1(x))
-        return self.W(self.drop(gate * self.w2(x)))
-
 class AdaptiveSqueezeExcitation(nn.Module):
     def __init__(self, channels, reduction=16):
         super().__init__()
@@ -143,7 +118,6 @@ class TransformerBlock(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(dim, mlp_hidden_dim),
             nn.ReLU(inplace=True),
-            # SwiGLU(mlp_hidden_dim, mlp_hidden_dim, mlp_hidden_dim),
             nn.Dropout(drop),
             nn.Linear(mlp_hidden_dim, dim),
             nn.Dropout(drop)
@@ -307,12 +281,6 @@ class CommonViT(nn.Module):
             if 'head' not in name and 'norm' not in name and 'seg_' not in name:
                 param.requires_grad = False
 
-    def merge_all_lora_into_linear(self):
-        """
-        Null compatible with LoLA interface.
-        """
-        pass
-
     def generate_cam(self, class_idx=None):
         """
         Return:
@@ -359,8 +327,6 @@ class CommonViT(nn.Module):
         x = x + self.pos_embed
         x = self.pos_drop(x)
         
-        current_spatial_size = self.patch_resolution
-        
         for level_idx, blocks in enumerate(self.transformer_levels):
             B, H, W, C = x.shape
             
@@ -383,7 +349,6 @@ class CommonViT(nn.Module):
                 
                 # to [B, H', W', 2*C]
                 x = x_conv.permute(0, 2, 3, 1)
-                current_spatial_size = current_spatial_size // 2
         
         # final norm
         B, H, W, C = x.shape

@@ -3,10 +3,9 @@ common:
   dataset_name: 'placeholder'
   lr: 0.0001
   weight_decay: 0.05
-  eval_interval: 4  # Evaluate every x epoch
-  label_smoothing: 0.1
+  eval_interval: 2  # Evaluate every x epoch
+  focal_gamma: 2.0    # Focal Loss focusing parameter (0 = CE, higher = more focus on hard samples)
   patience: 20  # More patience for patient-level split
-  use_wandb: false  # Disabled by default for stability
   use_amp: true  # Enable mixed precision (will auto-disable on CPU)
   scheduler:
     T_0: 10  # Shorter warm restarts
@@ -14,9 +13,8 @@ common:
     eta_min: 0.000001
   warmup_epochs: 5  # Reduced warmup
   grad_clip: 0.5  # mixed precision settings
-  fast_eval: true  # Evaluate on full test set during training
   gradient_accumulation_steps: 2  # Reduced for CPU training
-  cv_folds: 5  # Default number of folds for cross-validation (0 = disabled, use hold-out)
+  cv_folds: 1  # Default number of folds for cross-validation (0 = disabled, use hold-out)
 lora:
   lora_dropout: 0.2
   lora_rank: 16
@@ -31,10 +29,8 @@ split:
 preprocess:
   pca_components: 15  # Number of PCA components to retain.
 memory:
-  use_amp: true  # disable for CPU.
   pin_memory: true  # true is faster but may cause memoleak in distant server.
   num_workers: 4  # Workers on single GPU. More memory usage to accelerate data loading.
-  max_workers: 8  # max threads.
   parallel_gpu: 4  # Number of parallel GPU device. This influence many worker params.
   prefetch_factor: 4  # Prefetch batches to speed up training.
 path:

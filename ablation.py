@@ -17,11 +17,10 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources
 import numpy as np
 import matplotlib.pyplot as plt
 import os, gc, json, time, torch, argparse
-from datetime import datetime
 
 from config import load_config
 from model import LoLA_hsViT, CommonViT
-from pipeline import hsTrainer, NpyHSDataset, tprint
+from pipeline import hsTrainer, NpyHSDataset, tprint, analyze_dataset
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field, asdict
 
@@ -1017,10 +1016,6 @@ def main():
 
     if args.analyze_dataset:
         tprint("Analyzing mode enabled.")
-        from config import load_config
-        from pipeline import NpyHSDataset
-        from pipeline import analyze_dataset
-        
         config = load_config()
         print(f"Loading dataset from: {config.path.data}")
         dataset = NpyHSDataset(config=config)

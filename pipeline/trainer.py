@@ -22,11 +22,61 @@ from typing import Tuple, Callable, Dict
 from pipeline.dataset import AbstractHSDataset
 from torch.cuda.amp import GradScaler, autocast
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from sklearn.metrics import (accuracy_score, cohen_kappa_score,
+from sklearn.metrics import (accuracy_score, balanced_accuracy_score,
+                             cohen_kappa_score,
                              confusion_matrix as _cm, roc_curve,
                              precision_recall_fscore_support, auc)
+import torch.nn.functional as F
 
 warnings.filterwarnings("ignore")
+
+
+class FocalLoss(nn.Module):
+    """Focal Loss for class-imbalanced classification.
+
+    ```
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    ```
+    Down-weights well-classified samples so training focuses on hard / rare ones.
+    Supports segmentation outputs (N, C, H, W) with ignore_index masking.
+    """
+
+    def __init__(self, weight=None, gamma=2.0, ignore_index=-100,
+                 reduction='mean'):
+        super().__init__()
+        self.register_buffer('weight', weight)  # per-class weights (C,)
+        self.gamma = gamma
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        # Flatten to 2D: (N*H*W, C) and (N*H*W,)
+        if logits.dim() == 4:
+            N, C, H, W = logits.shape
+            logits = logits.permute(0, 2, 3, 1).reshape(-1, C)
+            targets = targets.reshape(-1)
+        elif logits.dim() == 3:
+            logits = logits.reshape(-1, logits.shape[-1])
+            targets = targets.reshape(-1)
+
+        # Mask ignore pixels
+        valid = (targets != self.ignore_index)
+        logits = logits[valid]
+        targets = targets[valid]
+
+        if logits.numel() == 0:
+            return logits.sum() * 0.0
+
+        log_p = F.log_softmax(logits, dim=-1)
+        p_t = log_p.exp().gather(1, targets.unsqueeze(1)).squeeze(1)
+        log_p_t = log_p.gather(1, targets.unsqueeze(1)).squeeze(1)
+
+        loss = -((1 - p_t) ** self.gamma) * log_p_t
+
+        if self.weight is not None:
+            loss = self.weight.to(logits.device)[targets] * loss
+
+        return loss.mean() if self.reduction == 'mean' else loss.sum()
 
 
 def _worker_plot_training_curves(train_losses, eval_losses, train_accs,
@@ -404,8 +454,8 @@ class hsTrainer:
         
         print(f"  AdamW(lr={lr}, wd={weight_decay}) + CosineWR(T0={T_0}, Tm={T_mult})")
         
-        # Class-weighted CrossEntropyLoss
-        label_smoothing = getattr(self.config.common, 'label_smoothing', 0.1)
+        # Class-weighted Focal Loss (handles severe class imbalance better than CE)
+        focal_gamma = getattr(self.config.common, 'focal_gamma', 2.0)
         class_weights = None
         try:
             train_labels = self.dataLoader.patch_labels[
@@ -413,17 +463,20 @@ class hsTrainer:
             num_cls = self.config.clsf.num
             class_counts = np.bincount(train_labels, minlength=num_cls).astype(np.float64)
             total_samples = class_counts.sum()
-            raw_weights = total_samples / (num_cls * class_counts + 1e-8)
+            # Effective number weighting (Cui et al., CVPR 2019)
+            beta = (total_samples - 1) / total_samples
+            effective_num = 1.0 - np.power(beta, class_counts)
+            raw_weights = 1.0 / (effective_num + 1e-8)
             raw_weights = raw_weights / raw_weights.mean()
             class_weights = torch.FloatTensor(raw_weights).to(self.device)
             imbalance = class_counts.max() / (class_counts.min() + 1)
-            print(f"  Class weights: imbalance ratio {imbalance:.1f}x, {num_cls} classes")
+            print(f"  Class weights (effective-number): imbalance ratio {imbalance:.1f}x, {num_cls} classes")
         except Exception as e:
             print(f"  Warning: uniform class weights ({e})")
         
-        self.criterion = nn.CrossEntropyLoss(
-            weight=class_weights,
-            label_smoothing=label_smoothing, ignore_index=255)
+        self.criterion = FocalLoss(
+            weight=class_weights, gamma=focal_gamma, ignore_index=255)
+        print(f"  FocalLoss(gamma={focal_gamma})")
         
         # Mixed precision
         use_amp = self.config.common.use_amp and self.device.type == 'cuda'
@@ -565,8 +618,8 @@ class hsTrainer:
         
         Return:
             Tuple (``loss``, ``accuracy``, ``kappa``, ``predictions``, ``labels``)
-            When collect_extra is True, also stores self._last_probas and
-            self._last_features for consumption by the comparator.
+            When collect_extra is True, also stores self._last_probas
+            for consumption by the comparator.
         """
         # Optionally swap in EMA weights
         _ema_backup = None
@@ -579,21 +632,6 @@ class hsTrainer:
         predictions_list = []   # GPU tensors, moved to CPU at end
         targets_list = []       # GPU tensors, moved to CPU at end
         probas_list = [] if collect_extra else None
-        features_list = [] if collect_extra else None
-        
-        # hook for feature extraction (penultimate layer)
-        _feat_hook = None
-        _feat_buffer = []
-        if collect_extra:
-            # Find the layer just before the classification head
-            target_layer = None
-            for name, module in self.model.named_modules():
-                if isinstance(module, (nn.AdaptiveAvgPool1d, nn.AdaptiveAvgPool2d)):
-                    target_layer = module
-            if target_layer is not None:
-                def _hook(mod, inp, out):
-                    _feat_buffer.append(out.detach().cpu())
-                _feat_hook = target_layer.register_forward_hook(_hook)
         
         eval_loader = self.test_loader
         
@@ -632,16 +670,16 @@ class hsTrainer:
                     proba_bhwk = proba.permute(0, 2, 3, 1)  # [B, H, W, K]
                     probas_list.append(proba_bhwk[valid_mask].cpu().numpy())
         
-        if _feat_hook is not None:
-            _feat_hook.remove()
-        
         # Single GPU -> CPU transfer at the end
         predictions = torch.cat(predictions_list, dim=0).cpu().numpy()
         targets = torch.cat(targets_list, dim=0).cpu().numpy()
         
-        acc = accuracy_score(targets, predictions) * 100
+        # balanced accuracy as the primary metric.
+        acc = balanced_accuracy_score(targets, predictions) * 100
+        oa = accuracy_score(targets, predictions) * 100
         kappa = cohen_kappa_score(targets, predictions) * 100
         loss = total_loss / len(eval_loader)
+        self._last_oa = oa  # store OA for logging
         
         # Compute mIoU
         model_ref = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
@@ -653,13 +691,6 @@ class hsTrainer:
                 self._last_probas = np.concatenate(probas_list, axis=0)
             else:
                 self._last_probas = None
-            if _feat_buffer:
-                raw = torch.cat(_feat_buffer, dim=0)
-                self._last_features = raw.view(raw.size(0), -1).numpy()
-                self._last_feature_labels = targets
-            else:
-                self._last_features = None
-                self._last_feature_labels = None
         
         # Restore original weights after EMA evaluation
         if _ema_backup is not None:
@@ -706,9 +737,11 @@ class hsTrainer:
                 if hasattr(self, '_last_miou'):
                     miou_str = f' mIoU: {self._last_miou:6.2f}%'
                 
+                oa_str = f' OA: {self._last_oa:6.2f}%' if hasattr(self, '_last_oa') else ''
                 tprint(f"\n[Epoch {epoch+1:3d}] "
                       f"Train Loss: {train_loss:.4f} Acc: {train_acc:6.2f}% | "
-                      f"Test Loss: {eval_loss:.4f} Acc: {eval_acc:6.2f}% Kappa: {kappa:6.2f}%{miou_str}")
+                      f"Test Loss: {eval_loss:.4f} BA: {eval_acc:6.2f}%{oa_str} "
+                      f"Kappa: {kappa:6.2f}%{miou_str}")
                 
                 # save the best model
                 if eval_acc > self.best_acc:
@@ -721,7 +754,7 @@ class hsTrainer:
                         'kappa': kappa
                     }
                     self._save_model()
-                    tprint(f"  Best model saved (Acc: {eval_acc:.2f}%) at {os.path.join(self.output, 'models', f'{self.model_name}_best.pth')}")
+                    tprint(f"  Best model saved (BA: {eval_acc:.2f}%) at {os.path.join(self.output, 'models', f'{self.model_name}_best.pth')}")
                 else:
                     # early stopping check
                     if epoch - self.best_epoch > self.patience:
@@ -742,7 +775,7 @@ class hsTrainer:
         
         print("\n")
         tprint(f"Training completed with:")
-        print(f"  Best epoch: {self.best_epoch + 1} (Acc: {self.best_acc:.2f}%)")
+        print(f"  Best epoch: {self.best_epoch + 1} (BA: {self.best_acc:.2f}%)")
         print(f"  Total time: {training_time:.2f}s")
         print("\n")
         
@@ -757,14 +790,6 @@ class hsTrainer:
         # Store for CV aggregation (accessed before trainer is deleted)
         self._final_pred = final_pred
         self._final_target = final_target
-        
-        # measure inference time (average over a few batches)
-        self._inference_time = self._measure_inference_time()
-        
-        # parameter counts
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        self._param_counts = {'total': total_params, 'trainable': trainable_params}
         
         # single-model visualizations, skip in CV mode for aggregated plots
         if not _cv_mode:
@@ -1506,51 +1531,6 @@ class hsTrainer:
         torch.save(state_dict, model_path)
         tprint(f"  Model saved to: {model_path}")
     
-    def load_best_model(self) -> Module:
-        model_path = os.path.join(self.output, 'models', f'{self.model_name}_best.pth')
-        if os.path.exists(model_path):
-            state_dict = torch.load(model_path, map_location=self.device)
-            
-            # Handle DataParallel model loading
-            if isinstance(self.model, nn.DataParallel):
-                # Add 'module.' prefix if loading into DataParallel model
-                if not any(k.startswith('module.') for k in state_dict.keys()):
-                    state_dict = {f'module.{k}': v for k, v in state_dict.items()}
-            else:
-                # Remove 'module.' prefix if loading into non-DataParallel model
-                if any(k.startswith('module.') for k in state_dict.keys()):
-                    state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-            
-            self.model.load_state_dict(state_dict)
-            tprint(f"  Loaded best model from: {model_path}")
-        else:
-            print(f"  Warning: Model file not found: {model_path}")
-        
-        return self.model
-    
-    def predict(self, hsi: torch.Tensor) -> torch.Tensor:
-        """
-        Predict single sample/batch.
-        
-        Args:
-            hsi: Tensor [B, C, H, W] or [B, H, W, C]
-            
-        Returns:
-            Predicted dense labels [B, H, W]
-        """
-        self.model.eval()
-        
-        with torch.no_grad():
-            if hsi.dim() == 4 and hsi.shape[-1] <= 16:
-                hsi = hsi.permute(0, 3, 1, 2)
-            
-            hsi = hsi.to(self.device)
-            
-            outputs = self.model(hsi)
-            predictions = torch.argmax(outputs, dim=1)
-        
-        return predictions
-    
     def _compute_gradcam(self, x: torch.Tensor, class_idx: int) -> np.ndarray:
         """Compute Grad-CAM heatmap for model interpretability.
         
@@ -1610,33 +1590,3 @@ class hsTrainer:
             h_b.remove()
         
         return cam
-
-    def _measure_inference_time(self, num_batches: int = 10) -> float:
-        """
-        Measure average inference latency in ms per batch.
-        
-        Returns:
-            Average inference time in milliseconds.
-        """
-        self.model.eval()
-        times = []
-        try:
-            test_iter = iter(self.test_loader)
-            for _ in range(min(num_batches, len(self.test_loader))):
-                batch_data = next(test_iter)
-                hsi, _ = self._unpack_batch(batch_data)
-                hsi = hsi.to(self.device, non_blocking=True)
-                if hsi.dim() == 4 and hsi.shape[-1] <= 16:
-                    hsi = hsi.permute(0, 3, 1, 2)
-
-                if self.device.type == 'cuda':
-                    torch.cuda.synchronize()
-                t0 = time.perf_counter()
-                with torch.no_grad():
-                    _ = self.model(hsi)
-                if self.device.type == 'cuda':
-                    torch.cuda.synchronize()
-                times.append((time.perf_counter() - t0) * 1000)  # ms
-        except Exception:
-            pass
-        return float(np.mean(times)) if times else 0.0

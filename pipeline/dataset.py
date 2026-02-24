@@ -2,20 +2,18 @@
 # todo:
 # - Implement class distribution analysis and visualization methods.
 # - Try various seeds for a balanced label distribution in line 542 create_dataloader.
-import warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources.*")
+import os, re, torch, numpy as np, warnings
 
-import os, re, torch
-from datetime import datetime
-from pipeline.monitor import tprint
-
-import numpy as np
 from munch import Munch
-from torch.utils.data import Dataset
+from pipeline.monitor import tprint
 from abc import ABC, abstractmethod
 from typing import Tuple, Dict, Any, Optional, List
 from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedGroupKFold
+from torch.utils.data import Dataset, WeightedRandomSampler
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources.*")
 
 
 class AbstractHSDataset(ABC, Dataset):
@@ -50,7 +48,6 @@ class AbstractHSDataset(ABC, Dataset):
         self.transform = transform
         self.kwargs = kwargs
         self.test_rate = config.split.test_rate
-        self.pca_component = config.preprocess.pca_components
 
         # Core data structures
         self.raw_data: np.ndarray = None
@@ -216,46 +213,22 @@ class AbstractHSDataset(ABC, Dataset):
         ]
         return label_patch.copy()
 
-    def splitTrainTestDataset(self, X, y, randomState=350234):
-        """
-            Splitter for test and training dataloader.
-        """
-        X_train, X_test, y_train, y_test = train_test_split(X, y,
-                                                    test_size=self.test_rate,
-                                                    random_state=randomState,
-                                                    stratify=y)
-        # Validate split results
-        assert len(np.unique(y_train)) == len(np.unique(y)), "Training set missing some classes"
-        assert len(np.unique(y_test)) == len(np.unique(y)), "Test set missing some classes"
-    
-        return X_train, X_test, y_train, y_test
+    def _sampler_balance(self, indices: np.ndarray) -> WeightedRandomSampler:
+        """Build a weighted sampler using sqrt-inverse class frequency.
 
-    def get_dataset_info(self) -> Dict[str, Any]:
+        Sqrt-inverse provides moderate oversampling for rare classes without
+        extreme repetition that pure inverse-frequency would cause.
         """
-        Get basic information about the dataset.
-        
-        Returns:
-            Dictionary containing dataset info such as number of samples,
-            number of classes, class names, and patch size.
-        """
-        return {
-            "dataset_name": self.config.common.dataset_name,
-            "total_samples": len(self.patch_indices),
-            "test_samples": int(len(self.patch_indices) * self.test_rate),
-            "num_classes": self.num,
-            "class_names": self.targets,
-            "patch_size": self.patch_size
-        }
-
-    def get_class_distribution(self) -> Dict[int, int]:
-        """
-        Get distribution of classes in the dataset.
-        
-        Returns:
-            Dictionary mapping class indices to their counts
-        """
-        unique, counts = np.unique(self.patch_labels, return_counts=True)
-        return dict(zip(unique, counts))
+        labels = self.patch_labels[indices]
+        class_counts = np.bincount(labels, minlength=self.num).astype(np.float64)
+        class_counts = np.maximum(class_counts, 1)
+        sample_weight = 1.0 / np.sqrt(class_counts)
+        weights = sample_weight[labels]
+        return WeightedRandomSampler(
+            weights=torch.from_numpy(weights).double(),
+            num_samples=len(indices),
+            replacement=True,
+        )
 
     # Magic methods.
     def __len__(self) -> int:
@@ -455,7 +428,6 @@ class NpyHSDataset(AbstractHSDataset):
         - Manual projection in float32 avoids sklearn's internal float64 copy.
         """
         from sklearn.decomposition import PCA
-        from sklearn.preprocessing import StandardScaler
         
         tprint("Processing raw data...")
         h, w, c = self.raw_data.shape
@@ -485,7 +457,6 @@ class NpyHSDataset(AbstractHSDataset):
         # float32 subsample fit.
         n_components = self.config.preprocess.pca_components
         if n_components and n_components < c:
-            from sklearn.decomposition import PCA
             max_pca_samples = 500_000
             if n_pixels > max_pca_samples:
                 rng = np.random.RandomState(42)
@@ -517,21 +488,6 @@ class NpyHSDataset(AbstractHSDataset):
         
         # release memory 
         del flat  
-            
-    def validate_data_quality(self) -> None:
-        """Check data quality: distribution, ranges, duplicates"""
-        print("\n[Dataset Quality Check]")
-        unique_labels, counts = np.unique(self.patch_labels, return_counts=True)
-        print(f"  Class distribution: {dict(zip(unique_labels, counts))}")
-        
-        # check imbalance
-        imbalance = counts.max() / counts.min() if len(counts) > 0 else 1
-        if imbalance > 10:
-            print(f"  WARNING: Class imbalance detected (ratio: {imbalance:.1f}x)")
-        
-        # check value range
-        sample = self._get_patch(0)
-        print(f"  Data range: [{sample.min():.4f}, {sample.max():.4f}]")
     
     def create_data_loader(self, num_workers=4, batch_size=None, pin_memory=True, 
                            prefetch_factor=2, persistent_workers=False):
@@ -619,6 +575,9 @@ class NpyHSDataset(AbstractHSDataset):
         test_subset = _IndexedSubset(self, test_idx)
         print(f"Training augmentations enabled: flip, rotate, spectral noise, band dropout, cutout")
         
+        # sampler balance.
+        train_sampler = self._sampler_balance(train_idx)
+        
         # memory settings
         if batch_size is None:
             batch_size = self.batch_size if hasattr(self, 'batch_size') else 32
@@ -628,7 +587,7 @@ class NpyHSDataset(AbstractHSDataset):
         train_loader = torch.utils.data.DataLoader(
             train_subset,
             batch_size=batch_size,
-            shuffle=True,
+            sampler=train_sampler,
             num_workers=num_workers,
             pin_memory=actual_pin_memory,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
@@ -663,8 +622,8 @@ class NpyHSDataset(AbstractHSDataset):
         """
         Create K-fold cross-validation DataLoaders with patient-level grouping.
 
-        Uses ``GroupKFold`` to guarantee zero patient overlap between
-        train and test sets across all folds.
+        Uses ``StratifiedGroupKFold`` to guarantee zero patient overlap between
+        train and test sets while preserving class proportions across folds.
 
         Args:
             n_folds: Number of cross-validation folds.
@@ -672,12 +631,12 @@ class NpyHSDataset(AbstractHSDataset):
         Returns:
             List of ``(train_loader, test_loader)`` tuples, one per fold.
         """
-        from sklearn.model_selection import GroupKFold
 
         total_indices = np.arange(len(self.patch_indices))
         all_classes = set(np.unique(self.patch_labels))
 
-        gkf = GroupKFold(n_splits=n_folds)
+        sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True,
+                                    random_state=350234)
 
         if batch_size is None:
             batch_size = self.batch_size if hasattr(self, 'batch_size') else 32
@@ -686,11 +645,11 @@ class NpyHSDataset(AbstractHSDataset):
         fold_loaders = []
 
         tprint(f"\n[Cross-Validation Split] {n_folds} folds, "
-              f"patient-level GroupKFold")
+              f"patient-level StratifiedGroupKFold")
 
         for fold_idx, (train_idx, test_idx) in enumerate(
-                gkf.split(total_indices, self.patch_labels,
-                          groups=self.patch_patient_groups)):
+                sgkf.split(total_indices, self.patch_labels,
+                           groups=self.patch_patient_groups)):
 
             # Verify no patient-level leakage
             train_patients = set(self.patch_patient_groups[train_idx])
@@ -721,10 +680,13 @@ class NpyHSDataset(AbstractHSDataset):
             )
             test_subset = _IndexedSubset(self, test_idx)
 
+            # Balanced sampler per fold
+            train_sampler = self._sampler_balance(train_idx)
+
             train_loader = torch.utils.data.DataLoader(
                 train_subset,
                 batch_size=batch_size,
-                shuffle=True,
+                sampler=train_sampler,
                 num_workers=num_workers,
                 pin_memory=actual_pin_memory,
                 prefetch_factor=prefetch_factor if num_workers > 0 else None,
@@ -836,21 +798,6 @@ class MatHSDataset(AbstractHSDataset):
         # Reshape back to original spatial dimensions
         self.processed_data = pca_data.reshape(h, w, self.pca_components)
         return self.processed_data, pca
-
-    def validate_data_quality(self) -> None:
-        """Check data quality: distribution, ranges, duplicates"""
-        tprint("\n[Dataset Quality Check]")
-        unique_labels, counts = np.unique(self.patch_labels, return_counts=True)
-        print(f"  Class distribution: {dict(zip(unique_labels, counts))}")
-        
-        # Check imbalance
-        imbalance = counts.max() / counts.min() if len(counts) > 0 else 1
-        if imbalance > 10:
-            print(f"  Class imbalance detected (ratio: {imbalance:.1f}x)")
-        
-        # Check data range
-        sample = self._get_patch(0)
-        print(f"  Data range: [{sample.min():.4f}, {sample.max():.4f}]")
     
     def create_data_loader(self, num_workers=0, batch_size=None, pin_memory=True,
                            prefetch_factor=2, persistent_workers=False):
@@ -867,7 +814,6 @@ class MatHSDataset(AbstractHSDataset):
         """
         total_indices = np.arange(len(self.patch_indices))
         
-        # Stratified random split (no patient groups for .mat benchmarks)
         train_idx, test_idx = train_test_split(
             total_indices,
             test_size=self.test_rate,
@@ -875,7 +821,7 @@ class MatHSDataset(AbstractHSDataset):
             stratify=self.patch_labels
         )
         
-        # Check class coverage
+        # check class coverage
         train_classes = set(np.unique(self.patch_labels[train_idx]))
         test_classes = set(np.unique(self.patch_labels[test_idx]))
         all_classes = set(np.unique(self.patch_labels))
@@ -916,82 +862,6 @@ class MatHSDataset(AbstractHSDataset):
         print(f"Test set: {len(test_loader)} batches ({len(test_idx)} samples)")
         return train_loader, test_loader
 
-class TiffHSDataset(AbstractHSDataset):
-    """
-    Hyperspectral dataset loader for TIFF file format.
-    
-    Handles datasets stored in multi-band TIFF files, another common format
-    for hyperspectral imagery.
-    """
-    
-    def __init__(self, 
-                 data_path: str,
-                 label_path: str,
-                 num_classes: int,
-                 target_names: List[str],
-                 patch_size: int = 15,
-                 transform: Optional[Any] = None,
-                 spectral_subset: Optional[List[int]] = None,** kwargs: Any) -> None:
-        """
-        Initialize a TIFF format hyperspectral dataset.
-        
-        Args:
-            spectral_subset: Optional list of band indices to select
-            See parent class for other parameters
-        """
-        self.spectral_subset = spectral_subset
-        super().__init__(data_path, label_path, num_classes, target_names, 
-                         patch_size, transform, **kwargs)
-
-    def _load_data(self) -> None:
-        """Load data from TIFF files using rasterio"""
-        try:
-            import rasterio
-        except ImportError:
-            raise ImportError("rasterio is required for TIFF datasets. Install with: pip install rasterio")
-        
-        try:
-            # Load hyperspectral data (multi-band TIFF)
-            with rasterio.open(self.data_path) as src:
-                # Read all bands (C, H, W)
-                data = src.read()
-                # Transpose to (H, W, C) format
-                self.raw_data = np.transpose(data, (1, 2, 0))
-                
-            # Load label data (single-band TIFF)
-            with rasterio.open(self.label_path) as src:
-                # Read label band and squeeze to (H, W)
-                self.raw_labels = src.read(1).squeeze()
-                
-            tprint(f"Loaded TIFF data: {self.raw_data.shape}, labels: {self.raw_labels.shape}")
-            
-        except Exception as e:
-            raise RuntimeError(f"Error loading TIFF files: {e}")
-
-    def _preprocess_data(self) -> None:
-        """
-        Preprocess data with band selection and normalization.
-        """
-        from sklearn.preprocessing import StandardScaler
-        tprint("Preprocessing TIFF data: band selection and normalization...")
-        
-        # Select specific spectral bands if requested
-        if self.spectral_subset is not None:
-            self.processed_data = self.raw_data[..., self.spectral_subset]
-            print(f"Selected spectral bands: {self.spectral_subset}")
-        else:
-            self.processed_data = self.raw_data.copy()
-        
-        # Normalize each band to zero mean and unit variance
-        h, w, c = self.processed_data.shape
-        flat_data = self.processed_data.reshape(-1, c)
-        
-        scaler = StandardScaler()
-        scaled_data = scaler.fit_transform(flat_data)
-        
-        self.processed_data = scaled_data.reshape(h, w, c)
-        print(f"Preprocessed data shape: {self.processed_data.shape}")
-
 class _IndexedSubset(Dataset):
     """
     indexed subset wrapper class.
@@ -1013,7 +883,7 @@ class _AugmentedSubset(Dataset):
     Training-only subset with on-the-fly spatial & spectral augmentations.
     
     Augmentations applied (all random, each with 50% probability):
-      - Spatial: horizontal flip, vertical flip, 90°/180°/270° rotation
+      - Spatial: horizontal flip, vertical flip, 90/180/270 deg. rotation
       - Spectral: Gaussian noise, band-wise dropout (zero out random bands)
       - Mixup-style: CutOut (mask random spatial region)
     
@@ -1039,37 +909,35 @@ class _AugmentedSubset(Dataset):
         patch = self.dataset._get_patch(original_idx)      # (H, W, C)
         label = self.dataset._get_label_patch(original_idx) # (H, W)
         
-        # --- Spatial augmentations (applied to both patch and label) ---
-        # Horizontal flip
+        # horizontal flip
         if np.random.rand() > 0.5:
             patch = np.flip(patch, axis=1).copy()
             label = np.flip(label, axis=1).copy()
         
-        # Vertical flip
+        # vertical flip
         if np.random.rand() > 0.5:
             patch = np.flip(patch, axis=0).copy()
             label = np.flip(label, axis=0).copy()
         
-        # Random 90° rotation
+        # random 90 rotation
         if np.random.rand() > 0.5:
             k = np.random.choice([1, 2, 3])
             patch = np.rot90(patch, k, axes=(0, 1)).copy()
             label = np.rot90(label, k, axes=(0, 1)).copy()
         
-        # --- Spectral augmentations (patch only) ---
-        # Gaussian noise
+        # gaussian noise
         if self.noise_std > 0 and np.random.rand() > 0.5:
             noise = np.random.normal(0, self.noise_std, patch.shape).astype(patch.dtype)
             patch = patch + noise
         
-        # Random band dropout (zero out a few spectral bands)
+        # random band dropout (zero out a few spectral bands)
         if self.band_drop_rate > 0 and np.random.rand() > 0.5:
             n_bands = patch.shape[2]
             n_drop = max(1, int(n_bands * self.band_drop_rate))
             drop_idx = np.random.choice(n_bands, n_drop, replace=False)
             patch[:, :, drop_idx] = 0.0
         
-        # --- Spatial CutOut (mask a random rectangular region) ---
+        # dpatial cutout, mask a random rectangular region
         if self.cutout_ratio > 0 and np.random.rand() > 0.3:
             h, w = patch.shape[:2]
             ch = max(1, int(h * self.cutout_ratio))
@@ -1080,98 +948,10 @@ class _AugmentedSubset(Dataset):
             # Mark cutout region as ignore in labels
             label[y0:y0+ch, x0:x0+cw] = 255
         
-        # Convert to (C, H, W) tensor
+        # convert to (C, H, W) tensor
         patch = np.transpose(patch, (2, 0, 1))
         
         if self.dataset.transform:
             patch = self.dataset.transform(patch)
         
         return torch.FloatTensor(patch), torch.LongTensor(label)
-
-class container:
-    """
-    A simple container for temporary storage with deferred tensor conversion.
-    
-    Note: 
-    magic method ``__len__``, ``__getitem__``
-    is needed for such classes.
-    """
-    def __init__(self, hyperspectral_data, labels):
-        self.hyperspectral_data = hyperspectral_data  # Already (N, C, H, W)
-        self.labels = labels
-
-    def __len__(self):
-        return len(self.hyperspectral_data)
-    
-    def __getitem__(self, idx):
-        # Get data (already in correct shape from create_data_loader)
-        hyperspectral = self.hyperspectral_data[idx]  # Shape: (C, H, W) - already transposed
-        
-        # Convert to tensor directly
-        hyperspectral_tensor = torch.FloatTensor(hyperspectral)
-        
-        # Create pretrained input (RGB-like from 15 bands)
-        if hyperspectral.shape[0] == 15:  # (15, H, W)
-            # Select 3 representative bands
-            r_band = hyperspectral[0]   # First band as red
-            g_band = hyperspectral[7]   # Middle band as green  
-            b_band = hyperspectral[14]  # Last band as blue
-            
-            # Stack to create RGB image
-            rgb = np.stack([r_band, g_band, b_band], axis=0)  # (3, H, W)
-            
-            # Normalize to [0, 1] range
-            rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8)
-            
-            # Convert to tensor
-            pretrained_input = torch.FloatTensor(rgb)
-            
-            # Resize from 15x15 to 224x224 for pretrained model
-            pretrained_input = torch.nn.functional.interpolate(
-                pretrained_input.unsqueeze(0),  # Add batch dimension
-                size=(224, 224), 
-                mode='bilinear', 
-                align_corners=False
-            ).squeeze(0)  # Remove batch dimension
-        else:
-            # Fallback: use first 3 channels
-            pretrained_input = torch.FloatTensor(hyperspectral[:3].copy())
-            
-            # Resize to 224x224
-            pretrained_input = torch.nn.functional.interpolate(
-                pretrained_input.unsqueeze(0),
-                size=(224, 224),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(0)
-        
-        # Get label
-        label = self.labels[idx]
-        
-        return hyperspectral_tensor, pretrained_input, torch.LongTensor([label]).squeeze()
-    
-if __name__ == "__main__":
-        """
-        test dataset functionalities with .mat format data.
-        """
-        
-        from config import load_config
-        config = load_config()
-        # dataset = MatHSDataset(config=config)
-        # train_loader, test_loader = dataset.create_data_loader(num_workers=0)
-        
-        # # Print dataset info
-        # pca_components = config.preprocess.pca_components
-        # print(f"Dataset loaded with {len(train_loader.dataset)} training samples and {len(test_loader.dataset)} test samples")
-        # print(f"Patch size: {config.split.patch_size}x{config.split.patch_size}")
-        # print(f"Number of classes: {dataset.num}")
-        # print(f"Class distribution in training set: {dataset.get_class_distribution()}")
-        # print(f"Class distribution in test set: {dataset.get_class_distribution()}")
-        
-        # # Print sample shapes
-        # sample_hyperspectral, sample_pretrained_input, sample_label = train_loader.dataset[0]
-        # print(f"Sample hyperspectral data shape: {sample_hyperspectral.shape}")
-        
-        # print(f"Sample pretrained input shape: {sample_pretrained_input.shape}")
-        # print(f"Sample label: {sample_label.item()}")
-    
