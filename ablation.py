@@ -1,6 +1,8 @@
 """
 ablation.py - Automated ablation experiment for model structure reduction.
-
+Usage:
+    python ablation.py -e <epoch> -m <model> -t <tag> (-s / -a)
+e.g.:
     python ablation.py -e 4 -m common -t mini
 
 Progressively reduces model structure (dim, depths, mlp_ratio, LoRA rank)
@@ -1009,6 +1011,7 @@ def main():
                              'Runs 1 epoch, 2-fold CV, tiny model. Finishes in <60s.')
     parser.add_argument('--analyze_dataset', '-a', action='store_true',
                         help='Analyze dataset distribution and generate plots.')
+
 
     args = parser.parse_args()
 
