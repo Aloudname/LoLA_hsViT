@@ -27,7 +27,7 @@ split:
   patch_size: 15  # Pixel size of image patches.
   eval_batch_size: 1024  # Smaller eval batch size for CPU training
 preprocess:
-  pca_components: 15  # Number of PCA components to retain.
+  pca_components: 31  # Number of PCA components to retain.
 memory:
   pin_memory: true  # true is faster but may cause memoleak in distant server.
   num_workers: 4  # Workers on single GPU. More memory usage to accelerate data loading.

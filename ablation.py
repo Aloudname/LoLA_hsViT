@@ -17,6 +17,7 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources
 import numpy as np
 import matplotlib.pyplot as plt
 import os, gc, json, time, torch, argparse
+from datetime import datetime
 
 from config import load_config
 from model import LoLA_hsViT, CommonViT
@@ -39,6 +40,9 @@ class AblationConfig:
     drop_path_rate: float = 0.2
     r: int = 16                       # LoRA rank (LoLA_hsViT only)
     lora_alpha: int = 32              # LoRA alpha (LoLA_hsViT only)
+    in_channels: int = 31             # must match preprocess.pca_components in config.yaml
+    spatial_size: int = 31            # must match split.patch_size in config.yaml
+    num_classes: int = 8              # must match clsf.num in config.yaml
 
     @property
     def run_name(self) -> str:
@@ -57,15 +61,15 @@ class AblationConfig:
     def build_model_fn(self):
         """Return a callable that constructs the model."""
         kwargs = dict(
-            in_channels=15,   # from config.yaml: pca_components
-            num_classes=8,     # from config.yaml: clsf.num (8 tissue classes, BG excluded)
+            in_channels=self.in_channels,    # synced from config.preprocess.pca_components
+            num_classes=self.num_classes,     # synced from config.clsf.num
             dim=self.dim,
             depths=self.depths,
             num_heads=self.num_heads,
             window_size=self.window_size[:len(self.depths)],
             mlp_ratio=self.mlp_ratio,
             drop_path_rate=self.drop_path_rate,
-            spatial_size=15,   # from config.yaml: patch_size
+            spatial_size=self.spatial_size,   # synced from config.split.patch_size
             r=self.r,
             lora_alpha=self.lora_alpha,
         )
@@ -188,9 +192,15 @@ class AblationRunner:
         self.results: List[AblationResult] = []
         self.results_file = os.path.join(self.summary_dir, "ablation_results.json")
 
-        # Load previous results if resuming
+        # load previous results if resuming
         if resume_idx > 0 and os.path.exists(self.results_file):
             self._load_results()
+
+    def _sync_cfg(self, cfg: AblationConfig) -> None:
+        """sync ablation config fields with base config values."""
+        cfg.in_channels = self.base_config.preprocess.pca_components
+        cfg.spatial_size = self.base_config.split.patch_size
+        cfg.num_classes = self.base_config.clsf.num
 
     def dry_run(self, configs: List[AblationConfig]) -> None:
         """Print parameter counts for all configs without training."""
@@ -199,6 +209,7 @@ class AblationRunner:
               f"{'mlp':>4} {'r':>3} {'Total Params':>14} {'Trainable':>14}")
 
         for i, cfg in enumerate(configs):
+            self._sync_cfg(cfg)
             total, trainable = cfg.count_params()
             depths_str = str(cfg.depths)
             r_str = str(cfg.r) if cfg.model_type == "LoLA_hsViT" else "-"
@@ -226,6 +237,9 @@ class AblationRunner:
         tprint()  # finish the line
 
         try:
+            # sync model shape params from base config (avoids hardcoded mismatch)
+            self._sync_cfg(cfg)
+
             # Param counts (lightweight dry-run, no GPU needed)
             total_params, trainable_params = cfg.count_params()
 

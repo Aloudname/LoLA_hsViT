@@ -281,14 +281,29 @@ class NpyHSDataset(AbstractHSDataset):
                  transform: Optional[Any] = None,
                   **kwargs: Any) -> None:
         """
-        Initialize a NumPy format hyperspectral dataset.
-        
-        See parent class for parameters.
+        per-patient pipeline: loads each patient independently to avoid
+        cross-patient patch contamination and zero-padding noise in pca.
+
+        bypasses AbstractHSDataset.__init__ which concatenates all patients
+        into one image, causing boundary artifacts and polluted statistics.
         """
-        super().__init__(config, transform, **kwargs)
+        # initialize torch Dataset directly (skip abstract concat pipeline)
+        Dataset.__init__(self)
+
+        # replicate base attributes from AbstractHSDataset.__init__
+        self.config = config
         self.data_path = config.path.data
-        # Assign patient groups after patches are created (by super().__init__)
-        self._assign_patient_groups()
+        self.label_path = config.path.label
+        self.num = config.clsf.num
+        self.targets = config.clsf.targets
+        self.patch_size = config.split.patch_size
+        self.margin = (config.split.patch_size - 1) // 2
+        self.transform = transform
+        self.kwargs = kwargs
+        self.test_rate = config.split.test_rate
+
+        # per-patient pipeline (replaces _load_data + _preprocess_data + _create_patches)
+        self._per_patient_pipeline()
     
     @staticmethod
     def _extract_patient_id(filepath: str) -> str:
@@ -305,37 +320,222 @@ class NpyHSDataset(AbstractHSDataset):
         # Fallback: use basename without extension
         return os.path.splitext(basename)[0].lower()
     
-    def _assign_patient_groups(self) -> None:
+    def _per_patient_pipeline(self) -> None:
         """
-        Assign patient group index to each patch based on row position.
-        
-        Uses row ranges recorded during _load_data() to map each patch's
-        spatial position to its source patient, enabling patient-level
-        train/test splitting to prevent data leakage.
+        load, normalize, pca, and extract patches per-patient independently.
+
+        fixes two critical bugs in the old concatenation approach:
+          1. patches at patient boundaries mixed tissues from different patients
+          2. zero-padding from width alignment polluted normalization/pca stats
+
+        pipeline:
+          phase 1: load all patients, collect real (non-bg) pixels for global stats
+          phase 2: fit global normalization + pca on real pixels only
+          phase 3: per-patient: normalize -> pca -> pad -> extract patches
+          phase 4: concatenate patches from all patients
         """
-        # Build a row-to-patient lookup array
-        # Derive total_rows from _patient_row_ranges (raw_data may already be freed)
-        total_rows = max(end for _, end, _ in self._patient_row_ranges)
-        row_to_patient = np.full(total_rows, -1, dtype=np.int32)
-        for row_start, row_end, pid_idx in self._patient_row_ranges:
-            row_to_patient[row_start:row_end] = pid_idx
-        
-        # Map each patch to its patient group
-        # patch_indices stores (r, c) in padded coordinates; original row = r - margin
-        orig_rows = self.patch_indices[:, 0] - self.margin
-        self.patch_patient_groups = row_to_patient[orig_rows]
-        
-        # Sanity check
-        assert np.all(self.patch_patient_groups >= 0), \
-            "Some patches could not be assigned to a patient group"
-        
-        # Print patient-level statistics
-        unique_groups, group_counts = np.unique(self.patch_patient_groups, return_counts=True)
-        print(f"Patient-level grouping: {len(unique_groups)} patients, "
-              f"patches per patient: min={group_counts.min()}, max={group_counts.max()}, "
-              f"mean={group_counts.mean():.0f}")
-    
-    
+        from sklearn.decomposition import PCA
+
+        pairs = self._pair_data_and_labels()
+        if not pairs:
+            raise RuntimeError("no data/label pairs found in " + self.data_path)
+
+        # --- phase 1: load all patients separately, collect real pixels ---
+        tprint("phase 1: loading patients independently...")
+        patient_records = []   # list of (data, labels, pid_idx)
+        all_real_pixels = []   # real (non-background) pixels for global fitting
+        _patient_id_map = {}
+
+        for idx, (data_file, label_file) in enumerate(pairs):
+            data = np.load(data_file).astype(np.float32)    # shape: (h_i, w_i, c)
+            labels = np.load(label_file).astype(np.int32)    # shape: (h_i, w_i)
+
+            if data.shape[:2] != labels.shape[:2]:
+                raise ValueError(
+                    f"shape mismatch: {data_file} {data.shape[:2]} "
+                    f"vs {labels.shape[:2]}")
+
+            # validate finite values
+            if not np.isfinite(data).all():
+                raise ValueError(f"non-finite values in {data_file}")
+
+            patient_id = self._extract_patient_id(data_file)
+            if patient_id not in _patient_id_map:
+                _patient_id_map[patient_id] = len(_patient_id_map)
+            pid_idx = _patient_id_map[patient_id]
+
+            patient_records.append((data, labels, pid_idx))
+
+            # collect only real (labeled) pixels — shape: (n_real_i, c)
+            mask = labels.reshape(-1) > 0
+            real_px = data.reshape(-1, data.shape[2])[mask]
+            all_real_pixels.append(real_px)
+
+            tprint(f"  loaded {idx+1}/{len(pairs)}: "
+                   f"{os.path.basename(data_file)} ({patient_id}), "
+                   f"shape {data.shape}, real pixels: {mask.sum():,}")
+
+        self._patient_names = {v: k for k, v in _patient_id_map.items()}
+        self._num_patients = len(_patient_id_map)
+        tprint(f"  {len(pairs)} pairs, {self._num_patients} unique patients")
+
+        # --- phase 2: fit normalization + pca on real pixels only ---
+        # excludes background and zero-padding → cleaner statistics
+        tprint("phase 2: fitting normalization + pca on real pixels only...")
+        all_real = np.concatenate(all_real_pixels, axis=0)   # shape: (n_total_real, c)
+        del all_real_pixels
+        c = all_real.shape[1]
+
+        # subsample for fitting if too many pixels
+        max_fit = 500_000
+        if len(all_real) > max_fit:
+            rng = np.random.RandomState(350235)
+            fit_idx = rng.choice(len(all_real), max_fit, replace=False)
+            fit_data = all_real[fit_idx]   # shape: (max_fit, c)
+        else:
+            fit_data = all_real
+
+        # global normalization stats — fit on real pixels only
+        global_mean = fit_data.mean(axis=0).astype(np.float32)       # shape: (c,)
+        global_std  = fit_data.std(axis=0).astype(np.float32) + 1e-8 # shape: (c,)
+        tprint(f"  normalization fit on {len(fit_data):,} / {len(all_real):,} real pixels")
+
+        # pca — fit on normalized real pixels only
+        n_components = self.config.preprocess.pca_components
+        pca_obj = None
+        if n_components and n_components < c:
+            normalized_fit = (fit_data - global_mean) / global_std
+            max_pca = 500_000
+            if len(normalized_fit) > max_pca:
+                rng = np.random.RandomState(42)
+                pca_idx = rng.choice(len(normalized_fit), max_pca, replace=False)
+                pca_fit = normalized_fit[pca_idx]
+            else:
+                pca_fit = normalized_fit
+
+            pca_obj = PCA(n_components=n_components, svd_solver='randomized',
+                          random_state=350234)
+            pca_obj.fit(pca_fit)
+            explained = sum(pca_obj.explained_variance_ratio_) * 100
+            tprint(f"  pca: {c} -> {n_components} channels, "
+                   f"explained variance: {explained:.1f}%, "
+                   f"fit on {len(pca_fit):,} pixels")
+            del normalized_fit, pca_fit
+
+        del all_real, fit_data
+
+        # pre-compute pca projection matrix in float32
+        if pca_obj is not None:
+            pca_components = pca_obj.components_.astype(np.float32)  # shape: (n_components, c)
+            pca_mean = pca_obj.mean_.astype(np.float32)              # shape: (c,)
+            c_out = n_components
+        else:
+            pca_components = None
+            pca_mean = None
+            c_out = c
+
+        # --- phase 3: per-patient normalize -> pca -> pad -> extract patches ---
+        # each patient is padded independently: no cross-patient boundary bleeding
+        tprint("phase 3: per-patient patching (no cross-patient boundaries)...")
+        self._patient_padded_data   = []  # list of padded arrays per patient
+        self._patient_padded_labels = []  # list of padded label maps per patient
+
+        all_patch_indices   = []  # each row: (patient_list_idx, row_padded, col_padded)
+        all_patch_labels    = []  # 0-based center-pixel label
+        all_patient_groups  = []  # patient group id for each patch
+
+        for data, labels, pid_idx in patient_records:
+            h, w, c_raw = data.shape                     # per-patient: (h_i, w_i, c)
+            flat = data.reshape(-1, c_raw)               # shape: (h_i * w_i, c)
+
+            # normalize using global stats (fit on real pixels only)
+            flat = (flat - global_mean) / global_std
+
+            # pca projection
+            if pca_components is not None:
+                flat = (flat - pca_mean) @ pca_components.T  # shape: (h_i*w_i, n_components)
+
+            processed = flat.reshape(h, w, c_out)        # shape: (h_i, w_i, c_out)
+
+            # pad this patient independently — no cross-patient bleeding
+            padded_data = self._pad_with_zeros(processed, self.margin)
+            # padded shape: (h_i + 2*margin, w_i + 2*margin, c_out)
+
+            # pad labels: background / padding -> 255 (ignore_index)
+            padded_lbl = np.full(
+                (h + 2 * self.margin, w + 2 * self.margin),
+                fill_value=255, dtype=np.int32
+            )  # shape: (h_i + 2*margin, w_i + 2*margin)
+            lbl_region = labels.copy().astype(np.int32)
+            lbl_region[lbl_region > 0] -= 1    # 1-based -> 0-based class index
+            lbl_region[labels == 0] = 255      # background -> ignore
+            padded_lbl[self.margin:self.margin + h,
+                       self.margin:self.margin + w] = lbl_region
+
+            patient_list_idx = len(self._patient_padded_data)
+            self._patient_padded_data.append(padded_data)
+            self._patient_padded_labels.append(padded_lbl)
+
+            # extract patch centers: only non-background pixels
+            rows, cols = np.where(labels > 0)
+            n_patches = len(rows)
+
+            # patch_indices: (patient_list_idx, row_in_padded, col_in_padded)
+            indices = np.stack([
+                np.full(n_patches, patient_list_idx, dtype=np.int32),
+                (rows + self.margin).astype(np.int32),
+                (cols + self.margin).astype(np.int32),
+            ], axis=1)   # shape: (n_patches, 3)
+
+            patch_labels = (labels[rows, cols] - 1).astype(np.int32)   # shape: (n_patches,)
+            patient_groups = np.full(n_patches, pid_idx, dtype=np.int32)
+
+            all_patch_indices.append(indices)
+            all_patch_labels.append(patch_labels)
+            all_patient_groups.append(patient_groups)
+
+            del data, labels, flat, processed
+
+        # --- phase 4: concatenate ---
+        self.patch_indices = np.concatenate(all_patch_indices, axis=0)          # shape: (N, 3)
+        self.patch_labels = np.concatenate(all_patch_labels, axis=0)            # shape: (N,)
+        self.patch_patient_groups = np.concatenate(all_patient_groups, axis=0)  # shape: (N,)
+
+        unique_groups, group_counts = np.unique(
+            self.patch_patient_groups, return_counts=True)
+        tprint(f"  total patches: {len(self.patch_indices):,} from "
+               f"{len(unique_groups)} patients")
+        print(f"  patches per patient: min={group_counts.min()}, "
+              f"max={group_counts.max()}, mean={group_counts.mean():.0f}")
+        print(f"  patch shape: ({self.patch_size}, {self.patch_size}, {c_out}), "
+              f"dtype: float32")
+
+    def _get_patch(self, idx: int) -> np.ndarray:
+        """
+        get a single patch from per-patient padded data.
+        patch_indices[idx] = (patient_list_idx, row_padded, col_padded).
+        returns: np.ndarray of shape (patch_size, patch_size, c_out).
+        """
+        p, r, c = self.patch_indices[idx]
+        padded = self._patient_padded_data[p]
+        return padded[
+            r - self.margin : r + self.margin + 1,
+            c - self.margin : c + self.margin + 1,
+            :
+        ].copy()
+
+    def _get_label_patch(self, idx: int) -> np.ndarray:
+        """
+        get dense label patch for segmentation.
+        returns: np.ndarray of shape (patch_size, patch_size), 255 = ignore.
+        """
+        p, r, c = self.patch_indices[idx]
+        padded = self._patient_padded_labels[p]
+        return padded[
+            r - self.margin : r + self.margin + 1,
+            c - self.margin : c + self.margin + 1
+        ].copy()
+
     def _pair_data_and_labels(self) -> List[Tuple[str, str]]:
         """
         Pair data and label files based on naming convention.
@@ -361,133 +561,12 @@ class NpyHSDataset(AbstractHSDataset):
         return pairs
     
     def _load_data(self) -> None:
-        """Load data from .npy files with memory-efficient approach"""
-        pairs = self._pair_data_and_labels()
-        
-        # calculate total shape
-        total_h, total_w = 0, 0
-        for data_file, label_file in pairs:
-            data = np.load(data_file, mmap_mode='r')  # read only metadata.
-            total_h += data.shape[0]
-            total_w = max(total_w, data.shape[1])
-            c = data.shape[2]
-        
-        print(f"Detected concatenation shape: ({total_h}, {total_w}, {c})")
-        
-        # allocate once and fill
-        self.raw_data = np.zeros((total_h, total_w, c), dtype=np.float32)
-        self.raw_labels = np.zeros((total_h, total_w), dtype=np.int32)
-        
-        # track patient for group splitting
-        self._patient_row_ranges = []  # List [row_start, row_end, patient_group_idx]
-        _patient_id_map = {}  # patient_name -> group index
-        
-        row_offset = 0
-        for idx, (data_file, label_file) in enumerate(pairs):
-            data = np.load(data_file)
-            labels = np.load(label_file)
-            
-            h, w = data.shape[:2]
-            # Validate shapes
-            if data.shape[:2] != labels.shape[:2]:
-                raise ValueError(f"Shape mismatch between {data_file} and {label_file}")
-            
-            patient_id = self._extract_patient_id(data_file)
-            if patient_id not in _patient_id_map:
-                _patient_id_map[patient_id] = len(_patient_id_map)
-            pid_idx = _patient_id_map[patient_id]
-            self._patient_row_ranges.append((row_offset, row_offset + h, pid_idx))
-            
-            # fill allocated arrays
-            self.raw_data[row_offset:row_offset+h, :w, :] = data
-            self.raw_labels[row_offset:row_offset+h, :w] = labels
-            row_offset += h
-            
-            tprint(f"  Loaded pair {idx+1}/{len(pairs)}: {data_file.split('/')[-1]} (patient: {patient_id})")
-            
-            # free memory
-            del data, labels
-        
-        self._patient_names = {v: k for k, v in _patient_id_map.items()}
-        self._num_patients = len(_patient_id_map)
-        
-        print(f"  Loaded {len(pairs)} pairs of .npy files")
-        print(f"  Identified {self._num_patients} unique patients")
-        print(f"  Concatenated data shape: {self.raw_data.shape}, labels shape: {self.raw_labels.shape}")
+        """legacy stub — kept for abc compliance. see _per_patient_pipeline()."""
+        pass
         
     def _preprocess_data(self) -> None:
-        """
-        Preprocess data with normalization and optional PCA.
-        
-        OPTIMIZATION:
-        - Global StandardScaler for consistent normalization.
-        - Random SVD: O(n*k^2) instead of full SVD O(n*c^2), ideal when
-          n_components(15) << n_features(64).
-        - Subsampled fit: fit PCA on a random subsample of pixels (max 500k),
-          then project all pixels. Spatial correlation makes this near-lossless.
-        - Manual projection in float32 avoids sklearn's internal float64 copy.
-        """
-        from sklearn.decomposition import PCA
-        
-        tprint("Processing raw data...")
-        h, w, c = self.raw_data.shape
-        flat = self.raw_data.reshape(-1, c).astype(np.float32)
-        n_pixels = flat.shape[0]
-        print("Reshaped to (n_pixels, n_channels):", flat.shape)
-        
-        del self.raw_data  # free memory
-
-        tprint("Batching for StandardScaler fit...")
-        max_fit_samples = 500_000
-        if n_pixels > max_fit_samples:
-            rng = np.random.RandomState(350235)
-            fit_idx = rng.choice(n_pixels, max_fit_samples, replace=False)
-            fit_data = flat[fit_idx]
-        else:
-            fit_data = flat
-            
-        mean = fit_data.mean(axis=0)           # (c,) float32
-        std = fit_data.std(axis=0) + 1e-8      # (c,) float32, avoid div-by-zero
-        flat = (flat - mean) / std             # in-place normalization float32
-            
-        # global normalization
-        tprint(f"  StandardScaler fit on {len(fit_data):,} / {n_pixels:,} pixels.")
-        
-        # PCA
-        # float32 subsample fit.
-        n_components = self.config.preprocess.pca_components
-        if n_components and n_components < c:
-            max_pca_samples = 500_000
-            if n_pixels > max_pca_samples:
-                rng = np.random.RandomState(42)
-                pca_idx = rng.choice(n_pixels, max_pca_samples, replace=False)
-                pca_fit_data = flat[pca_idx]
-            else:
-                pca_fit_data = flat
-
-            pca = PCA(n_components=n_components, svd_solver='randomized', random_state=350234)
-            pca.fit(pca_fit_data)
-
-            # Manual transform in float32 (avoid sklearn's float64 cast)
-            components = pca.components_.astype(np.float32)   # (n_components, c)
-            pca_mean = pca.mean_.astype(np.float32)           # (c,)
-            flat = (flat - pca_mean) @ components.T            # (n_pixels, n_components) float32
-
-            explained = sum(pca.explained_variance_ratio_) * 100
-            tprint(f"  Conducted PCA: {c} -> {n_components} channels, "
-                   f"explained variance: {explained:.1f}%, "
-                   f"fit on {len(pca_fit_data):,} pixels")
-            c = n_components
-
-            self.processed_data = flat.reshape(h, w, c)
-            print(f"  Final shape: {self.processed_data.shape}, dtype: {self.processed_data.dtype}")
-            del fit_data, pca_fit_data, components, mean, pca_mean  # free memory
-        else:
-            self.processed_data = flat.reshape(h, w, c)
-            print("  PCA not applied, using all original components")
-        
-        # release memory 
-        del flat  
+        """legacy stub — kept for abc compliance. see _per_patient_pipeline()."""
+        pass
     
     def create_data_loader(self, num_workers=4, batch_size=None, pin_memory=True, 
                            prefetch_factor=2, persistent_workers=False):
@@ -937,8 +1016,8 @@ class _AugmentedSubset(Dataset):
             drop_idx = np.random.choice(n_bands, n_drop, replace=False)
             patch[:, :, drop_idx] = 0.0
         
-        # dpatial cutout, mask a random rectangular region
-        if self.cutout_ratio > 0 and np.random.rand() > 0.3:
+        # spatial cutout — reduced from 70% to 30% to preserve more supervision signal
+        if self.cutout_ratio > 0 and np.random.rand() > 0.7:
             h, w = patch.shape[:2]
             ch = max(1, int(h * self.cutout_ratio))
             cw = max(1, int(w * self.cutout_ratio))
