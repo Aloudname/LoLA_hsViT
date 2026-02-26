@@ -169,7 +169,10 @@ def _worker_plot_roc_curves(roc_data, num_classes, class_names,
         return
     fig, ax = plt.subplots(figsize=(8, 7))
     for cls_i in range(num_classes):
-        fpr, tpr, roc_auc = roc_data[cls_i]
+        entry = roc_data[cls_i]
+        if entry is None:
+            continue   # class absent from sampled ROC set
+        fpr, tpr, roc_auc = entry
         ax.plot(fpr, tpr, label=f'{class_names[cls_i]} (AUC={roc_auc:.3f})', linewidth=1.3)
     ax.plot([0, 1], [0, 1], 'k--', alpha=0.4)
     ax.set_xlabel('False Positive Rate'); ax.set_ylabel('True Positive Rate')
@@ -665,9 +668,14 @@ class hsTrainer:
         # collect_extra: per-pixel arrays needed for final plots & ROC curves only
         predictions_list = [] if collect_extra else None
         targets_list     = [] if collect_extra else None
-        probas_list      = [] if collect_extra else None
+        probas_list      = [] if collect_extra else None   # sub-sampled; see roc_per_batch
+        roc_targets_list = [] if collect_extra else None   # targets paired with sub-sampled probas
 
         eval_loader = self.test_loader
+        # ROC sub-sampling budget: keep ≤2M pixels total (~1350 per batch for typical test set).
+        # ROC AUC is statistically stable with ≥1M samples; this avoids the 14 GB y_onehot
+        # allocation and the 4.4B-iteration Python loop in _save_all_plots.
+        roc_per_batch = max(256, 2_000_000 // max(len(eval_loader), 1)) if collect_extra else 0
         pbar = tqdm(eval_loader, desc='Evaluating', leave=False)
 
         with torch.no_grad():
@@ -707,9 +715,18 @@ class hsTrainer:
                 if collect_extra:
                     predictions_list.append(pred_valid)   # stays on GPU
                     targets_list.append(tgt_valid)        # stays on GPU
-                    proba = outputs.softmax(dim=1)           # [B, K, H, W]
-                    proba_bhwk = proba.permute(0, 2, 3, 1)  # [B, H, W, K]
-                    probas_list.append(proba_bhwk[valid_mask].cpu().numpy())
+                    # Sub-sample probas: keep at most roc_per_batch valid pixels per batch.
+                    # Avoids storing all 4.4B×8-class float32 (~14 GB) in host RAM.
+                    proba = outputs.softmax(dim=1)                       # [B, K, H, W]
+                    proba_valid = proba.permute(0, 2, 3, 1)[valid_mask]  # [n_v, K]
+                    n_v = proba_valid.shape[0]
+                    if n_v > roc_per_batch:
+                        sel = torch.randperm(n_v, device=self.device)[:roc_per_batch]
+                        probas_list.append(proba_valid[sel].cpu().numpy())
+                        roc_targets_list.append(tgt_valid[sel].cpu().numpy())
+                    else:
+                        probas_list.append(proba_valid.cpu().numpy())
+                        roc_targets_list.append(tgt_valid.cpu().numpy())
 
         cm_np    = cm_gpu.cpu().numpy().astype(np.int64)   # shape (C, C)
         row_sums = cm_np.sum(axis=1)                       # actual count per class
@@ -751,9 +768,11 @@ class hsTrainer:
             predictions = torch.cat(predictions_list, dim=0).cpu().numpy()
             targets     = torch.cat(targets_list,     dim=0).cpu().numpy()
             if probas_list:
-                self._last_probas = np.concatenate(probas_list, axis=0)
+                self._last_probas         = np.concatenate(probas_list, axis=0)
+                self._last_probas_targets = np.concatenate(roc_targets_list, axis=0)
             else:
-                self._last_probas = None
+                self._last_probas         = None
+                self._last_probas_targets = None
         else:
             # epoch-level eval: callers only use scalar metrics
             predictions = np.empty(0, dtype=np.int64)
@@ -1429,7 +1448,7 @@ class hsTrainer:
         class_names = list(self.config.clsf.targets[:num_classes])
         probas = getattr(self, '_last_probas', None)
 
-        # --- pre-compute heavy metrics in main process (avoids pickle of huge arrays) ---
+        # pre-compute heavy metrics in main process (avoids pickle of huge arrays)
         tprint("  pre-computing plot metrics in main process...")
         t_pre = time.perf_counter()
 
@@ -1449,16 +1468,22 @@ class hsTrainer:
                 f"{name}: P={precision[i]:.4f}, R={recall[i]:.4f}, F1={f1[i]:.4f}")
         metrics_text = '\n'.join(report_lines) + '\n'
 
-        # roc curves — list of (fpr, tpr, auc_val) per class, ~200 points each
+        # roc curves — list of (fpr, tpr, auc_val) per class, ~200 points each.
+        # probas is already sub-sampled to ~2M pixels (done in evaluate()).
+        # Per-class binary label avoids:
+        #   (a) np.zeros((4.4B, 8)) — 14 GB allocation
+        #   (b) 4.4B-iteration Python for-loop
+        #   (c) roc_curve sorting 4.4B elements × 8 classes
         roc_data = None
-        if probas is not None:
+        probas_targets = getattr(self, '_last_probas_targets', None)
+        if probas is not None and probas_targets is not None:
             roc_data = []
-            y_onehot = np.zeros((len(final_target), num_classes), dtype=np.float32)
-            for i, t in enumerate(final_target):
-                if 0 <= t < num_classes:
-                    y_onehot[i, t] = 1
             for cls_i in range(num_classes):
-                fpr, tpr, _ = roc_curve(y_onehot[:, cls_i], probas[:, cls_i])
+                y_bin = (probas_targets == cls_i).astype(np.uint8)  # (n_sampled,)
+                if y_bin.sum() == 0:
+                    roc_data.append(None)   # absent class — worker will skip
+                    continue
+                fpr, tpr, _ = roc_curve(y_bin, probas[:, cls_i])
                 roc_auc = auc(fpr, tpr)
                 # downsample roc to ~200 points to keep pickle tiny
                 if len(fpr) > 200:
@@ -1469,8 +1494,9 @@ class hsTrainer:
                                  float(roc_auc)))
 
         # free large arrays before spawning workers
-        del final_target, final_pred, probas
-        self._last_probas = None
+        del final_target, final_pred, probas, probas_targets
+        self._last_probas         = None
+        self._last_probas_targets = None
 
         tprint(f"  metrics pre-computed in {time.perf_counter() - t_pre:.1f}s")
 
