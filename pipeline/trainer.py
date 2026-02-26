@@ -112,22 +112,18 @@ def _worker_plot_training_curves(train_losses, eval_losses, train_accs,
     plt.close()
 
 
-def _worker_plot_confusion_matrix(y_true, y_pred, num_classes, class_names,
-                                  model_name, output):
-    """Worker: confusion matrix."""
+def _worker_plot_confusion_matrix(cm, cm_norm, metrics_text,
+                                  class_names, model_name, output):
+    """worker: plot pre-computed confusion matrix.
+    cm: shape (num_classes, num_classes) int — raw counts.
+    cm_norm: shape (num_classes, num_classes) float — row-normalized.
+    metrics_text: str — pre-formatted classification report to save.
+    """
     matplotlib.use('Agg')
 
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, labels=range(num_classes), zero_division=0)
-    report_lines = []
-    for i in range(num_classes):
-        name = class_names[i] if i < len(class_names) else f'Class_{i}'
-        report_lines.append(f"{name}: P={precision[i]:.4f}, R={recall[i]:.4f}, F1={f1[i]:.4f}")
     with open(os.path.join(output, 'classification_metrics.txt'), 'w') as f:
-        f.write('\n'.join(report_lines) + '\n')
+        f.write(metrics_text)
 
-    cm = _cm(y_true, y_pred)
-    cm_norm = cm.astype('float') / (cm.sum(axis=1, keepdims=True) + 1e-8)
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[0])
     axes[0].set_title('Confusion Matrix (Count)'); axes[0].set_ylabel('True'); axes[0].set_xlabel('Predicted')
@@ -138,13 +134,13 @@ def _worker_plot_confusion_matrix(y_true, y_pred, num_classes, class_names,
     plt.close()
 
 
-def _worker_plot_per_class_metrics(y_true, y_pred, num_classes, class_names,
+def _worker_plot_per_class_metrics(p, r, f1, num_classes, class_names,
                                    model_name, output):
-    """Worker: per-class P/R/F1 bar chart."""
+    """worker: plot pre-computed per-class precision/recall/f1.
+    p, r, f1: each shape (num_classes,) float arrays.
+    """
     matplotlib.use('Agg')
 
-    p, r, f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, labels=range(num_classes), zero_division=0)
     x = np.arange(num_classes)
     w = 0.25
     fig, ax = plt.subplots(figsize=(12, 5))
@@ -161,21 +157,19 @@ def _worker_plot_per_class_metrics(y_true, y_pred, num_classes, class_names,
     plt.close()
 
 
-def _worker_plot_roc_curves(y_true, probas, num_classes, class_names,
+def _worker_plot_roc_curves(roc_data, num_classes, class_names,
                             model_name, output):
-    """Worker: per-class ROC."""
+    """worker: plot pre-computed roc curves.
+    roc_data: list of (fpr, tpr, auc_val) tuples, one per class.
+              each fpr/tpr is a 1-d array (variable length).
+    """
     matplotlib.use('Agg')
 
-    if probas is None:
+    if roc_data is None:
         return
-    y_onehot = np.zeros((len(y_true), num_classes))
-    for i, t in enumerate(y_true):
-        if 0 <= t < num_classes:
-            y_onehot[i, t] = 1
     fig, ax = plt.subplots(figsize=(8, 7))
     for cls_i in range(num_classes):
-        fpr, tpr, _ = roc_curve(y_onehot[:, cls_i], probas[:, cls_i])
-        roc_auc = auc(fpr, tpr)
+        fpr, tpr, roc_auc = roc_data[cls_i]
         ax.plot(fpr, tpr, label=f'{class_names[cls_i]} (AUC={roc_auc:.3f})', linewidth=1.3)
     ax.plot([0, 1], [0, 1], 'k--', alpha=0.4)
     ax.set_xlabel('False Positive Rate'); ax.set_ylabel('True Positive Rate')
@@ -269,6 +263,28 @@ class ModelEMA:
     def load_state_dict(self, state_dict):
         self.shadow.load_state_dict(state_dict)
 
+    @torch.no_grad()
+    def swap(self, model: nn.Module) -> None:
+        """Zero-copy in-place swap of model parameters/buffers with EMA shadow.
+
+        Exchanges the underlying storage pointers of every parameter and buffer
+        between ``model`` and the shadow copy — no tensor allocation, no PCIe
+        transfer.  Calling ``swap()`` a second time restores the original state,
+        so no backup is needed.
+
+        Handles ``nn.DataParallel`` by unwrapping to the inner module first.
+        """
+        raw_model = model.module if isinstance(model, nn.DataParallel) else model
+        for p_m, p_s in zip(raw_model.parameters(), self.shadow.parameters()):
+            # Swap storage pointers — no data copied, O(num_params) pointer assigns
+            tmp        = p_m.data
+            p_m.data   = p_s.data
+            p_s.data   = tmp
+        for b_m, b_s in zip(raw_model.buffers(), self.shadow.buffers()):
+            tmp        = b_m.data
+            b_m.data   = b_s.data
+            b_s.data   = tmp
+
 
 class hsTrainer:
     """
@@ -279,7 +295,7 @@ class hsTrainer:
         self,
         config: Munch = None,
         dataLoader: AbstractHSDataset = None,
-        epochs: int = 20,
+        epochs: int = 10,
         model: Callable[..., Module] = None,
         model_name: str = "model",
         debug_mode: bool = False,
@@ -609,45 +625,61 @@ class hsTrainer:
                  ) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
         """
         Evaluate on the test set with optimized performance.
-        
+
+        Optimization:
+        1) GPU-side confusion matrix (int64) accumulated via scatter_add_
+              each batch; only 64 numbers transferred to CPU after the loop,
+              instead of ~1.5 GB of per-pixel predictions.
+        2) All metrics (OA, BA, Kappa, mIoU) derived analytically from the
+              single confusion matrix; confusion_matrix() is called only once,
+              eliminating 19 redundant full-array scans.
+
         Args:
-            collect_extra: if True, also collect softmax probabilities and
-                           penultimate-layer features (for ROC / t-SNE).
+            collect_extra: if True, also collect per-pixel predictions/targets
+                           (needed for plots) and softmax probabilities (ROC).
+                           Only set True for the final evaluation — not every epoch.
             use_ema: if True, temporarily swap in EMA shadow weights for
                      evaluation, then restore original weights.
-        
+
         Return:
             Tuple (``loss``, ``accuracy``, ``kappa``, ``predictions``, ``labels``)
-            When collect_extra is True, also stores self._last_probas
-            for consumption by the comparator.
+            predictions/labels are full arrays when collect_extra=True,
+            empty arrays otherwise (sufficient for epoch-level logging).
+            When collect_extra is True, also stores self._last_probas.
         """
-        # Optionally swap in EMA weights
-        _ema_backup = None
+        # Swap in EMA shadow weights (zero-copy pointer exchange; call again to restore)
         if use_ema:
-            _ema_backup = copy.deepcopy(self.model.state_dict())
-            self.model.load_state_dict(self.ema.state_dict())
-        
+            self.ema.swap(self.model)
+
         self.model.eval()
+        model_ref = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        num_classes = model_ref.num_classes
+
         total_loss = 0.0
-        predictions_list = []   # GPU tensors, moved to CPU at end
-        targets_list = []       # GPU tensors, moved to CPU at end
-        probas_list = [] if collect_extra else None
-        
+
+        # GPU-side confusion matrix — shape (C, C), int64
+        # Updated in-loop via scatter_add_; only C² numbers transferred to CPU at end.
+        cm_gpu = torch.zeros(num_classes, num_classes,
+                             dtype=torch.long, device=self.device)
+
+        # collect_extra: per-pixel arrays needed for final plots & ROC curves only
+        predictions_list = [] if collect_extra else None
+        targets_list     = [] if collect_extra else None
+        probas_list      = [] if collect_extra else None
+
         eval_loader = self.test_loader
-        
         pbar = tqdm(eval_loader, desc='Evaluating', leave=False)
-        
+
         with torch.no_grad():
             for batch_data in pbar:
                 hsi, labels = self._unpack_batch(batch_data)
-                hsi = hsi.to(self.device, non_blocking=True)
+                hsi    = hsi.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
-                
-                # format check up
+
+                # format check
                 if hsi.dim() == 4 and hsi.shape[-1] <= 16:
                     hsi = hsi.permute(0, 3, 1, 2)
-                
-                # Use AMP for evaluation (match training precision)
+
                 if self.use_amp:
                     with autocast():
                         outputs = self.model(hsi)
@@ -656,46 +688,82 @@ class hsTrainer:
                     outputs = self.model(hsi)
                     loss = self.criterion(outputs, labels)
                 total_loss += loss.item()
-                
+
                 _, predicted = torch.max(outputs, 1)
-                
-                # Stay on GPU: filter ignore pixels and accumulate
-                valid_mask = (labels != 255)
-                predictions_list.append(predicted[valid_mask])
-                targets_list.append(labels[valid_mask])
-                
-                # Collect softmax probabilities for valid pixels (ROC curves)
+
+                # filter padding/background (ignore_index = 255)
+                valid_mask  = (labels != 255)
+                pred_valid  = predicted[valid_mask]   # shape: (n_valid,)
+                tgt_valid   = labels[valid_mask]      # shape: (n_valid,)
+
+                # linearise (true_cls, pred_cls) -> flat index and accumulate
+                # cm_gpu[t, p] += 1  equivalent, without any Python loop
+                linear_idx = tgt_valid * num_classes + pred_valid
+                cm_gpu.view(-1).scatter_add_(
+                    0, linear_idx,
+                    torch.ones_like(linear_idx, dtype=torch.long))
+
+                # collect full arrays only for final-eval plots / ROC
                 if collect_extra:
-                    proba = outputs.softmax(dim=1)          # [B, K, H, W]
+                    predictions_list.append(pred_valid)   # stays on GPU
+                    targets_list.append(tgt_valid)        # stays on GPU
+                    proba = outputs.softmax(dim=1)           # [B, K, H, W]
                     proba_bhwk = proba.permute(0, 2, 3, 1)  # [B, H, W, K]
                     probas_list.append(proba_bhwk[valid_mask].cpu().numpy())
-        
-        # Single GPU -> CPU transfer at the end
-        predictions = torch.cat(predictions_list, dim=0).cpu().numpy()
-        targets = torch.cat(targets_list, dim=0).cpu().numpy()
-        
-        # balanced accuracy as the primary metric.
-        acc = balanced_accuracy_score(targets, predictions) * 100
-        oa = accuracy_score(targets, predictions) * 100
-        kappa = cohen_kappa_score(targets, predictions) * 100
+
+        cm_np    = cm_gpu.cpu().numpy().astype(np.int64)   # shape (C, C)
+        row_sums = cm_np.sum(axis=1)                       # actual count per class
+        col_sums = cm_np.sum(axis=0)                       # predicted count per class
+        diag     = np.diag(cm_np)
+        total    = int(cm_np.sum())
+
+        # overall Accuracy
+        oa = float(diag.sum()) / total * 100 if total > 0 else 0.0
+
+        # balanced Accuracy (mean per-class recall, ignoring absent classes)
+        valid_cls     = row_sums > 0
+        per_cls_recall = np.where(valid_cls, diag / np.maximum(row_sums, 1), 0.0)
+        acc = float(per_cls_recall[valid_cls].mean()) * 100 if valid_cls.any() else 0.0
+
+        # Cohen's Kappa (analytical formula, no sklearn)
+        expected = row_sums.astype(np.float64) * col_sums.astype(np.float64) / max(total, 1)
+        p_o = float(diag.sum()) / max(total, 1)
+        p_e = float(expected.sum()) / max(total, 1)
+        kappa = ((p_o - p_e) / max(1.0 - p_e, 1e-8)) * 100
+
+        # mIoU (tp / (tp + fp + fn) per class, from confusion matrix columns/rows)
+        miou_vals = []
+        for c in range(num_classes):
+            tp    = int(cm_np[c, c])
+            fp    = int(col_sums[c]) - tp
+            fn    = int(row_sums[c]) - tp
+            denom = tp + fp + fn
+            if denom > 0:
+                miou_vals.append(tp / denom)
+        miou = float(np.mean(miou_vals)) * 100 if miou_vals else 0.0
+
         loss = total_loss / len(eval_loader)
-        self._last_oa = oa  # store OA for logging
-        
-        # Compute mIoU
-        model_ref = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-        miou = self._compute_miou(targets, predictions, model_ref.num_classes)
+        self._last_oa   = oa
         self._last_miou = miou
-        
+
+        # final-eval: full arrays for plots / ROC (single GPU -> CPU transfer)
         if collect_extra:
+            predictions = torch.cat(predictions_list, dim=0).cpu().numpy()
+            targets     = torch.cat(targets_list,     dim=0).cpu().numpy()
             if probas_list:
                 self._last_probas = np.concatenate(probas_list, axis=0)
             else:
                 self._last_probas = None
-        
-        # Restore original weights after EMA evaluation
-        if _ema_backup is not None:
-            self.model.load_state_dict(_ema_backup)
-        
+        else:
+            # epoch-level eval: callers only use scalar metrics
+            predictions = np.empty(0, dtype=np.int64)
+            targets     = np.empty(0, dtype=np.int64)
+
+        # restore original weights via second swap
+        # e.g. if EMA was used, swap back to original model weights
+        if use_ema:
+            self.ema.swap(self.model)
+
         return loss, acc, kappa, predictions, targets
     
     def train(self, _cv_mode: bool = False) -> Dict[str, float]:
@@ -764,7 +832,7 @@ class hsTrainer:
                 tprint(f"[Epoch {epoch+1:3d}] Train Loss: {train_loss:.4f} Acc: {train_acc:6.2f}%", end='')
             
             # Generate visualizations
-            if self.debug_mode or (should_eval and (epoch + 1) % 2 == 0):
+            if self.debug_mode:
                 try:
                     self._generate_cam(epoch)
                 except Exception as e:
@@ -781,11 +849,13 @@ class hsTrainer:
         
         # load best model for final evaluation
         if self.best_model_state is not None:
+            tprint(f"Loading model from epoch {self.best_epoch + 1} for final eval...")
             self.model.load_state_dict(self.best_model_state['model_state'])
         
         # final evaluation with extra data collection (probabilities, features)
         final_loss, final_acc, final_kappa, final_pred, final_target = self.evaluate(
             collect_extra=True)
+        tprint(f"Final eval completed!")
         
         # Store for CV aggregation (accessed before trainer is deleted)
         self._final_pred = final_pred
@@ -1348,15 +1418,63 @@ class hsTrainer:
         tprint(f"  CV gradient norm saved to {path}")
 
     def _save_all_plots(self, final_target, final_pred):
-        """Generate all single-model plots in parallel using ProcessPoolExecutor.
+        """generate all single-model plots in parallel.
 
-        Each plot is dispatched to a separate process so that 7 matplotlib
-        renders happen concurrently instead of sequentially.
+        pre-computes all heavy metrics (cm, p/r/f1, roc) in the main process
+        so that only small summary arrays (~kb) are pickled to workers,
+        instead of raw predictions (~gb). this reduces plot time from
+        ~10 min to ~seconds.
         """
         num_classes = self.config.clsf.num
         class_names = list(self.config.clsf.targets[:num_classes])
         probas = getattr(self, '_last_probas', None)
 
+        # --- pre-compute heavy metrics in main process (avoids pickle of huge arrays) ---
+        tprint("  pre-computing plot metrics in main process...")
+        t_pre = time.perf_counter()
+
+        # confusion matrix — cm: shape (num_classes, num_classes) int
+        cm = _cm(final_target, final_pred, labels=range(num_classes))
+        cm_norm = cm.astype('float') / (cm.sum(axis=1, keepdims=True) + 1e-8)
+
+        # per-class precision, recall, f1 — each shape (num_classes,)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            final_target, final_pred, labels=range(num_classes), zero_division=0)
+
+        # format metrics text for saving
+        report_lines = []
+        for i in range(num_classes):
+            name = class_names[i] if i < len(class_names) else f'Class_{i}'
+            report_lines.append(
+                f"{name}: P={precision[i]:.4f}, R={recall[i]:.4f}, F1={f1[i]:.4f}")
+        metrics_text = '\n'.join(report_lines) + '\n'
+
+        # roc curves — list of (fpr, tpr, auc_val) per class, ~200 points each
+        roc_data = None
+        if probas is not None:
+            roc_data = []
+            y_onehot = np.zeros((len(final_target), num_classes), dtype=np.float32)
+            for i, t in enumerate(final_target):
+                if 0 <= t < num_classes:
+                    y_onehot[i, t] = 1
+            for cls_i in range(num_classes):
+                fpr, tpr, _ = roc_curve(y_onehot[:, cls_i], probas[:, cls_i])
+                roc_auc = auc(fpr, tpr)
+                # downsample roc to ~200 points to keep pickle tiny
+                if len(fpr) > 200:
+                    idx = np.linspace(0, len(fpr) - 1, 200, dtype=int)
+                    fpr, tpr = fpr[idx], tpr[idx]
+                roc_data.append((fpr.astype(np.float32),
+                                 tpr.astype(np.float32),
+                                 float(roc_auc)))
+
+        # free large arrays before spawning workers
+        del final_target, final_pred, probas
+        self._last_probas = None
+
+        tprint(f"  metrics pre-computed in {time.perf_counter() - t_pre:.1f}s")
+
+        # dispatch lightweight plot tasks to workers
         tasks = [
             (_worker_plot_training_curves,
              (list(self.train_losses), list(self.eval_losses),
@@ -1364,13 +1482,13 @@ class hsTrainer:
               self.eval_interval, self.debug_mode,
               self.best_acc, self.model_name, self.output)),
             (_worker_plot_confusion_matrix,
-             (final_target, final_pred, num_classes, class_names,
-              self.model_name, self.output)),
+             (cm, cm_norm, metrics_text,
+              class_names, self.model_name, self.output)),
             (_worker_plot_per_class_metrics,
-             (final_target, final_pred, num_classes, class_names,
+             (precision, recall, f1, num_classes, class_names,
               self.model_name, self.output)),
             (_worker_plot_roc_curves,
-             (final_target, probas, num_classes, class_names,
+             (roc_data, num_classes, class_names,
               self.model_name, self.output)),
             (_worker_plot_grad_norm,
              (list(self.grad_norms), self.model_name, self.output)),

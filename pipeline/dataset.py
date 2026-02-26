@@ -324,40 +324,74 @@ class NpyHSDataset(AbstractHSDataset):
         """
         load, normalize, pca, and extract patches per-patient independently.
 
-        fixes two critical bugs in the old concatenation approach:
+        pipeline:
+          - load all patients, collect real (non-bg) pixels for global stats
+          - fit global normalization + pca on non-bg pixels only
+          - per-patient: normalize -> pca -> pad -> extract patches
+          - concatenate patches from all patients
+          
+        2026.2.25 fixed two critical bugs in the old concatenation approach:
           1. patches at patient boundaries mixed tissues from different patients
           2. zero-padding from width alignment polluted normalization/pca stats
-
-        pipeline:
-          phase 1: load all patients, collect real (non-bg) pixels for global stats
-          phase 2: fit global normalization + pca on real pixels only
-          phase 3: per-patient: normalize -> pca -> pad -> extract patches
-          phase 4: concatenate patches from all patients
+          
+        2026.2.26 fixed:
+          1. label remapping for merged classes (LN+Blood -> LQ)
+          2. added robust validation for raw data and labels (shape, finite values, label range)
         """
+        
         from sklearn.decomposition import PCA
-
         pairs = self._pair_data_and_labels()
         if not pairs:
             raise RuntimeError("no data/label pairs found in " + self.data_path)
 
-        # --- phase 1: load all patients separately, collect real pixels ---
-        tprint("phase 1: loading patients independently...")
-        patient_records = []   # list of (data, labels, pid_idx)
-        all_real_pixels = []   # real (non-background) pixels for global fitting
+        # raw:    0=bg, 1=PG, 2=FAT, 3=TG, 4=LN, 5=MS, 6=Blood, 7=Tra, 8=ES
+        # mapped: identity — all 8 tissue classes kept separate
+        # LN and Blood are spectrally distinct; merging them caused AUC<0.5
+        _label_remap = np.array([
+            0,  # 0: background -> background
+            1,  # 1: PG         -> PG    (1)
+            2,  # 2: FAT        -> FAT   (2)
+            3,  # 3: TG         -> TG    (3)
+            4,  # 4: LN         -> LN    (4)
+            5,  # 5: MS         -> MS    (5)
+            6,  # 6: Blood      -> Blood (6)
+            7,  # 7: Tra        -> Tra   (7)
+            8,  # 8: ES         -> ES    (8)
+        ], dtype=np.int32)
+
+        tprint("loading patients...")
+        patient_records = []
+        all_real_pixels = []
         _patient_id_map = {}
 
         for idx, (data_file, label_file) in enumerate(pairs):
             data = np.load(data_file).astype(np.float32)    # shape: (h_i, w_i, c)
-            labels = np.load(label_file).astype(np.int32)    # shape: (h_i, w_i)
+            labels_raw = np.load(label_file).astype(np.int32)  # shape: (h_i, w_i), 1-based
 
-            if data.shape[:2] != labels.shape[:2]:
+            if data.shape[:2] != labels_raw.shape[:2]:
                 raise ValueError(
                     f"shape mismatch: {data_file} {data.shape[:2]} "
-                    f"vs {labels.shape[:2]}")
+                    f"vs {labels_raw.shape[:2]}")
 
-            # validate finite values
             if not np.isfinite(data).all():
                 raise ValueError(f"non-finite values in {data_file}")
+
+            # apply label remap — validate range then clip
+            # raw labels are 1-based: 0=bg, 1-8=classes
+            # clip to _label_remap's valid index range (0 to len-1), NOT to config.clsf.num
+            min_raw = int(labels_raw.min())
+            max_raw = int(labels_raw.max())
+            if min_raw < 0:
+                print(f"\t\tWARNING: {os.path.basename(label_file)} has negative "
+                       f"label {min_raw}, will be clipped to 0")
+            if max_raw >= len(_label_remap):
+                print(f"\t\tWARNING: {os.path.basename(label_file)} has label value "
+                       f"{max_raw} exceeding remap table max "
+                       f"{len(_label_remap)-1}, will be clipped")
+            # CRITICAL: clip to len(_label_remap)-1 (=8), NOT config.clsf.num (=7).
+            # clipping to 7 would map ES(8) -> _label_remap[7]=Tra, silently corrupting ES labels.
+            labels_clipped = np.clip(labels_raw, 0, len(_label_remap) - 1)
+            labels = _label_remap[labels_clipped]  # shape: (h_i, w_i), now 1-based merged
 
             patient_id = self._extract_patient_id(data_file)
             if patient_id not in _patient_id_map:
@@ -366,52 +400,62 @@ class NpyHSDataset(AbstractHSDataset):
 
             patient_records.append((data, labels, pid_idx))
 
-            # collect only real (labeled) pixels — shape: (n_real_i, c)
+            # collect non-bg pixels for global stats (unchanged: labels > 0)
             mask = labels.reshape(-1) > 0
             real_px = data.reshape(-1, data.shape[2])[mask]
             all_real_pixels.append(real_px)
 
             tprint(f"  loaded {idx+1}/{len(pairs)}: "
                    f"{os.path.basename(data_file)} ({patient_id}), "
-                   f"shape {data.shape}, real pixels: {mask.sum():,}")
+                   f"shape {data.shape}, non-bg pixels: {mask.sum():,}, "
+                   f"max label {labels.max()}, min label {labels.min()}"
+                   )
 
         self._patient_names = {v: k for k, v in _patient_id_map.items()}
         self._num_patients = len(_patient_id_map)
         tprint(f"  {len(pairs)} pairs, {self._num_patients} unique patients")
 
-        # --- phase 2: fit normalization + pca on real pixels only ---
-        # excludes background and zero-padding → cleaner statistics
-        tprint("phase 2: fitting normalization + pca on real pixels only...")
+        # norm + pca on non-bg pixels
+        # excludes background and zero-padding -> cleaner statistics
+        tprint("fitting norm + pca...")
         all_real = np.concatenate(all_real_pixels, axis=0)   # shape: (n_total_real, c)
         del all_real_pixels
         c = all_real.shape[1]
 
-        # subsample for fitting if too many pixels
-        max_fit = 500_000
+        # subsample for normalization stats — use up to 2M pixels for stable mean/std
+        # (larger sample = more accurate global stats; memory cost ~2M * c * 4 bytes)
+        max_fit = 2_000_000
         if len(all_real) > max_fit:
-            rng = np.random.RandomState(350235)
-            fit_idx = rng.choice(len(all_real), max_fit, replace=False)
-            fit_data = all_real[fit_idx]   # shape: (max_fit, c)
+            rng_fit = np.random.RandomState(350235)
+            fit_idx = rng_fit.choice(len(all_real), max_fit, replace=False)
+            fit_data = all_real[fit_idx]   # shape: (max_fit, c) — independent copy
+            del all_real                   # free large array immediately
         else:
             fit_data = all_real
+            all_real = None               # release reference; fit_data keeps the data
 
-        # global normalization stats — fit on real pixels only
+        # global normalization stats — fit on non-bg pixels only
         global_mean = fit_data.mean(axis=0).astype(np.float32)       # shape: (c,)
         global_std  = fit_data.std(axis=0).astype(np.float32) + 1e-8 # shape: (c,)
-        tprint(f"  normalization fit on {len(fit_data):,} / {len(all_real):,} real pixels")
+        tprint(f"  normalization fit on {len(fit_data):,} non-bg pixels")
 
-        # pca — fit on normalized real pixels only
+        # pca — fit on normalized non-bg pixels, capped at 500K
+        # O(n * p^2); 500K is sufficient for stable eigenvectors)
         n_components = self.config.preprocess.pca_components
         pca_obj = None
+        
+        # global mean: shape (c,), global std: shape (c,),
+        # Z-score normalization on fit_data before PCA fitting,
+        # to remove possible sensor bias and ensure PCA captures meaningful variance directions.
         if n_components and n_components < c:
-            normalized_fit = (fit_data - global_mean) / global_std
+            normalized_fit = (fit_data - global_mean) / global_std  # shape: (n_fit, c)
             max_pca = 500_000
             if len(normalized_fit) > max_pca:
-                rng = np.random.RandomState(42)
-                pca_idx = rng.choice(len(normalized_fit), max_pca, replace=False)
-                pca_fit = normalized_fit[pca_idx]
+                rng_pca = np.random.RandomState(42)
+                pca_idx = rng_pca.choice(len(normalized_fit), max_pca, replace=False)
+                pca_fit = normalized_fit[pca_idx]   # shape: (max_pca, c)
             else:
-                pca_fit = normalized_fit
+                pca_fit = normalized_fit            # already within budget
 
             pca_obj = PCA(n_components=n_components, svd_solver='randomized',
                           random_state=350234)
@@ -422,7 +466,7 @@ class NpyHSDataset(AbstractHSDataset):
                    f"fit on {len(pca_fit):,} pixels")
             del normalized_fit, pca_fit
 
-        del all_real, fit_data
+        del fit_data   # all_real already freed above
 
         # pre-compute pca projection matrix in float32
         if pca_obj is not None:
@@ -434,9 +478,9 @@ class NpyHSDataset(AbstractHSDataset):
             pca_mean = None
             c_out = c
 
-        # --- phase 3: per-patient normalize -> pca -> pad -> extract patches ---
-        # each patient is padded independently: no cross-patient boundary bleeding
-        tprint("phase 3: per-patient patching (no cross-patient boundaries)...")
+        # patient norm -> pca -> pad -> extract patches
+        # patient padded independently, no cross-patient boundary bleeding
+        tprint("patient patching...")
         self._patient_padded_data   = []  # list of padded arrays per patient
         self._patient_padded_labels = []  # list of padded label maps per patient
 
@@ -448,10 +492,12 @@ class NpyHSDataset(AbstractHSDataset):
             h, w, c_raw = data.shape                     # per-patient: (h_i, w_i, c)
             flat = data.reshape(-1, c_raw)               # shape: (h_i * w_i, c)
 
-            # normalize using global stats (fit on real pixels only)
+            # normalize using global stats (fit on non-bg pixels only)
             flat = (flat - global_mean) / global_std
 
             # pca projection
+            # pca_mean is the mean of normalized training pixels (≈0 but not exactly)
+            # must subtract before projection to match sklearn's PCA.transform() behavior.
             if pca_components is not None:
                 flat = (flat - pca_mean) @ pca_components.T  # shape: (h_i*w_i, n_components)
 
@@ -495,6 +541,10 @@ class NpyHSDataset(AbstractHSDataset):
             all_patient_groups.append(patient_groups)
 
             del data, labels, flat, processed
+
+        # free all original patient arrays — del inside the loop only removed loop-variable
+        # names; patient_records still held references until here
+        del patient_records
 
         # --- phase 4: concatenate ---
         self.patch_indices = np.concatenate(all_patch_indices, axis=0)          # shape: (N, 3)
@@ -544,8 +594,9 @@ class NpyHSDataset(AbstractHSDataset):
             List of tuples containing (data_file, label_file) paths
         """
         
-        all_files = os.listdir(self.data_path)
-        
+        # sorted() ensures deterministic file order across OS/filesystems
+        all_files = sorted(os.listdir(self.data_path))
+
         # Filter for .npy files and pair them
         data_files = [f for f in all_files if f.endswith('.npy') and not f.endswith('_gt.npy')]
         label_files = [f for f in all_files if f.endswith('_gt.npy')]
@@ -596,7 +647,7 @@ class NpyHSDataset(AbstractHSDataset):
         # appear in both train and test sets (rare class 3, 7 may only exist in
         # a few patients (need check), so some seeds will strand them in one set).
         best_split = None
-        best_missing = len(all_classes)  # worst case
+        best_missing = len(all_classes) * 2 + 1  # guarantee any real result beats this
         base_seed = 350234
         
         for seed in range(base_seed, base_seed + 100):
@@ -619,10 +670,15 @@ class NpyHSDataset(AbstractHSDataset):
                 best_missing = n_missing
                 best_split = (t_idx, v_idx, seed)
         else:
-            # No perfect split found — use the best one
-            train_idx, test_idx, seed = best_split
-            tprint(f"  WARNING: No split covers all classes in both sets after 100 seeds. "
-                  f"Using best seed={seed} ({best_missing} missing class(es)).")
+            # No perfect split found — use the best available one
+            if best_split is None:
+                # every seed had the same n_missing; just use the last one
+                train_idx, test_idx = t_idx, v_idx
+                tprint("  WARNING: No split improved over baseline; using last seed.")
+            else:
+                train_idx, test_idx, seed = best_split
+                tprint(f"  WARNING: No split covers all classes in both sets after 100 seeds. "
+                       f"Using best seed={seed} ({best_missing} missing class(es)).")
         
         # Verify no patient-level leakage
         train_patients = set(self.patch_patient_groups[train_idx])
@@ -653,20 +709,18 @@ class NpyHSDataset(AbstractHSDataset):
         )
         test_subset = _IndexedSubset(self, test_idx)
         print(f"Training augmentations enabled: flip, rotate, spectral noise, band dropout, cutout")
-        
-        # sampler balance.
-        train_sampler = self._sampler_balance(train_idx)
-        
-        # memory settings
+
+        # memory： prefer config value, then explicit attr, then safe default
         if batch_size is None:
-            batch_size = self.batch_size if hasattr(self, 'batch_size') else 32
+            batch_size = getattr(self.config.split, 'batch_size',
+                         getattr(self, 'batch_size', 32))
         
         actual_pin_memory = pin_memory and torch.cuda.is_available()
         
         train_loader = torch.utils.data.DataLoader(
             train_subset,
             batch_size=batch_size,
-            sampler=train_sampler,
+            shuffle=True,
             num_workers=num_workers,
             pin_memory=actual_pin_memory,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,

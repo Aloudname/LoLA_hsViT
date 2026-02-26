@@ -40,9 +40,9 @@ class AblationConfig:
     drop_path_rate: float = 0.2
     r: int = 16                       # LoRA rank (LoLA_hsViT only)
     lora_alpha: int = 32              # LoRA alpha (LoLA_hsViT only)
-    in_channels: int = 31             # must match preprocess.pca_components in config.yaml
-    spatial_size: int = 31            # must match split.patch_size in config.yaml
-    num_classes: int = 8              # must match clsf.num in config.yaml
+    in_channels: int = None             # must match preprocess.pca_components in config.yaml
+    spatial_size: int = None            # must match split.patch_size in config.yaml
+    num_classes: int = None              # must match clsf.num in config.yaml
 
     @property
     def run_name(self) -> str:
@@ -109,44 +109,72 @@ class AblationResult:
 
 def build_common_vit_configs() -> List[AblationConfig]:
     """Define ablation configs for CommonViT."""
+    from config import load_config
+    config = load_config()
     return [
         AblationConfig(tag="full_stack",  model_type="CommonViT",
-                       dim=96, depths=[3,4,5], num_heads=[4,8,16], mlp_ratio=4.0),
+                       dim=96, depths=[3,4,5], num_heads=[4,8,16], mlp_ratio=4.0, 
+                       in_channels=config.preprocess.pca_components,
+                       spatial_size=config.split.patch_size,
+                       num_classes=config.clsf.num),
         AblationConfig(tag="shallow_dim",   model_type="CommonViT",
-                       dim=96, depths=[2,3,3], num_heads=[4,8,16], mlp_ratio=4.0),
+                       dim=96, depths=[2,3,3], num_heads=[4,8,16], mlp_ratio=4.0,
+                       in_channels=config.preprocess.pca_components,
+                       spatial_size=config.split.patch_size,
+                       num_classes=config.clsf.num),
         AblationConfig(tag="reduced",   model_type="CommonViT",
-                       dim=64, depths=[2,3,3], num_heads=[4,8,16], mlp_ratio=4.0),
+                       dim=64, depths=[2,3,3], num_heads=[4,8,16], mlp_ratio=4.0,
+                       in_channels=config.preprocess.pca_components,
+                       spatial_size=config.split.patch_size,
+                       num_classes=config.clsf.num),
         AblationConfig(tag="tiny",      model_type="CommonViT",
-                       dim=32, depths=[2,2,2], num_heads=[4,8,16], mlp_ratio=2.0),
+                       dim=32, depths=[2,2,2], num_heads=[4,8,16], mlp_ratio=2.0,
+                       in_channels=config.preprocess.pca_components,
+                       spatial_size=config.split.patch_size,
+                       num_classes=config.clsf.num),
         AblationConfig(tag="mini",      model_type="CommonViT",
-                       dim=32, depths=[1,1,2], num_heads=[2,4,8],  mlp_ratio=2.0),
+                       dim=32, depths=[1,1,2], num_heads=[2,4,8],  mlp_ratio=2.0,
+                       in_channels=config.preprocess.pca_components,
+                       spatial_size=config.split.patch_size,
+                       num_classes=config.clsf.num),
         AblationConfig(tag="two_level", model_type="CommonViT",
                        dim=48, depths=[2,3], num_heads=[4,8], window_size=[7,7],
-                       mlp_ratio=3.0),
+                       mlp_ratio=3.0,
+                       in_channels=config.preprocess.pca_components,
+                       spatial_size=config.split.patch_size,
+                       num_classes=config.clsf.num),
     ]
 
 
 def build_lola_vit_configs() -> List[AblationConfig]:
     """Define ablation configs for LoLA_hsViT."""
+    from config import load_config
+    config = load_config()
     return [
         AblationConfig(tag="full_stack",  model_type="LoLA_hsViT",
                        dim=96, depths=[3,4,5], num_heads=[4,8,16], mlp_ratio=4.0,
-                       r=16, lora_alpha=32),
+                       r=16, lora_alpha=32, in_channels=config.preprocess.pca_components,
+                       spatial_size=config.split.patch_size, num_classes=config.clsf.num),
         AblationConfig(tag="shallow_dim",   model_type="LoLA_hsViT",
                        dim=96, depths=[2,3,3], num_heads=[4,8,16], mlp_ratio=4.0,
-                       r=16, lora_alpha=32),
+                       r=16, lora_alpha=32, in_channels=config.preprocess.pca_components,
+                       spatial_size=config.split.patch_size, num_classes=config.clsf.num),
         AblationConfig(tag="reduced",   model_type="LoLA_hsViT",
                        dim=64, depths=[2,3,3], num_heads=[4,8,16], mlp_ratio=4.0,
-                       r=16, lora_alpha=32),
+                       r=16, lora_alpha=32, in_channels=config.preprocess.pca_components,
+                       spatial_size=config.split.patch_size, num_classes=config.clsf.num),
         AblationConfig(tag="tiny",     model_type="LoLA_hsViT",
                        dim=32, depths=[2,2,2], num_heads=[4,8,16], mlp_ratio=2.0,
-                       r=8, lora_alpha=16),
+                       r=8, lora_alpha=16, in_channels=config.preprocess.pca_components,
+                       spatial_size=config.split.patch_size, num_classes=config.clsf.num),
         AblationConfig(tag="mini",     model_type="LoLA_hsViT",
                        dim=32, depths=[1,1,2], num_heads=[2,4,8], window_size=[7,7,7],
-                       mlp_ratio=2.0, r=4, lora_alpha=8),
+                       mlp_ratio=2.0, r=4, lora_alpha=8, in_channels=config.preprocess.pca_components,
+                       spatial_size=config.split.patch_size, num_classes=config.clsf.num),
         AblationConfig(tag="two_level", model_type="LoLA_hsViT",
                             dim=48, depths=[2,3], num_heads=[4,8], window_size=[7,7],
-                            mlp_ratio=3.0, r=4, lora_alpha=8),
+                            mlp_ratio=3.0, r=4, lora_alpha=8, in_channels=config.preprocess.pca_components,
+                            spatial_size=config.split.patch_size, num_classes=config.clsf.num),
     ]
 
 def compute_balance_score(eval_acc: float, overfit_gap: float,
