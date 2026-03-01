@@ -24,11 +24,11 @@ lora:
 split:
   test_rate: 0.2 # 0.2 default.
   n_folds: 5  # Number of folds for cross-validation (0 = disabled, use hold-out)
-  batch_size: 512  # This refers to the size on a single GPU.
-  patch_size: 31  # Pixel size of image patches.
-  eval_batch_size: 512  # Smaller eval batch size for CPU training
+  batch_size: 256  # This refers to the size on a single GPU.
+  patch_size: 45  # Pixel size of image patches.
+  eval_batch_size: 256  # Smaller eval batch size for CPU training
 preprocess:
-  pca_components: 32  # Number of PCA components to retain.
+  pca_components: 15  # Number of PCA components to retain.
 memory:
   pin_memory: true  # true is faster but may cause memoleak in distant server.
   num_workers: 4  # Workers on single GPU. More memory usage to accelerate data loading.

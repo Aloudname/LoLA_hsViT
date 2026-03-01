@@ -28,9 +28,9 @@ from dataclasses import dataclass, field, asdict
 os.setpgrp() # prevent Ctrl+C from killing the whole terminal session when running long ablation schedules
 
 @dataclass
-class AblationConfig:
-    """Single ablation experiment configuration."""
-    tag: str                          # Human-readable tag (e.g. "compact_r8")
+class ModuleConfig:
+    """Single experiment configuration."""
+    tag: str                          # Human-readable tag (e.g. "compact")
     model_type: str                   # "LoLA_hsViT" or "CommonViT"
     dim: int = 96                     # Base feature dimension
     depths: List[int] = field(default_factory=lambda: [3, 4, 5])
@@ -38,10 +38,10 @@ class AblationConfig:
     window_size: List[int] = field(default_factory=lambda: [7, 7, 7])
     mlp_ratio: float = 4.0
     drop_path_rate: float = 0.2
-    r: int = 16                       # LoRA rank (LoLA_hsViT only)
-    lora_alpha: int = 32              # LoRA alpha (LoLA_hsViT only)
+    r: Optional[int] = 16                       # LoRA rank (LoLA_hsViT only)
+    lora_alpha: Optional[int] = 32              # LoRA alpha (LoLA_hsViT only)
     in_channels: int = None             # must match preprocess.pca_components in config.yaml
-    spatial_size: int = None            # must match split.patch_size in config.yaml
+    patch_size: int = None            # must match split.patch_size in config.yaml
     num_classes: int = None              # must match clsf.num in config.yaml
 
     @property
@@ -69,7 +69,7 @@ class AblationConfig:
             window_size=self.window_size[:len(self.depths)],
             mlp_ratio=self.mlp_ratio,
             drop_path_rate=self.drop_path_rate,
-            spatial_size=self.spatial_size,   # synced from config.split.patch_size
+            patch_size=self.patch_size,   # synced from config.split.patch_size
             r=self.r,
             lora_alpha=self.lora_alpha,
         )
@@ -89,7 +89,7 @@ class AblationConfig:
 
 
 @dataclass
-class AblationResult:
+class Result:
     """Stores results for one ablation run."""
     config_tag: str
     model_type: str
@@ -106,75 +106,37 @@ class AblationResult:
     balance_score: float = 0.0        # composite metric
     output_dir: str = None
 
-
-def build_common_vit_configs() -> List[AblationConfig]:
-    """Define ablation configs for CommonViT."""
+def build_configs(model_type: str) -> List[ModuleConfig]:
+    """
+    Define ablation configs of 'LoLA_hsViT' or 'CommonViT'.
+    """
     from config import load_config
     config = load_config()
     return [
-        AblationConfig(tag="full_stack",  model_type="CommonViT",
-                       dim=96, depths=[3,4,5], num_heads=[4,8,16], mlp_ratio=4.0, 
-                       in_channels=config.preprocess.pca_components,
-                       spatial_size=config.split.patch_size,
-                       num_classes=config.clsf.num),
-        AblationConfig(tag="shallow_dim",   model_type="CommonViT",
-                       dim=96, depths=[2,3,3], num_heads=[4,8,16], mlp_ratio=4.0,
-                       in_channels=config.preprocess.pca_components,
-                       spatial_size=config.split.patch_size,
-                       num_classes=config.clsf.num),
-        AblationConfig(tag="reduced",   model_type="CommonViT",
-                       dim=64, depths=[2,3,3], num_heads=[4,8,16], mlp_ratio=4.0,
-                       in_channels=config.preprocess.pca_components,
-                       spatial_size=config.split.patch_size,
-                       num_classes=config.clsf.num),
-        AblationConfig(tag="tiny",      model_type="CommonViT",
-                       dim=32, depths=[2,2,2], num_heads=[4,8,16], mlp_ratio=2.0,
-                       in_channels=config.preprocess.pca_components,
-                       spatial_size=config.split.patch_size,
-                       num_classes=config.clsf.num),
-        AblationConfig(tag="mini",      model_type="CommonViT",
-                       dim=32, depths=[1,1,2], num_heads=[2,4,8],  mlp_ratio=2.0,
-                       in_channels=config.preprocess.pca_components,
-                       spatial_size=config.split.patch_size,
-                       num_classes=config.clsf.num),
-        AblationConfig(tag="two_level", model_type="CommonViT",
-                       dim=48, depths=[2,3], num_heads=[4,8], window_size=[7,7],
-                       mlp_ratio=3.0,
-                       in_channels=config.preprocess.pca_components,
-                       spatial_size=config.split.patch_size,
-                       num_classes=config.clsf.num),
-    ]
-
-
-def build_lola_vit_configs() -> List[AblationConfig]:
-    """Define ablation configs for LoLA_hsViT."""
-    from config import load_config
-    config = load_config()
-    return [
-        AblationConfig(tag="full_stack",  model_type="LoLA_hsViT",
+        ModuleConfig(tag="full_stack",  model_type=model_type,
                        dim=96, depths=[3,4,5], num_heads=[4,8,16], mlp_ratio=4.0,
                        r=16, lora_alpha=32, in_channels=config.preprocess.pca_components,
-                       spatial_size=config.split.patch_size, num_classes=config.clsf.num),
-        AblationConfig(tag="shallow_dim",   model_type="LoLA_hsViT",
+                       patch_size=config.split.patch_size, num_classes=config.clsf.num),
+        ModuleConfig(tag="shallow_dim",   model_type=model_type,
                        dim=96, depths=[2,3,3], num_heads=[4,8,16], mlp_ratio=4.0,
                        r=16, lora_alpha=32, in_channels=config.preprocess.pca_components,
-                       spatial_size=config.split.patch_size, num_classes=config.clsf.num),
-        AblationConfig(tag="reduced",   model_type="LoLA_hsViT",
+                       patch_size=config.split.patch_size, num_classes=config.clsf.num),
+        ModuleConfig(tag="reduced",   model_type=model_type,
                        dim=64, depths=[2,3,3], num_heads=[4,8,16], mlp_ratio=4.0,
                        r=16, lora_alpha=32, in_channels=config.preprocess.pca_components,
-                       spatial_size=config.split.patch_size, num_classes=config.clsf.num),
-        AblationConfig(tag="tiny",     model_type="LoLA_hsViT",
+                       patch_size=config.split.patch_size, num_classes=config.clsf.num),
+        ModuleConfig(tag="tiny",     model_type=model_type,
                        dim=32, depths=[2,2,2], num_heads=[4,8,16], mlp_ratio=2.0,
                        r=8, lora_alpha=16, in_channels=config.preprocess.pca_components,
-                       spatial_size=config.split.patch_size, num_classes=config.clsf.num),
-        AblationConfig(tag="mini",     model_type="LoLA_hsViT",
+                       patch_size=config.split.patch_size, num_classes=config.clsf.num),
+        ModuleConfig(tag="mini",     model_type=model_type,
                        dim=32, depths=[1,1,2], num_heads=[2,4,8], window_size=[7,7,7],
                        mlp_ratio=2.0, r=4, lora_alpha=8, in_channels=config.preprocess.pca_components,
-                       spatial_size=config.split.patch_size, num_classes=config.clsf.num),
-        AblationConfig(tag="two_level", model_type="LoLA_hsViT",
-                            dim=48, depths=[2,3], num_heads=[4,8], window_size=[7,7],
+                       patch_size=config.split.patch_size, num_classes=config.clsf.num),
+        ModuleConfig(tag="two_level", model_type=model_type,
+                            dim=48, depths=[2,2], num_heads=[2,4], window_size=[7,7],
                             mlp_ratio=3.0, r=4, lora_alpha=8, in_channels=config.preprocess.pca_components,
-                            spatial_size=config.split.patch_size, num_classes=config.clsf.num),
+                            patch_size=config.split.patch_size, num_classes=config.clsf.num),
     ]
 
 def compute_balance_score(eval_acc: float, overfit_gap: float,
@@ -200,8 +162,8 @@ def compute_balance_score(eval_acc: float, overfit_gap: float,
     score = eval_acc - overfit_penalty - size_penalty
     return score
 
-class AblationRunner:
-    """Orchestrates the full ablation experiment."""
+class Runner:
+    """do experiment."""
 
     def __init__(self, base_config, dataLoader, epochs: int, num_gpus: int,
                  gap_threshold: float = 8.0, resume_idx: int = 0,
@@ -217,20 +179,20 @@ class AblationRunner:
         self.summary_dir = self.base_config.path.output
         os.makedirs(self.summary_dir, exist_ok=True)
 
-        self.results: List[AblationResult] = []
+        self.results: List[Result] = []
         self.results_file = os.path.join(self.summary_dir, "ablation_results.json")
 
         # load previous results if resuming
         if resume_idx > 0 and os.path.exists(self.results_file):
             self._load_results()
 
-    def _sync_cfg(self, cfg: AblationConfig) -> None:
+    def _sync_cfg(self, cfg: ModuleConfig) -> None:
         """sync ablation config fields with base config values."""
         cfg.in_channels = self.base_config.preprocess.pca_components
-        cfg.spatial_size = self.base_config.split.patch_size
+        cfg.patch_size = self.base_config.split.patch_size
         cfg.num_classes = self.base_config.clsf.num
 
-    def dry_run(self, configs: List[AblationConfig]) -> None:
+    def dry_run(self, configs: List[ModuleConfig]) -> None:
         """Print parameter counts for all configs without training."""
         tprint(f"  DRY RUN: Parameter Count Preview")
         tprint(f"{'#':>3} {'Model':<12} {'Tag':<16} {'dim':>4} {'depths':<12} "
@@ -249,7 +211,7 @@ class AblationRunner:
         tprint(f"Estimated training time: ~{len(configs) * self.epochs * 2:.0f} min "
               f"(rough, depends on data & hardware)\n")
 
-    def run_single(self, idx: int, cfg: AblationConfig) -> Optional[AblationResult]:
+    def run_single(self, idx: int, cfg: ModuleConfig) -> Optional[Result]:
         """Train one configuration and return the result.
 
         When ``self.n_folds > 1``, this uses K-Fold cross-validation
@@ -272,7 +234,7 @@ class AblationRunner:
             total_params, trainable_params = cfg.count_params()
 
             if self.n_folds > 1:
-                # ── Cross-Validation mode ──
+                # cross-validation mode
                 results = hsTrainer.cross_validate(
                     config=self.base_config,
                     dataLoader=self.dataLoader,
@@ -290,7 +252,7 @@ class AblationRunner:
                 best_epoch = results.get('best_epoch', 0)
                 output_dir = results.get('output_dir', '')
             else:
-                # ── Single hold-out mode (original behaviour) ──
+                # single hold-out mode
                 trainer = hsTrainer(
                     config=self.base_config,
                     dataLoader=self.dataLoader,
@@ -323,7 +285,7 @@ class AblationRunner:
             balance = compute_balance_score(
                 best_eval_acc, overfit_gap, total_params, self.gap_threshold)
 
-            result = AblationResult(
+            result = Result(
                 config_tag=cfg.tag,
                 model_type=cfg.model_type,
                 short_label=cfg.short_label,
@@ -365,7 +327,7 @@ class AblationRunner:
 
         return result
 
-    def run_all(self, configs: List[AblationConfig]) -> None:
+    def run_all(self, configs: List[ModuleConfig]) -> None:
         """Execute the full ablation schedule."""
         total = len(configs)
         tprint("\n")
@@ -387,7 +349,7 @@ class AblationRunner:
         tprint(f"  Ablation Complete: {len(self.results)} runs in {elapsed:.1f}s")
         tprint(f"\n")
 
-    def run_tag(self, tag: str, all_configs: List[AblationConfig]) -> None:
+    def run_tag(self, tag: str, all_configs: List[ModuleConfig]) -> None:
         """
         Train only the two configs (one per model_type) that match the given tag.
 
@@ -421,7 +383,7 @@ class AblationRunner:
         tprint(f"  Tag Run Complete: {len(matched)} run(s) in {elapsed:.1f}s")
         tprint(f"\n")
 
-    def analyze(self) -> Dict[str, Optional[AblationResult]]:
+    def analyze(self) -> Dict[str, Optional[Result]]:
         """
         Analyze results:
           1. Select best balanced model per model_type
@@ -685,7 +647,7 @@ class AblationRunner:
         plt.close(fig)
         tprint(f"  Saved: {path}")
 
-    def _cleanup_models(self, best_models: Dict[str, AblationResult]) -> None:
+    def _cleanup_models(self, best_models: Dict[str, Result]) -> None:
         """
         Remove model checkpoint files for non-optimal runs
         but preserve all visualization outputs (plots, CAMs, etc.).
@@ -721,12 +683,12 @@ class AblationRunner:
         try:
             with open(self.results_file, 'r') as f:
                 data = json.load(f)
-            self.results = [AblationResult(**d) for d in data]
+            self.results = [Result(**d) for d in data]
             tprint(f"  Loaded {len(self.results)} previous results from {self.results_file}")
         except Exception as e:
             tprint(f"  Warning: Could not load previous results: {e}")
 
-    def _save_summary(self, best_models: Dict[str, AblationResult]) -> None:
+    def _save_summary(self, best_models: Dict[str, Result]) -> None:
         """Save human-readable summary."""
         path = os.path.join(self.summary_dir, "best_models.txt")
         with open(path, 'w') as f:
@@ -761,9 +723,7 @@ class AblationRunner:
                         f"Gap={r.overfit_gap:4.1f}% | "
                         f"Params={r.total_params/1e6:6.2f}M | "
                         f"Balance={r.balance_score:6.1f}\n")
-
         tprint(f"  Saved: {path}")
-
 
 def _run_smoke_test(args) -> bool:
     """
@@ -805,7 +765,7 @@ def _run_smoke_test(args) -> bool:
         patch_size = config.split.patch_size             # 15
         num_classes = config.clsf.num                    # 8
 
-        class SyntheticHSDataset(Dataset):
+        class MiniDataset(Dataset):
             """Minimal synthetic dataset mimicking NpyHSDataset interface."""
             def __init__(self):
                 # Per-patch label (for CV split & class-weight computation)
@@ -831,10 +791,10 @@ def _run_smoke_test(args) -> bool:
                 """Return raw patch data for given index."""
                 return self.data[idx]
 
-        dataset = SyntheticHSDataset()
+        dataset = MiniDataset()
         assert len(dataset) == n_samples
         assert len(np.unique(dataset.patch_labels)) == num_classes
-        tprint(f"    Synthetic dataset: {n_samples} samples, {num_classes} classes, "
+        tprint(f"    Mini dataset: {n_samples} samples, {num_classes} classes, "
                f"{dataset._num_patients} patients")
 
         # DataLoader
@@ -867,7 +827,7 @@ def _run_smoke_test(args) -> bool:
             window_size=[7, 7],
             mlp_ratio=2.0,
             drop_path_rate=0.1,
-            spatial_size=patch_size,
+            patch_size=patch_size,
             r=4,
             lora_alpha=8,
         )
@@ -963,15 +923,15 @@ def _run_smoke_test(args) -> bool:
         # Ablation Runner (dry-run) 
         tprint("\n  Ablation runner (dry-run)...")
         smoke_configs = [
-            AblationConfig(tag="smoke", model_type="CommonViT",
+            ModuleConfig(tag="smoke", model_type="CommonViT",
                            dim=16, depths=[1, 1], num_heads=[2, 4],
                            window_size=[7, 7], mlp_ratio=2.0),
-            AblationConfig(tag="smoke", model_type="LoLA_hsViT",
+            ModuleConfig(tag="smoke", model_type="LoLA_hsViT",
                            dim=16, depths=[1, 1], num_heads=[2, 4],
                            window_size=[7, 7], mlp_ratio=2.0, r=4, lora_alpha=8),
         ]
 
-        runner = AblationRunner(
+        runner = Runner(
             base_config=config,
             dataLoader=None,
             epochs=1,
@@ -1071,15 +1031,15 @@ def main():
         tprint("Smoke test complete.")
         raise SystemExit(0 if ok else 1)
 
-    all_configs: List[AblationConfig] = []
-    all_configs.extend(build_common_vit_configs())
-    all_configs.extend(build_lola_vit_configs())
+    all_configs: List[ModuleConfig] = []
+    all_configs.extend(build_configs(model_type="CommonViT"))
+    all_configs.extend(build_configs(model_type="LoLA_hsViT"))
 
-    configs: List[AblationConfig] = []
+    configs: List[ModuleConfig] = []
     if args.model in ('common', 'both'):
-        configs.extend(build_common_vit_configs())
+        configs.extend(build_configs(model_type="CommonViT"))
     if args.model in ('lola', 'both'):
-        configs.extend(build_lola_vit_configs())
+        configs.extend(build_configs(model_type="LoLA_hsViT"))
 
     if not configs:
         tprint("No configs to run.")
@@ -1094,7 +1054,7 @@ def main():
     # Dry-run: skip data loading, just show parameter counts
     if args.dry_run:
         show_configs = [c for c in all_configs if c.tag == args.tag] if args.tag else configs
-        runner = AblationRunner(
+        runner = Runner(
             base_config=config,
             dataLoader=None,
             epochs=args.epoch,
@@ -1109,7 +1069,7 @@ def main():
     # Full run: load data
     dataLoader = NpyHSDataset(config=config, transform=None)
 
-    runner = AblationRunner(
+    runner = Runner(
         base_config=config,
         dataLoader=dataLoader,
         epochs=args.epoch,

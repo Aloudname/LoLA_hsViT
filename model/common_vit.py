@@ -135,11 +135,11 @@ class CommonViT(nn.Module):
     Same API and params with LoLA are remaining.
     """
     
-    def __init__(self, in_channels=15, num_classes=8, dim=96, depths=[3, 4, 5],
-                 num_heads=[4, 8, 16], window_size=[7, 7, 7], mlp_ratio=4.,
-                 drop_path_rate=0.2, spatial_size=15, r=16, lora_alpha=32):
+    def __init__(self, in_channels=None, num_classes=None, patch_size=None, dim=96, depths=[3, 4, 5],
+                 num_heads=[4, 8, 16], mlp_ratio=4., drop_path_rate=0.2):
         """
         Standard, common ViT for hyperspectral image pixel-level segmentation.
+        in_channel num_classes and patch_size are necessary.
         
         params:
             in_channels (int): 15 default.
@@ -150,7 +150,7 @@ class CommonViT(nn.Module):
             window_size (list): only for compatibility.
             mlp_ratio (float): num of MLP hidden layes, 4 default.
             drop_path_rate (float): drop path rate, 0.2 default.
-            spatial_size (int): input spatial size (pixel), 15 default.
+            patch_size (int): input spatial size (pixel), 15 default.
             r (int): only for compatibility.
             lora_alpha (float): only for compatibility.
         """
@@ -160,11 +160,11 @@ class CommonViT(nn.Module):
         self.dim = dim
         self.depths = depths
         self.num_heads = num_heads
-        self.spatial_size = spatial_size
+        self.patch_size = patch_size
         self.mode = 'segmentation'  # pixel-level only
         
         print(f"StandardHSITransformer initialized with {in_channels} input channels, "
-              f"{num_classes} classes, depths {depths}")
+              f"{num_classes} classes, depths {depths}, {patch_size} patch_size.")
         
         # preprocessing layers.
         self.spectral_conv = nn.Sequential(
@@ -190,7 +190,7 @@ class CommonViT(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        self.patch_resolution = spatial_size // 2
+        self.patch_resolution = patch_size // 2
         self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_resolution,
                                                    self.patch_resolution, dim))
         self.pos_drop = nn.Dropout(p=0.1)
@@ -378,7 +378,8 @@ class CommonViT(nn.Module):
         B, C, H, W = x.shape
         
         if C != self.in_channels:
-            print(f"WARNING: Input has {C} channels, but model expects {self.in_channels}")
+            print(f"\nWARNING: Input has {C} channels, but model expects {self.in_channels}.\n"
+                  "This usually caused by incorrect data shape, which requires [B, C, H, W]. \n")
         
         x = self.forward_features(x)  # [B, N, C_final]
         
@@ -401,7 +402,7 @@ if __name__ == "__main__":
     model = CommonViT(
         in_channels=15, num_classes=8, dim=96, depths=[3, 4, 5],
         num_heads=[4, 8, 16], window_size=[7, 7, 7], mlp_ratio=4.,
-        drop_path_rate=0.2, spatial_size=15, r=16, lora_alpha=32
+        drop_path_rate=0.2, patch_size=15, r=16, lora_alpha=32
     )
     
     dummy_input = torch.randn(2, 15, 15, 15)  # [B, C, H, W]

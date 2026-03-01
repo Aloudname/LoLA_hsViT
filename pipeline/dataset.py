@@ -400,7 +400,7 @@ class NpyHSDataset(AbstractHSDataset):
 
             patient_records.append((data, labels, pid_idx))
 
-            # collect non-bg pixels for global stats (unchanged: labels > 0)
+            # collect non-bg pixels for global stats (labels > 0)
             mask = labels.reshape(-1) > 0
             real_px = data.reshape(-1, data.shape[2])[mask]
             all_real_pixels.append(real_px)
@@ -408,6 +408,7 @@ class NpyHSDataset(AbstractHSDataset):
             tprint(f"  loaded {idx+1}/{len(pairs)}: "
                    f"{os.path.basename(data_file)} ({patient_id}), "
                    f"shape {data.shape}, non-bg pixels: {mask.sum():,}, "
+                   f"possesses non_bg labels: {np.unique(labels)}, "
                    f"max label {labels.max()}, min label {labels.min()}"
                    )
 
@@ -422,24 +423,26 @@ class NpyHSDataset(AbstractHSDataset):
         del all_real_pixels
         c = all_real.shape[1]
 
-        # subsample for normalization stats — use up to 2M pixels for stable mean/std
-        # (larger sample = more accurate global stats; memory cost ~2M * c * 4 bytes)
+        # subsample for normalization stats 
+        # use up to 2M pixels for stable mean/std
+        # larger sample = more acc global stats;
+        # memory cost ~(max_fit * c * 4) bytes
         max_fit = 2_000_000
         if len(all_real) > max_fit:
             rng_fit = np.random.RandomState(350235)
             fit_idx = rng_fit.choice(len(all_real), max_fit, replace=False)
-            fit_data = all_real[fit_idx]   # shape: (max_fit, c) — independent copy
+            fit_data = all_real[fit_idx]   # shape: (max_fit, c) independent copy
             del all_real                   # free large array immediately
         else:
             fit_data = all_real
             all_real = None               # release reference; fit_data keeps the data
 
-        # global normalization stats — fit on non-bg pixels only
+        # global normalization stats fit on non-bg pixels only
         global_mean = fit_data.mean(axis=0).astype(np.float32)       # shape: (c,)
         global_std  = fit_data.std(axis=0).astype(np.float32) + 1e-8 # shape: (c,)
         tprint(f"  normalization fit on {len(fit_data):,} non-bg pixels")
 
-        # pca — fit on normalized non-bg pixels, capped at 500K
+        # pca fit on normalized non-bg pixels, capped at 500K
         # O(n * p^2); 500K is sufficient for stable eigenvectors)
         n_components = self.config.preprocess.pca_components
         pca_obj = None
@@ -465,8 +468,7 @@ class NpyHSDataset(AbstractHSDataset):
                    f"explained variance: {explained:.1f}%, "
                    f"fit on {len(pca_fit):,} pixels")
             del normalized_fit, pca_fit
-
-        del fit_data   # all_real already freed above
+        del fit_data
 
         # pre-compute pca projection matrix in float32
         if pca_obj is not None:
@@ -503,15 +505,15 @@ class NpyHSDataset(AbstractHSDataset):
 
             processed = flat.reshape(h, w, c_out)        # shape: (h_i, w_i, c_out)
 
-            # pad this patient independently — no cross-patient bleeding
             padded_data = self._pad_with_zeros(processed, self.margin)
             # padded shape: (h_i + 2*margin, w_i + 2*margin, c_out)
 
-            # pad labels: background / padding -> 255 (ignore_index)
+            # pad labels: bg / padding -> 255 (ignore_index)
+            # lbl shape: (h_i + 2*margin, w_i + 2*margin)
             padded_lbl = np.full(
                 (h + 2 * self.margin, w + 2 * self.margin),
                 fill_value=255, dtype=np.int32
-            )  # shape: (h_i + 2*margin, w_i + 2*margin)
+                )       
             lbl_region = labels.copy().astype(np.int32)
             lbl_region[lbl_region > 0] -= 1    # 1-based -> 0-based class index
             lbl_region[labels == 0] = 255      # background -> ignore
@@ -539,17 +541,15 @@ class NpyHSDataset(AbstractHSDataset):
             all_patch_indices.append(indices)
             all_patch_labels.append(patch_labels)
             all_patient_groups.append(patient_groups)
+        # del inside the loop only removed loop-variable
+            del data, labels, flat, processed, padded_data, padded_lbl
+        # patient_records still held references until here
+        del patient_records, _patient_id_map
 
-            del data, labels, flat, processed
-
-        # free all original patient arrays — del inside the loop only removed loop-variable
-        # names; patient_records still held references until here
-        del patient_records
-
-        # --- phase 4: concatenate ---
-        self.patch_indices = np.concatenate(all_patch_indices, axis=0)          # shape: (N, 3)
-        self.patch_labels = np.concatenate(all_patch_labels, axis=0)            # shape: (N,)
-        self.patch_patient_groups = np.concatenate(all_patient_groups, axis=0)  # shape: (N,)
+        # concatenate
+        self.patch_indices = np.concatenate(all_patch_indices, axis=0)          # (N, 3)
+        self.patch_labels = np.concatenate(all_patch_labels, axis=0)            # (N,)
+        self.patch_patient_groups = np.concatenate(all_patient_groups, axis=0)  # (N,)
 
         unique_groups, group_counts = np.unique(
             self.patch_patient_groups, return_counts=True)

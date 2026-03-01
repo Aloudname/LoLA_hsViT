@@ -546,9 +546,9 @@ class LoLA_hsViT(nn.Module):
         (4) Segmentation Head of ``[B, HW/64, 4dim] -> [B, K, H, W]``:
                 ``X_3`` --(seg_decoder + interpolate + seg_head)--> output ``Y``
     """
-    def __init__(self, in_channels=15, num_classes=8, dim=96, depths=[3, 4, 5],
+    def __init__(self, in_channels=None, num_classes=None, patch_size=None, dim=96, depths=[3, 4, 5],
                  num_heads=[4, 8, 16], window_size=[7, 7, 7], mlp_ratio=4.,
-                 drop_path_rate=0.2, spatial_size=15, r=16, lora_alpha=32):
+                 drop_path_rate=0.2, r=16, lora_alpha=32):
         """
         Args:
             ``in_channels``: Number of input channels (spectral bands).
@@ -559,7 +559,7 @@ class LoLA_hsViT(nn.Module):
             ``window_size``: List of window sizes for each LoLA_hsViT block.
             ``mlp_ratio``: Ratio for MLP hidden dimension.
             ``drop_path_rate``: Stochastic depth rate.
-            ``spatial_size``: Spatial size.
+            ``patch_size``: Spatial size.
             ``r``: LoRA rank.
             ``lora_alpha``: LoRA scaling factor.
         """
@@ -595,7 +595,7 @@ class LoLA_hsViT(nn.Module):
         )
         
         # Position embedding
-        self.patch_resolution = spatial_size // 2
+        self.patch_resolution = patch_size // 2
         self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_resolution, 
                                                  self.patch_resolution, dim))
         self.pos_drop = nn.Dropout(p=0.1)
@@ -816,7 +816,8 @@ class LoLA_hsViT(nn.Module):
         B, C, H, W = x.shape
         
         if C != self.in_channels:
-            print(f"WARNING: Input has {C} channels, but model expects {self.in_channels}")
+            print(f"\nWARNING: Input has {C} channels, but model expects {self.in_channels}.\n"
+                  "This usually caused by incorrect data shape, which requires [B, C, H, W]. \n")
         
         # Extract features through backbone
         x = self.forward_features(x)  # [B, N, C_final]
@@ -840,7 +841,7 @@ if __name__ == "__main__":
     # Example usage and testing of the model.
     model = LoLA_hsViT(in_channels=15, num_classes=8, dim=96, depths=[3, 4, 5],
                        num_heads=[4, 8, 16], window_size=[7, 7, 7], mlp_ratio=4.,
-                       drop_path_rate=0.2, spatial_size=15, r=16, lora_alpha=32)
+                       drop_path_rate=0.2, patch_size=15, r=16, lora_alpha=32)
     
     dummy_input = torch.randn(2, 15, 15, 15)  # [B, C, H, W]
     

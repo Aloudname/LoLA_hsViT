@@ -18,9 +18,10 @@ from tqdm import tqdm
 from munch import Munch
 from torch.nn import Module
 from pipeline.monitor import tprint
-from typing import Tuple, Callable, Dict
 from pipeline.dataset import AbstractHSDataset
 from torch.cuda.amp import GradScaler, autocast
+from dataclasses import dataclass, field
+from typing import Tuple, Callable, Dict, Optional, List
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from sklearn.metrics import (accuracy_score, balanced_accuracy_score,
                              cohen_kappa_score,
@@ -125,9 +126,11 @@ def _worker_plot_confusion_matrix(cm, cm_norm, metrics_text,
         f.write(metrics_text)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[0])
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[0],
+                xticklabels=class_names, yticklabels=class_names)
     axes[0].set_title('Confusion Matrix (Count)'); axes[0].set_ylabel('True'); axes[0].set_xlabel('Predicted')
-    sns.heatmap(cm_norm, annot=True, fmt='.1%', cmap='Greens', ax=axes[1])
+    sns.heatmap(cm_norm, annot=True, fmt='.1%', cmap='Greens', ax=axes[1],
+                xticklabels=class_names, yticklabels=class_names)
     axes[1].set_title('Confusion Matrix (Normalized)'); axes[1].set_ylabel('True'); axes[1].set_xlabel('Predicted')
     plt.tight_layout()
     plt.savefig(os.path.join(output, 'confusion_matrix.png'), dpi=150, bbox_inches='tight')
@@ -288,7 +291,6 @@ class ModelEMA:
             b_m.data   = b_s.data
             b_s.data   = tmp
 
-
 class hsTrainer:
     """
     Trainer for hyperspectral dataset.
@@ -305,6 +307,7 @@ class hsTrainer:
         num_gpus: int = 1,
         train_loader=None,
         test_loader=None,
+        **kwargs
     ):
         
         self.config = config
@@ -315,6 +318,7 @@ class hsTrainer:
         self.debug_mode = debug_mode
         self.num_gpus = num_gpus
         self.output = self.config.path.output + f'/{self.model_name}'
+        self.kwargs = kwargs
         
         os.makedirs(self.output, exist_ok=True)
         os.makedirs(os.path.join(self.output, 'CAM'), exist_ok=True)
@@ -357,7 +361,7 @@ class hsTrainer:
     
     def _setup_device(self) -> None:
         """setup device and validate multi-GPU configuration"""
-        device_type = self.config.get('device_type', 'cuda')
+        device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
         try:
             self.device = torch.device(device_type)
             if device_type == 'cuda':
@@ -431,7 +435,7 @@ class hsTrainer:
         """create model and print parameter count"""
         tprint("Creating model with:")
         try:
-            self.model = self.model()
+            self.model = self.model(**self.kwargs)
             self.model.to(self.device)
             
             # stats for model parameter count
@@ -516,7 +520,6 @@ class hsTrainer:
             print(f"  AMP enabled, EMA(decay={ema_decay}), patience={self.patience}")
         else:
             print(f"  EMA(decay={ema_decay}), patience={self.patience}")
-
     
     def train_epoch(self, epoch: int) -> Tuple[float, float]:
         """
@@ -1473,7 +1476,7 @@ class hsTrainer:
         # Per-class binary label avoids:
         #   (a) np.zeros((4.4B, 8)) — 14 GB allocation
         #   (b) 4.4B-iteration Python for-loop
-        #   (c) roc_curve sorting 4.4B elements × 8 classes
+        #   (c) roc_curve sorting pixels * classes ~ 8 * 4.4B*log(4.4B) ops
         roc_data = None
         probas_targets = getattr(self, '_last_probas_targets', None)
         if probas is not None and probas_targets is not None:
