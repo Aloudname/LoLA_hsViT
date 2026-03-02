@@ -136,7 +136,8 @@ class CommonViT(nn.Module):
     """
     
     def __init__(self, in_channels=None, num_classes=None, patch_size=None, dim=96, depths=[3, 4, 5],
-                 num_heads=[4, 8, 16], mlp_ratio=4., drop_path_rate=0.2):
+                 num_heads=[4, 8, 16], mlp_ratio=4., drop_path_rate=0.2,
+                 window_size=None, r=None, lora_alpha=None):
         """
         Standard, common ViT for hyperspectral image pixel-level segmentation.
         in_channel num_classes and patch_size are necessary.
@@ -147,14 +148,15 @@ class CommonViT(nn.Module):
             dim (int): dim of feature maps, 96 default.
             depths (list): num of transformer blocks, [3, 4, 5] default.
             num_heads (list): attention head for layers, [4, 8, 16] default.
-            window_size (list): only for compatibility.
+            window_size (list): only for compatibility, ignored.
             mlp_ratio (float): num of MLP hidden layes, 4 default.
             drop_path_rate (float): drop path rate, 0.2 default.
             patch_size (int): input spatial size (pixel), 15 default.
-            r (int): only for compatibility.
-            lora_alpha (float): only for compatibility.
+            r (int): only for compatibility, ignored.
+            lora_alpha (float): only for compatibility, ignored.
         """
         super().__init__()
+        # Note: window_size, r, lora_alpha are accepted for API compatibility but ignored
         self.in_channels = in_channels
         self.num_classes = num_classes
         self.dim = dim

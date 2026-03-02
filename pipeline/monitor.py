@@ -75,14 +75,7 @@ class Monitor:
             import torch
             return torch.cuda.is_available()
         except ImportError:
-            try:
-                import pynvml
-                pynvml.nvmlInit()
-                device_count = pynvml.nvmlDeviceGetCount()
-                pynvml.nvmlShutdown()
-                return device_count > 0
-            except:
-                return False
+            raise ImportError("torch.cuda not available for GPU monitoring.")
     
     def _init_gpu_monitor(self):
         self._gpu_backend = None  # 'pynvml' or 'torch'

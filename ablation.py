@@ -114,28 +114,28 @@ def build_configs(model_type: str) -> List[ModuleConfig]:
     config = load_config()
     return [
         ModuleConfig(tag="full_stack",  model_type=model_type,
-                       dim=96, depths=[3,4,5], num_heads=[4,8,16], mlp_ratio=4.0,
-                       r=16, lora_alpha=32, in_channels=config.preprocess.pca_components,
-                       patch_size=config.split.patch_size, num_classes=config.clsf.num),
+                        dim=96, depths=[3,4,5], num_heads=[4,8,16], mlp_ratio=4.0,
+                        in_channels=config.preprocess.pca_components,
+                        patch_size=config.split.patch_size, num_classes=config.clsf.num),
         ModuleConfig(tag="shallow_dim",   model_type=model_type,
-                       dim=96, depths=[2,3,3], num_heads=[4,8,16], mlp_ratio=4.0,
-                       r=16, lora_alpha=32, in_channels=config.preprocess.pca_components,
-                       patch_size=config.split.patch_size, num_classes=config.clsf.num),
+                        dim=96, depths=[2,3,3], num_heads=[4,8,16], mlp_ratio=4.0,
+                        in_channels=config.preprocess.pca_components,
+                        patch_size=config.split.patch_size, num_classes=config.clsf.num),
         ModuleConfig(tag="reduced",   model_type=model_type,
-                       dim=64, depths=[2,3,3], num_heads=[4,8,16], mlp_ratio=4.0,
-                       r=16, lora_alpha=32, in_channels=config.preprocess.pca_components,
-                       patch_size=config.split.patch_size, num_classes=config.clsf.num),
+                        dim=64, depths=[2,3,3], num_heads=[4,8,16], mlp_ratio=4.0,
+                        in_channels=config.preprocess.pca_components,
+                        patch_size=config.split.patch_size, num_classes=config.clsf.num),
         ModuleConfig(tag="tiny",     model_type=model_type,
-                       dim=32, depths=[2,2,2], num_heads=[4,8,16], mlp_ratio=2.0,
-                       r=8, lora_alpha=16, in_channels=config.preprocess.pca_components,
-                       patch_size=config.split.patch_size, num_classes=config.clsf.num),
+                        dim=64, depths=[2,2,2], num_heads=[4,8,16], mlp_ratio=2.0,
+                        in_channels=config.preprocess.pca_components,
+                        patch_size=config.split.patch_size, num_classes=config.clsf.num),
         ModuleConfig(tag="mini",     model_type=model_type,
-                       dim=32, depths=[1,1,2], num_heads=[2,4,8], window_size=[7,7,7],
-                       mlp_ratio=2.0, r=4, lora_alpha=8, in_channels=config.preprocess.pca_components,
-                       patch_size=config.split.patch_size, num_classes=config.clsf.num),
+                        dim=48, depths=[1,1,2], num_heads=[2,4,8], 
+                        in_channels=config.preprocess.pca_components,
+                        patch_size=config.split.patch_size, num_classes=config.clsf.num),
         ModuleConfig(tag="two_level", model_type=model_type,
-                            dim=48, depths=[2,2], num_heads=[2,4], window_size=[7,7],
-                            mlp_ratio=3.0, r=4, lora_alpha=8, in_channels=config.preprocess.pca_components,
+                            dim=16, depths=[1,1], num_heads=[2,4],
+                            mlp_ratio=3.0, in_channels=config.preprocess.pca_components,
                             patch_size=config.split.patch_size, num_classes=config.clsf.num),
     ]
 
@@ -1010,20 +1010,15 @@ def main():
     parser.add_argument('--smoke-test', '-s', action='store_true',
                         help='Quick end-to-end validation with synthetic data. '
                              'Runs 1 epoch, 2-fold CV, tiny model. Finishes in <60s.')
-    parser.add_argument('--analyze_dataset', '-a', action='store_true',
-                        help='Analyze dataset distribution and generate plots.')
+    parser.add_argument('--limit-pairs', type=int, default=None,
+                        help='Debug: only load the first N data/label pairs')
+    parser.add_argument('--max-patches-per-patient', type=int, default=None,
+                        help='Debug: cap number of patches per patient')
+    parser.add_argument('--fast-debug', action='store_true',
+                        help='Debug: enable fast path (limit pairs + verbose summary)')
 
 
     args = parser.parse_args()
-
-    if args.analyze_dataset:
-        tprint("Analyzing mode enabled.")
-        config = load_config()
-        print(f"Loading dataset from: {config.path.data}")
-        dataset = NpyHSDataset(config=config)
-        analyze_dataset(dataset, show_split=True)
-        tprint("Dataset analysis complete.")
-        raise SystemExit(0)
 
     if args.smoke_test:
         tprint("Smoke test mode enabled.")
@@ -1067,7 +1062,15 @@ def main():
         return
 
     # Full run: load data
-    dataLoader = NpyHSDataset(config=config, transform=None)
+    dataLoader = NpyHSDataset(
+        config=config,
+        transform=None,
+        limit_pairs=args.limit_pairs,
+        max_patches_per_patient=args.max_patches_per_patient,
+        debug_mode=args.fast_debug,
+    )
+    if args.fast_debug:
+        dataLoader.describe(top_k=3)
 
     runner = Runner(
         base_config=config,

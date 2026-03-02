@@ -183,7 +183,7 @@ class AbstractHSDataset(ABC, Dataset):
                            self.margin:self.margin + self.raw_labels.shape[1]] = label_region
         tprint(f"Created padded label map: {self.padded_labels.shape}")
 
-    def _get_patch(self, idx: int) -> np.ndarray:
+    def _get_patch_(self, idx: int) -> np.ndarray:
         """
         Get a single patch from the cached padded data.
         
@@ -200,7 +200,7 @@ class AbstractHSDataset(ABC, Dataset):
         ]
         return patch.copy()
 
-    def _get_label_patch(self, idx: int) -> np.ndarray:
+    def _get_label_patch_(self, idx: int) -> np.ndarray:
         """
         Get the dense label patch for segmentation mode.
         Returns label map of shape (patch_size, patch_size) where
@@ -247,7 +247,7 @@ class AbstractHSDataset(ABC, Dataset):
             - label: Tensor of shape (H, W) with per-pixel class indices
                      (255 = ignore / background)
         """
-        patch = self._get_patch(idx)
+        patch = self._get_patch_(idx)
         
         # Convert to (C, H, W) format for PyTorch
         patch = np.transpose(patch, (2, 0, 1))
@@ -256,7 +256,7 @@ class AbstractHSDataset(ABC, Dataset):
             patch = self.transform(patch)
         
         # Always return dense per-pixel labels
-        label_patch = self._get_label_patch(idx)  # [H, W]
+        label_patch = self._get_label_patch_(idx)  # [H, W]
         return torch.FloatTensor(patch), torch.LongTensor(label_patch)
 
 class NpyHSDataset(AbstractHSDataset):
@@ -279,18 +279,20 @@ class NpyHSDataset(AbstractHSDataset):
     def __init__(self, 
                  config: Munch = None,
                  transform: Optional[Any] = None,
+                 limit_pairs: Optional[int] = None,
+                 max_patches_per_patient: Optional[int] = None,
+                 debug_mode: bool = False,
                   **kwargs: Any) -> None:
         """
-        per-patient pipeline: loads each patient independently to avoid
-        cross-patient patch contamination and zero-padding noise in pca.
+        per-patient pipeline: 
+        loads each patient independently,
+        to avoid cross-patient patch contamination and zero-padding noise in pca.
 
         bypasses AbstractHSDataset.__init__ which concatenates all patients
         into one image, causing boundary artifacts and polluted statistics.
         """
-        # initialize torch Dataset directly (skip abstract concat pipeline)
         Dataset.__init__(self)
 
-        # replicate base attributes from AbstractHSDataset.__init__
         self.config = config
         self.data_path = config.path.data
         self.label_path = config.path.label
@@ -301,8 +303,22 @@ class NpyHSDataset(AbstractHSDataset):
         self.transform = transform
         self.kwargs = kwargs
         self.test_rate = config.split.test_rate
+        
+        # Debug-friendly controls
+        self.limit_pairs = limit_pairs  # only load first N pairs when set
+        self.max_patches_per_patient = max_patches_per_patient  # cap patches per patient
+        self.debug_mode = debug_mode
 
-        # per-patient pipeline (replaces _load_data + _preprocess_data + _create_patches)
+        # Cached stats for downstream analysis
+        self.global_mean: Optional[np.ndarray] = None
+        self.global_std: Optional[np.ndarray] = None
+        self.pca_components: Optional[np.ndarray] = None
+        self.pca_mean: Optional[np.ndarray] = None
+        self.pca_explained_variance: Optional[np.ndarray] = None
+        self.feature_dim: Optional[int] = None
+        self._label_remap: Optional[np.ndarray] = None
+
+        # per-patient pipeline (_load_data + _preprocess_data + _create_patches)
         self._per_patient_pipeline()
     
     @staticmethod
@@ -340,7 +356,10 @@ class NpyHSDataset(AbstractHSDataset):
         """
         
         from sklearn.decomposition import PCA
-        pairs = self._pair_data_and_labels()
+        pairs = self._pair_data_and_labels_()
+        if self.limit_pairs is not None:
+            pairs = pairs[: self.limit_pairs]
+            tprint(f"  DEBUG limit_pairs={self.limit_pairs}: using first {len(pairs)} pair(s)")
         if not pairs:
             raise RuntimeError("no data/label pairs found in " + self.data_path)
 
@@ -352,12 +371,13 @@ class NpyHSDataset(AbstractHSDataset):
             1,  # 1: PG         -> PG    (1)
             2,  # 2: FAT        -> FAT   (2)
             3,  # 3: TG         -> TG    (3)
-            4,  # 4: LN         -> LN    (4)
-            5,  # 5: MS         -> MS    (5)
-            6,  # 6: Blood      -> Blood (6)
-            7,  # 7: Tra        -> Tra   (7)
-            8,  # 8: ES         -> ES    (8)
+            0,  # 4: LN         -> LN    (4)
+            4,  # 5: MS         -> MS    (5)
+            0,  # 6: Blood      -> Blood (6)
+            5,  # 7: Tra        -> Tra   (7)
+            6,  # 8: ES         -> ES    (8)
         ], dtype=np.int32)
+        self._label_remap = _label_remap
 
         tprint("loading patients...")
         patient_records = []
@@ -440,6 +460,8 @@ class NpyHSDataset(AbstractHSDataset):
         # global normalization stats fit on non-bg pixels only
         global_mean = fit_data.mean(axis=0).astype(np.float32)       # shape: (c,)
         global_std  = fit_data.std(axis=0).astype(np.float32) + 1e-8 # shape: (c,)
+        self.global_mean = global_mean
+        self.global_std = global_std
         tprint(f"  normalization fit on {len(fit_data):,} non-bg pixels")
 
         # pca fit on normalized non-bg pixels, capped at 500K
@@ -474,11 +496,16 @@ class NpyHSDataset(AbstractHSDataset):
         if pca_obj is not None:
             pca_components = pca_obj.components_.astype(np.float32)  # shape: (n_components, c)
             pca_mean = pca_obj.mean_.astype(np.float32)              # shape: (c,)
+            self.pca_explained_variance = pca_obj.explained_variance_ratio_.astype(np.float32)
             c_out = n_components
         else:
             pca_components = None
             pca_mean = None
             c_out = c
+
+        self.pca_components = pca_components
+        self.pca_mean = pca_mean
+        self.feature_dim = c_out
 
         # patient norm -> pca -> pad -> extract patches
         # patient padded independently, no cross-patient boundary bleeding
@@ -528,6 +555,14 @@ class NpyHSDataset(AbstractHSDataset):
             rows, cols = np.where(labels > 0)
             n_patches = len(rows)
 
+            if self.max_patches_per_patient is not None and n_patches > self.max_patches_per_patient:
+                sel = np.random.RandomState(123 + idx).choice(n_patches, self.max_patches_per_patient, replace=False)
+                rows = rows[sel]
+                cols = cols[sel]
+                n_patches = len(rows)
+                if self.debug_mode:
+                    tprint(f"    capped patches for patient {pid_idx} to {n_patches}")
+
             # patch_indices: (patient_list_idx, row_in_padded, col_in_padded)
             indices = np.stack([
                 np.full(n_patches, patient_list_idx, dtype=np.int32),
@@ -560,7 +595,7 @@ class NpyHSDataset(AbstractHSDataset):
         print(f"  patch shape: ({self.patch_size}, {self.patch_size}, {c_out}), "
               f"dtype: float32")
 
-    def _get_patch(self, idx: int) -> np.ndarray:
+    def _get_patch_(self, idx: int) -> np.ndarray:
         """
         get a single patch from per-patient padded data.
         patch_indices[idx] = (patient_list_idx, row_padded, col_padded).
@@ -574,7 +609,7 @@ class NpyHSDataset(AbstractHSDataset):
             :
         ].copy()
 
-    def _get_label_patch(self, idx: int) -> np.ndarray:
+    def _get_label_patch_(self, idx: int) -> np.ndarray:
         """
         get dense label patch for segmentation.
         returns: np.ndarray of shape (patch_size, patch_size), 255 = ignore.
@@ -586,7 +621,7 @@ class NpyHSDataset(AbstractHSDataset):
             c - self.margin : c + self.margin + 1
         ].copy()
 
-    def _pair_data_and_labels(self) -> List[Tuple[str, str]]:
+    def _pair_data_and_labels_(self) -> List[Tuple[str, str]]:
         """
         Pair data and label files based on naming convention.
         
@@ -619,113 +654,116 @@ class NpyHSDataset(AbstractHSDataset):
         """legacy stub — kept for abc compliance. see _per_patient_pipeline()."""
         pass
     
-    def create_data_loader(self, num_workers=4, batch_size=None, pin_memory=True, 
+    def _create_data_loader_(self, num_workers=4, batch_size=None, pin_memory=True, 
                            prefetch_factor=2, persistent_workers=False):
         """
         Create PyTorch DataLoaders with optimized performance settings.
         
+        Uses StratifiedGroupKFold (single fold) for train/val+test split to preserve
+        class distribution across splits while preventing patient-level leakage.
+        Train set uses balanced sampling; val set for early stopping; test set held out.
+        
         Args:
             num_workers: Number of worker threads for parallel data loading.
-                        Recommended: 4 for optimal throughput (prevents I/O bottleneck).
-                        Set to 0 only to debug or on single-core systems.
             batch_size: Batch size for each iteration. If None, uses config value or 32.
-            pin_memory: Whether to pin memory for GPU transfer, better True on GPU.
+            pin_memory: Whether to pin memory for GPU transfer.
             prefetch_factor: preload batches per worker.
             persistent_workers: keep workers from frequent recreation.
         
         Returns:
-            Tuple of (train_loader, test_loader)
+            Tuple of (train_loader, val_loader, test_loader)
         """
 
-        from sklearn.model_selection import GroupShuffleSplit
+        from sklearn.model_selection import StratifiedGroupKFold, GroupShuffleSplit
         
         total_indices = np.arange(len(self.patch_indices))
         all_classes = set(np.unique(self.patch_labels))
         
-        # Patient-level split to prevent data leakage.
-        # NOTE: Retry with different seeds to find a split where ALL classes
-        # appear in both train and test sets (rare class 3, 7 may only exist in
-        # a few patients (need check), so some seeds will strand them in one set).
-        best_split = None
-        best_missing = len(all_classes) * 2 + 1  # guarantee any real result beats this
-        base_seed = 350234
+        # stratified patient-level split into train+val vs test
+        # StratifiedGroupKFold preserves class proportions while ensuring patient isolation.
+        # use 5-fold split: take 1 fold as test (20%), 4 folds as train+val pool.
+        sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=350234)
+        trainval_idx, test_idx = next(sgkf.split(
+            total_indices, self.patch_labels,
+            groups=self.patch_patient_groups
+        ))
         
-        for seed in range(base_seed, base_seed + 100):
-            gss = GroupShuffleSplit(n_splits=1, test_size=self.test_rate,
-                                   random_state=seed)
-            t_idx, v_idx = next(gss.split(
-                total_indices, self.patch_labels,
-                groups=self.patch_patient_groups
-            ))
-            
-            test_cls = set(np.unique(self.patch_labels[v_idx]))
-            train_cls = set(np.unique(self.patch_labels[t_idx]))
-            n_missing = len(all_classes - test_cls) + len(all_classes - train_cls)
-            
-            if n_missing == 0:
-                train_idx, test_idx = t_idx, v_idx
-                tprint(f"  GroupShuffleSplit: found full-coverage split (seed={seed})")
-                break
-            if n_missing < best_missing:
-                best_missing = n_missing
-                best_split = (t_idx, v_idx, seed)
-        else:
-            # No perfect split found — use the best available one
-            if best_split is None:
-                # every seed had the same n_missing; just use the last one
-                train_idx, test_idx = t_idx, v_idx
-                tprint("  WARNING: No split improved over baseline; using last seed.")
-            else:
-                train_idx, test_idx, seed = best_split
-                tprint(f"  WARNING: No split covers all classes in both sets after 100 seeds. "
-                       f"Using best seed={seed} ({best_missing} missing class(es)).")
+        # split train+val pool into train vs val (patient-level)
+        # GroupShuffleSplit on the trainval pool: 10% val.
+        val_rate = self.config.split.val_rate
+        gss = GroupShuffleSplit(n_splits=1, test_size=val_rate, random_state=350234)
+        train_rel, val_rel = next(gss.split(
+            np.arange(len(trainval_idx)),
+            self.patch_labels[trainval_idx],
+            groups=self.patch_patient_groups[trainval_idx]
+        ))
+        train_idx = trainval_idx[train_rel]
+        val_idx = trainval_idx[val_rel]
         
-        # Verify no patient-level leakage
+        # verify no patient leakage
         train_patients = set(self.patch_patient_groups[train_idx])
+        val_patients = set(self.patch_patient_groups[val_idx])
         test_patients = set(self.patch_patient_groups[test_idx])
-        assert len(train_patients & test_patients) == 0, \
-            "Data leakage detected: patients appear in both train and test sets!"
-        tprint(f"Patient-level split: {len(train_patients)} train patients, "
-              f"{len(test_patients)} test patients (0 overlap)")
+        assert len(train_patients & val_patients) == 0, "Leakage: train/val overlap!"
+        assert len(train_patients & test_patients) == 0, "Leakage: train/test overlap!"
+        assert len(val_patients & test_patients) == 0, "Leakage: val/test overlap!"
+        tprint(f"Patient-level split: {len(train_patients)} train, "
+              f"{len(val_patients)} val, {len(test_patients)} test (0 overlap)")
         
-        # Check class coverage in both splits
-        train_classes = set(np.unique(self.patch_labels[train_idx]))
-        test_classes = set(np.unique(self.patch_labels[test_idx]))
-        if train_classes != all_classes:
-            missing = all_classes - train_classes
-            print(f"  WARNING: Training set missing classes: {missing}")
-        if test_classes != all_classes:
-            missing = all_classes - test_classes
-            print(f"  WARNING: Test set missing classes: {missing}")
+        # check class coverage
+        for name, idx in [("Train", train_idx), ("Val", val_idx), ("Test", test_idx)]:
+            split_classes = set(np.unique(self.patch_labels[idx]))
+            if split_classes != all_classes:
+                print(f"  WARNING: {name} set missing classes: {all_classes - split_classes}")
         
-        # create indexed subsets:
-        # Training: augmented subset with spatial/spectral augmentations
-        # Testing: plain subset without augmentations
+        # log class distribution for sanity check
+        for name, idx in [("Train", train_idx), ("Val", val_idx), ("Test", test_idx)]:
+            dist = np.bincount(self.patch_labels[idx], minlength=self.num)
+            pct = (dist / dist.sum() * 100).round(1)
+            tprint(f"  {name} class dist: {dict(zip(self.config.clsf.targets, pct))}")
+        
+        # create indexed subsets
+        # augmentation for train only
         train_subset = _AugmentedSubset(
             self, train_idx,
             noise_std=0.02,
             band_drop_rate=0.05,
             cutout_ratio=0.15
         )
+        val_subset = _IndexedSubset(self, val_idx)
         test_subset = _IndexedSubset(self, test_idx)
         print(f"Training augmentations enabled: flip, rotate, spectral noise, band dropout, cutout")
 
-        # memory： prefer config value, then explicit attr, then safe default
         if batch_size is None:
             batch_size = getattr(self.config.split, 'batch_size',
                          getattr(self, 'batch_size', 32))
-        
         actual_pin_memory = pin_memory and torch.cuda.is_available()
+        
+        # balanced sampler for training
+        # sqrt-inverse weighting to handle class imbalance
+        train_sampler = self._sampler_balance(train_idx)
         
         train_loader = torch.utils.data.DataLoader(
             train_subset,
             batch_size=batch_size,
-            shuffle=True,
+            sampler=train_sampler,  # balanced sampling instead of shuffle
             num_workers=num_workers,
             pin_memory=actual_pin_memory,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
             persistent_workers=persistent_workers and (num_workers > 0),
-            drop_last=True,  # drop last batch if it's smaller than batch_size
+            drop_last=True,
+            timeout=60 if num_workers > 0 else 0
+        )
+        
+        val_loader = torch.utils.data.DataLoader(
+            val_subset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=actual_pin_memory,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=persistent_workers and (num_workers > 0),
+            drop_last=False,
             timeout=60 if num_workers > 0 else 0
         )
         
@@ -742,14 +780,14 @@ class NpyHSDataset(AbstractHSDataset):
         )
         
         tprint('\n')
-        print(f"Training set: {len(train_loader)} batches ({len(train_idx)} samples)")
+        print(f"Training set: {len(train_loader)} batches ({len(train_idx)} samples) [balanced sampler]")
+        print(f"Validation set: {len(val_loader)} batches ({len(val_idx)} samples)")
         print(f"Test set: {len(test_loader)} batches ({len(test_idx)} samples)")
         print(f"DataLoader config: num_workers={num_workers}, batch_size={batch_size}, pin_memory={actual_pin_memory}")
-        print(f"  prefetch_factor={prefetch_factor}, persistent_workers={persistent_workers and (num_workers > 0)}")
         
-        return train_loader, test_loader
+        return train_loader, val_loader, test_loader
 
-    def create_cv_data_loaders(self, n_folds=5, num_workers=4, batch_size=None,
+    def _create_cv_data_loaders_(self, n_folds=5, num_workers=4, batch_size=None,
                                pin_memory=True, prefetch_factor=2,
                                persistent_workers=False):
         """
@@ -843,6 +881,47 @@ class NpyHSDataset(AbstractHSDataset):
 
         tprint(f"  Created {n_folds} fold DataLoader pairs\n")
         return fold_loaders
+
+    # public interfaces.
+    def get_loaders(self, *args, **kwargs):
+        return self._create_data_loader_(*args, **kwargs)
+
+    def get_cv_loaders(self, *args, **kwargs):
+        return self._create_cv_data_loaders_(*args, **kwargs)
+
+    # convenience helpers
+    def describe(self, top_k: int = 5) -> None:
+        """Return and print basic dataset statistics for quick sanity check."""
+        stats: Dict[str, Any] = {}
+        stats["num_patients"] = int(getattr(self, "_num_patients", 0))
+        stats["num_patches"] = int(len(self.patch_indices))
+        stats["patch_shape"] = (self.patch_size, self.patch_size)
+        cls_counts = np.bincount(self.patch_labels, minlength=self.num)
+        stats["class_counts"] = cls_counts.tolist()
+        stats["class_ratios"] = (cls_counts / np.maximum(cls_counts.sum(), 1)).round(4).tolist()
+
+        # patient-level patch counts
+        patient_counts = []
+        if hasattr(self, "patch_patient_groups"):
+            for pid in np.unique(self.patch_patient_groups):
+                patient_counts.append((int(pid), int((self.patch_patient_groups == pid).sum())))
+            stats["patient_patch_counts"] = patient_counts
+
+        print("[Dataset Summary]")
+        print(f"  patients: {stats['num_patients']}, patches: {stats['num_patches']}")
+        print(f"  patch size: {stats['patch_shape']}, num_classes: {self.num}")
+        print(f"  class counts: {cls_counts.tolist()}")
+        print(f"  class ratios: {stats['class_ratios']}")
+        if patient_counts:
+            top = sorted(patient_counts, key=lambda x: x[1], reverse=True)[:top_k]
+            print(f"  top-{top_k} patients by patch count: {top}")
+
+    def sample_batch(self, batch_size: int = 2) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample a tiny batch (no augmentation) for debugging shapes."""
+        idx = np.random.choice(len(self.patch_indices), size=min(batch_size, len(self.patch_indices)), replace=False)
+        subset = _IndexedSubset(self, idx)
+        loader = torch.utils.data.DataLoader(subset, batch_size=len(idx))
+        return next(iter(loader))
 
 class MatHSDataset(AbstractHSDataset):
     """
@@ -1025,12 +1104,36 @@ class _AugmentedSubset(Dataset):
     def __init__(self, dataset: AbstractHSDataset, indices: np.ndarray,
                  noise_std: float = 0.02,
                  band_drop_rate: float = 0.05,
-                 cutout_ratio: float = 0.15):
+                 cutout_ratio: float = 0.15,
+                 minority_threshold: float = 0.3,
+                 minority_blend_prob: float = 0.5):
+        """Augment subset with optional rare-class copy-paste blending.
+
+        Args:
+            minority_threshold: classes with < threshold * max_count are treated as rare.
+            minority_blend_prob: probability to apply rare-class blend on rare-class samples.
+        """
         self.dataset = dataset
         self.indices = indices
         self.noise_std = noise_std
         self.band_drop_rate = band_drop_rate
         self.cutout_ratio = cutout_ratio
+        self.minority_threshold = minority_threshold
+        self.minority_blend_prob = minority_blend_prob
+
+        # pre-compute rare classes over subset
+        labels = dataset.patch_labels[indices]
+        class_counts = np.bincount(labels, minlength=dataset.num)
+        self.class_counts = class_counts
+        self.max_count = max(1, class_counts.max())
+        rare_mask = class_counts < (self.max_count * minority_threshold)
+        self.minority_classes = set(np.where(rare_mask)[0].tolist())
+
+        # map class
+        # make indices for fast sampling
+        self.class_to_indices: Dict[int, np.ndarray] = {}
+        for cls_idx in np.where(class_counts > 0)[0]:
+            self.class_to_indices[int(cls_idx)] = indices[labels == cls_idx]
     
     def __len__(self):
         return len(self.indices)
@@ -1039,8 +1142,8 @@ class _AugmentedSubset(Dataset):
         original_idx = self.indices[idx]
         
         # Get raw numpy patch (H, W, C) and label (H, W)
-        patch = self.dataset._get_patch(original_idx)      # (H, W, C)
-        label = self.dataset._get_label_patch(original_idx) # (H, W)
+        patch = self.dataset._get_patch_(original_idx)      # (H, W, C)
+        label = self.dataset._get_label_patch_(original_idx) # (H, W)
         
         # horizontal flip
         if np.random.rand() > 0.5:
@@ -1080,6 +1183,30 @@ class _AugmentedSubset(Dataset):
             patch[y0:y0+ch, x0:x0+cw, :] = 0.0
             # Mark cutout region as ignore in labels
             label[y0:y0+ch, x0:x0+cw] = 255
+
+        # rare-class copy-paste: enrich minority classes with a same-class donor patch
+        center_cls = int(self.dataset.patch_labels[original_idx])
+        if (
+            self.minority_classes
+            and center_cls in self.minority_classes
+            and np.random.rand() < self.minority_blend_prob
+        ):
+            donor_pool = self.class_to_indices.get(center_cls)
+            if donor_pool is not None and len(donor_pool) > 1:
+                donor_idx = int(np.random.choice(donor_pool))
+                if donor_idx != original_idx:
+                    donor_patch = self.dataset._get_patch_(donor_idx).copy()
+                    donor_label = self.dataset._get_label_patch_(donor_idx).copy()
+
+                    h, w = patch.shape[:2]
+                    # Paste a moderate region (20%~50% side length) to avoid overpowering
+                    rh = np.random.randint(max(1, int(0.2 * h)), max(2, int(0.5 * h)))
+                    rw = np.random.randint(max(1, int(0.2 * w)), max(2, int(0.5 * w)))
+                    y0 = np.random.randint(0, h - rh + 1)
+                    x0 = np.random.randint(0, w - rw + 1)
+
+                    patch[y0:y0+rh, x0:x0+rw, :] = donor_patch[y0:y0+rh, x0:x0+rw, :]
+                    label[y0:y0+rh, x0:x0+rw] = donor_label[y0:y0+rh, x0:x0+rw]
         
         # convert to (C, H, W) tensor
         patch = np.transpose(patch, (2, 0, 1))

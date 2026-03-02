@@ -79,7 +79,10 @@ class Unet(nn.Module):
     Same API and params with LoLA are remaining.
     """
     
-    def __init__(self, in_channels=15, num_classes=9, dim=64):
+    def __init__(self, in_channels=15, num_classes=9, dim=64,
+                 patch_size=None, depths=None, num_heads=None,
+                 window_size=None, mlp_ratio=None, drop_path_rate=None,
+                 r=None, lora_alpha=None):
         """
         U-net for hyperspectral image pixel-level segmentation.
         
@@ -87,9 +90,13 @@ class Unet(nn.Module):
             in_channels (int): 15 default.
             num_classes (int): 9 default.
             dim (int): dim of feature maps, 64 default.
+            patch_size: Accepted for API compatibility, ignored.
+            depths, num_heads, window_size, mlp_ratio, drop_path_rate,
+            r, lora_alpha: Accepted for API compatibility, ignored.
         """
         
         super().__init__()
+        # Note: patch_size, depths, etc. are accepted for API compatibility but ignored
         self.in_channels = in_channels
         self.num_classes = num_classes
         self.dim = dim

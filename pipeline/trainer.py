@@ -18,14 +18,12 @@ from tqdm import tqdm
 from munch import Munch
 from torch.nn import Module
 from pipeline.monitor import tprint
+from typing import Tuple, Callable, Dict
 from pipeline.dataset import AbstractHSDataset
 from torch.cuda.amp import GradScaler, autocast
-from dataclasses import dataclass, field
-from typing import Tuple, Callable, Dict, Optional, List
+
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from sklearn.metrics import (accuracy_score, balanced_accuracy_score,
-                             cohen_kappa_score,
-                             confusion_matrix as _cm, roc_curve,
+from sklearn.metrics import (confusion_matrix as _cm, roc_curve,
                              precision_recall_fscore_support, auc)
 import torch.nn.functional as F
 
@@ -306,14 +304,16 @@ class hsTrainer:
         debug_mode: bool = False,
         num_gpus: int = 1,
         train_loader=None,
-        test_loader=None,
+        val_loader=None,   # Validation set for early stopping (not seen during final test)
+        test_loader=None,  # Test set held out completely, evaluated only once at the end
         **kwargs
     ):
         
         self.config = config
         self.dataLoader = dataLoader
         self.epochs = epochs
-        self.model = model
+        self._model_ctor = model
+        self.model = None
         self.model_name = model_name
         self.debug_mode = debug_mode
         self.num_gpus = num_gpus
@@ -328,9 +328,11 @@ class hsTrainer:
         self._setup_device()
         if train_loader is not None and test_loader is not None:
             self.train_loader = train_loader
+            self.val_loader = val_loader  # may be None if legacy 2-loader mode
             self.test_loader = test_loader
             tprint(f"  Using injected data loaders "
                   f"(train: {len(train_loader)} batches, "
+                  f"val: {len(val_loader) if val_loader else 'N/A'} batches, "
                   f"test: {len(test_loader)} batches)")
         else:
             self._load_data()
@@ -347,7 +349,7 @@ class hsTrainer:
         self.best_epoch = 0
         self.best_model_state = None
         
-        # memory-efficient tracking for visualizations
+        # tracking for visualizations
         self.lr_history = []          # lr per epoch
         self.grad_norms = []          # gradient L2 norm per epoch
         self.epoch_times = []         # wall-clock time per epoch
@@ -358,6 +360,30 @@ class hsTrainer:
         print(f"  device: {self.device}")
         print(f"  num_gpus: {self.num_gpus}")
         print(f"  output_dir: {self.output}")
+
+    # public interface
+    def summary(self) -> None:
+        """Print a short summary of loaders/model for quick inspection."""
+        train_batches = len(self.train_loader) if hasattr(self, 'train_loader') else 0
+        test_batches = len(self.test_loader) if hasattr(self, 'test_loader') else 0
+        print("[Trainer Summary]")
+        print(f"  model: {self.model_name}, epochs: {self.epochs}, device: {self.device}")
+        print(f"  loaders: train={train_batches} batches, test={test_batches} batches")
+        if hasattr(self.dataLoader, 'describe'):
+            self.dataLoader.describe(top_k=3)
+
+    def fit(self, *_args, **_kwargs):
+        """Alias of train() for a cleaner external API."""
+        return self.train(*_args, **_kwargs)
+
+    def fit_cv(self, *args, **kwargs):
+        """Call static cross_validate with current config and dataloader."""
+        return hsTrainer.cross_validate(self.config, self.dataLoader,
+                        kwargs.get('n_folds', self.config.common.cv_folds),
+                        self.epochs, self._model_ctor,
+                        model_name=self.model_name,
+                        num_gpus=self.num_gpus,
+                        debug_mode=self.debug_mode)
     
     def _setup_device(self) -> None:
         """setup device and validate multi-GPU configuration"""
@@ -419,14 +445,28 @@ class hsTrainer:
                       f"({batch_size // self.num_gpus} per GPU)")
                 print(f"    prefetch_factor: {prefetch_factor}, persistent_workers: {persistent_workers}")
             
-            self.train_loader, self.test_loader = self.dataLoader.create_data_loader(
+            loader_fn = getattr(self.dataLoader, 'get_loaders', None) \
+                        or getattr(self.dataLoader, 'create_data_loader', None)
+            if loader_fn is None:
+                raise RuntimeError("Dataset object does not expose get_loaders/create_data_loader")
+
+            # New API returns (train, val, test); supports legacy 2-tuple fallback
+            loaders = loader_fn(
                 num_workers=num_workers,
                 batch_size=batch_size,
                 pin_memory=self.config.memory.pin_memory,
                 prefetch_factor=prefetch_factor,
                 persistent_workers=persistent_workers
             )
+            if len(loaders) == 3:
+                self.train_loader, self.val_loader, self.test_loader = loaders
+            else:
+                # Legacy 2-loader mode: use test as val for backward compatibility
+                self.train_loader, self.test_loader = loaders
+                self.val_loader = None
             print(f"  training set: {len(self.train_loader)} batches")
+            if self.val_loader:
+                print(f"  validation set: {len(self.val_loader)} batches")
             print(f"  test set: {len(self.test_loader)} batches")
         except Exception as e:
             raise RuntimeError(f"Error during data loading: {e}")
@@ -435,8 +475,10 @@ class hsTrainer:
         """create model and print parameter count"""
         tprint("Creating model with:")
         try:
-            self.model = self.model(**self.kwargs)
-            self.model.to(self.device)
+            if self._model_ctor is None:
+                raise RuntimeError("model constructor is None; please pass a callable when initializing hsTrainer")
+            self.model = self._model_ctor(**self.kwargs)
+            self.model.to(self.device)  # optimize for convolutional models
             
             # stats for model parameter count
             total_params = sum(p.numel() for p in self.model.parameters())
@@ -460,6 +502,17 @@ class hsTrainer:
         """Initialize training components: optimizer, scheduler, loss, precision"""
         print("Training components:")
         
+        torch.backends.cudnn.benchmark = self.config.memory.benchmark
+        torch.backends.cuda.matmul.allow_tf32 = self.config.memory.benchmark
+        torch.backends.cudnn.allow_tf32 = self.config.memory.benchmark
+        tprint("torch.backends.cudnn.benchmark={},"
+               "torch.backends.cuda.matmul.allow_tf32={},"
+               "torch.backends.cudnn.allow_tf32={}".format(
+                   torch.backends.cudnn.benchmark,
+                   torch.backends.cuda.matmul.allow_tf32,
+                   torch.backends.cudnn.allow_tf32
+               ))
+        
         # Optimizer
         lr = self.config.common.lr
         weight_decay = self.config.common.weight_decay
@@ -478,7 +531,7 @@ class hsTrainer:
         print(f"  AdamW(lr={lr}, wd={weight_decay}) + CosineWR(T0={T_0}, Tm={T_mult})")
         
         # Class-weighted Focal Loss (handles severe class imbalance better than CE)
-        focal_gamma = getattr(self.config.common, 'focal_gamma', 2.0)
+        focal_gamma = self.config.common.focal_gamma
         class_weights = None
         try:
             train_labels = self.dataLoader.patch_labels[
@@ -554,7 +607,7 @@ class hsTrainer:
             # non_blocking=True to:
             # transfer new batch from memory to GPU parallel with last GPU conduct.
             hsi = hsi.to(self.device, non_blocking=True)
-            labels = labels.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True, memory_format=torch.contiguous_format)
             
             # NOTE: method permute() may cause incontinuous memory, FATAL ERROR.
             # try permute().contiguous() if goes wrong.
@@ -627,10 +680,10 @@ class hsTrainer:
         return epoch_loss, epoch_acc
     
     @torch.no_grad()
-    def evaluate(self, collect_extra: bool = False, use_ema: bool = False
-                 ) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
+    def evaluate(self, collect_extra: bool = False, use_ema: bool = False,
+                 loader=None) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
         """
-        Evaluate on the test set with optimized performance.
+        Evaluate on a given loader with optimized performance.
 
         Optimization:
         1) GPU-side confusion matrix (int64) accumulated via scatter_add_
@@ -646,6 +699,8 @@ class hsTrainer:
                            Only set True for the final evaluation — not every epoch.
             use_ema: if True, temporarily swap in EMA shadow weights for
                      evaluation, then restore original weights.
+            loader: DataLoader to evaluate on. If None, uses val_loader (for epoch
+                    eval/early stopping) or test_loader if val_loader is unavailable.
 
         Return:
             Tuple (``loss``, ``accuracy``, ``kappa``, ``predictions``, ``labels``)
@@ -674,7 +729,11 @@ class hsTrainer:
         probas_list      = [] if collect_extra else None   # sub-sampled; see roc_per_batch
         roc_targets_list = [] if collect_extra else None   # targets paired with sub-sampled probas
 
-        eval_loader = self.test_loader
+        # Default loader selection: val for epoch eval, test only for final
+        if loader is None:
+            eval_loader = self.val_loader if self.val_loader else self.test_loader
+        else:
+            eval_loader = loader
         # ROC sub-sampling budget: keep ≤2M pixels total (~1350 per batch for typical test set).
         # ROC AUC is statistically stable with ≥1M samples; this avoids the 14 GB y_onehot
         # allocation and the 4.4B-iteration Python loop in _save_all_plots.
@@ -819,6 +878,7 @@ class hsTrainer:
             should_eval = ((epoch + 1) % self.eval_interval == 0) or (epoch + 1 == self.epochs)
             
             if should_eval or self.debug_mode:
+                # Evaluate on val set for early stopping (not test set)
                 eval_loss, eval_acc, kappa, pred, target = self.evaluate(use_ema=True)
                 self.eval_losses.append(eval_loss)
                 self.eval_accs.append(eval_acc)
@@ -828,9 +888,10 @@ class hsTrainer:
                     miou_str = f' mIoU: {self._last_miou:6.2f}%'
                 
                 oa_str = f' OA: {self._last_oa:6.2f}%' if hasattr(self, '_last_oa') else ''
+                eval_set_name = 'Val' if self.val_loader else 'Test'
                 tprint(f"\n[Epoch {epoch+1:3d}] "
                       f"Train Loss: {train_loss:.4f} Acc: {train_acc:6.2f}% | "
-                      f"Test Loss: {eval_loss:.4f} BA: {eval_acc:6.2f}%{oa_str} "
+                      f"{eval_set_name} Loss: {eval_loss:.4f} BA: {eval_acc:6.2f}%{oa_str} "
                       f"Kappa: {kappa:6.2f}%{miou_str}")
                 
                 # save the best model
@@ -874,10 +935,11 @@ class hsTrainer:
             tprint(f"Loading model from epoch {self.best_epoch + 1} for final eval...")
             self.model.load_state_dict(self.best_model_state['model_state'])
         
-        # final evaluation with extra data collection (probabilities, features)
+        # Final evaluation on held-out TEST set (not val set) with full data collection
+        # This is the only time test set is used, ensuring unbiased generalization estimate
         final_loss, final_acc, final_kappa, final_pred, final_target = self.evaluate(
-            collect_extra=True)
-        tprint(f"Final eval completed!")
+            collect_extra=True, loader=self.test_loader)
+        tprint(f"Final eval on TEST set completed (BA: {final_acc:.2f}%)")
         
         # Store for CV aggregation (accessed before trainer is deleted)
         self._final_pred = final_pred
@@ -964,7 +1026,11 @@ class hsTrainer:
             n_folds = len(fold_loaders)
             print(f"  Using injected fold loaders ({n_folds} folds)")
         else:
-            fold_loaders = dataLoader.create_cv_data_loaders(
+            cv_loader_fn = getattr(dataLoader, 'get_cv_loaders', None) \
+                            or getattr(dataLoader, 'create_cv_data_loaders', None)
+            if cv_loader_fn is None:
+                raise RuntimeError("Dataset object does not expose get_cv_loaders/create_cv_data_loaders")
+            fold_loaders = cv_loader_fn(
                 n_folds=n_folds,
                 num_workers=num_workers,
                 batch_size=batch_size,
