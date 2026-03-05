@@ -1,7 +1,8 @@
 from pipeline.dataset import (AbstractHSDataset,
-                              MatHSDataset, NpyHSDataset)
+                              MatHSDataset, NpyHSDataset,
+                              HSPreprocessor)
 from pipeline.trainer import hsTrainer
-from pipeline.monitor import (monitor, tprint)
+from pipeline.monitor import (monitor, tprint, _managed_pool)
 from pipeline.analyzer import (DatasetAnalyzer, analyze_dataset)
 from pipeline.core import (TrainPipeline, TrainResult, 
                            CVResult, ModelFactory)
@@ -18,6 +19,7 @@ __all__ = [
     'AbstractHSDataset',
     'MatHSDataset', 
     'NpyHSDataset',
+    'HSPreprocessor',
     
     'hsTrainer',
     
@@ -25,4 +27,5 @@ __all__ = [
     'tprint',
     'DatasetAnalyzer',
     'analyze_dataset',
+    '_managed_pool',
 ]

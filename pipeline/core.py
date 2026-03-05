@@ -29,6 +29,7 @@ from dataclasses import dataclass, field, asdict
 from munch import Munch
 from torch.nn import Module
 
+from sklearn.base import BaseEstimator
 from pipeline.dataset import AbstractHSDataset
 from pipeline.trainer import hsTrainer
 from pipeline.monitor import tprint
@@ -211,19 +212,21 @@ class ModelFactory:
             'unet': Unet,
         }
 
-class TrainPipeline:
+class TrainPipeline(BaseEstimator):
     """
-    Entry point for training and evaluation.
-    
-    Public API:
-        - run(epochs): single model train + eval
-        - run_cv(n_folds, epochs): K-fold cross-validation
-        - summary(): config and dataset summary printout
-    
-    Usage:
-        >>> pipeline = TrainPipeline(config, dataset, model_fn, name="exp1")
-            result = pipeline.run(epochs=50)
-            print(result)
+    Sklearn-compatible entry point for training and evaluation.
+
+    Follows sklearn API convention::
+
+        pipeline = TrainPipeline(config, dataset, model_fn, name="exp1")
+        pipeline.fit(epochs=50)        # train, stores result in pipeline.result_
+        pipeline.predict()             # predict on test set
+        pipeline.score()               # evaluate accuracy
+
+    Backward-compatible aliases::
+
+        result = pipeline.run(epochs=50)      # returns TrainResult directly
+        result = pipeline.run_cv(n_folds=5)   # returns CVResult directly
     """
     
     def __init__(self,
@@ -263,16 +266,21 @@ class TrainPipeline:
         print(f"  GPUs: {self._num_gpus}")
         print(f"  Output: {self._output_dir}")
     
-    def run(self, epochs: int = 50) -> TrainResult:
+    def fit(self, X=None, y=None, epochs: int = 50) -> 'TrainPipeline':
         """
-        run single training and evaluation.
-        
+        Train the model. Follows sklearn ``fit`` convention.
+
+        Args:
+            X : ignored (data comes from internal dataset).
+            y : ignored.
+            epochs : training epochs.
+
         Returns:
-            TrainResult: A `TrainResult` wrapper.
+            self
         """
         tprint(f"Starting training: {self._name}")
         
-        trainer = hsTrainer(
+        self._trainer = hsTrainer(
             config=self._config,
             dataLoader=self._dataset,
             epochs=epochs,
@@ -282,10 +290,11 @@ class TrainPipeline:
             num_gpus=self._num_gpus,
         )
         
-        raw_result = trainer.train()
+        self._trainer.fit()
+        raw_result = self._trainer.results_
         
         # wrap raw result into TrainResult dataclass
-        result = TrainResult(
+        self.result_ = TrainResult(
             best_accuracy=raw_result.get('best_accuracy', 0.0),
             final_accuracy=raw_result.get('final_accuracy', 0.0),
             final_kappa=raw_result.get('final_kappa', 0.0),
@@ -295,29 +304,66 @@ class TrainPipeline:
             total_epochs=epochs,
             model_path=raw_result.get('model_path', ''),
             output_dir=self._output_dir,
-            train_losses=trainer.train_losses,
-            eval_losses=trainer.eval_losses,
-            train_accs=trainer.train_accs,
-            eval_accs=trainer.eval_accs,
+            train_losses=self._trainer.train_losses,
+            eval_losses=self._trainer.eval_losses,
+            train_accs=self._trainer.train_accs,
+            eval_accs=self._trainer.eval_accs,
         )
         
-        result.save(os.path.join(self._output_dir, 'result.json'))
+        self.result_.save(os.path.join(self._output_dir, 'result.json'))
         
-        tprint(f"Training completed: {result.summary()}")
-        return result
-    
-    def run_cv(self, 
-               n_folds: int = 5, 
-               epochs: int = 50) -> CVResult:
+        tprint(f"Training completed: {self.result_.summary()}")
+        return self
+
+    def predict(self, X=None):
         """
-        run K-fold cross-validation.
-        
+        Predict using the trained model.
+
         Args:
-            n_folds: if n_folds=0, run single training.
-            epochs: training epochs for each fold.
-        
+            X : DataLoader or None (uses test set).
+
         Returns:
-            CVResult: A `CVResult` wrapper.
+            np.ndarray of predictions.
+        """
+        if not hasattr(self, '_trainer'):
+            raise RuntimeError("Call fit() before predict().")
+        return self._trainer.predict(X)
+
+    def score(self, X=None, y=None):
+        """
+        Evaluate and return balanced accuracy.
+
+        Args:
+            X : DataLoader or None (uses val/test set).
+            y : ignored.
+
+        Returns:
+            float: balanced accuracy percentage.
+        """
+        if not hasattr(self, '_trainer'):
+            raise RuntimeError("Call fit() before score().")
+        return self._trainer.score(X)
+
+    def run(self, epochs: int = 50) -> TrainResult:
+        """
+        Backward-compatible alias for ``fit()``.
+        Returns TrainResult directly.
+        """
+        self.fit(epochs=epochs)
+        return self.result_
+    
+    def fit_cv(self, n_folds: int = 5, epochs: int = 50) -> 'TrainPipeline':
+        """
+        Cross-validation fit. Follows sklearn convention, returns ``self``.
+
+        Result is stored in ``self.result_`` (a CVResult).
+
+        Args:
+            n_folds : number of folds (0 falls back to single training).
+            epochs  : training epochs per fold.
+
+        Returns:
+            self
         """
         tprint(f"Starting {n_folds}-fold CV: {self._name}")
         
@@ -337,7 +383,7 @@ class TrainPipeline:
         fold_accs = raw_result.get('cv_fold_accuracies', [])
         fold_kappas = raw_result.get('cv_fold_kappas', [])
         
-        result = CVResult(
+        self.result_ = CVResult(
             accuracy_mean=raw_result.get('cv_accuracy_mean', 0.0),
             accuracy_std=raw_result.get('cv_accuracy_std', 0.0),
             kappa_mean=raw_result.get('cv_kappa_mean', 0.0),
@@ -354,10 +400,20 @@ class TrainPipeline:
             output_dir=raw_result.get('output_dir', self._output_dir),
         )
         
-        result.save(os.path.join(self._output_dir, 'cv_result.json'))
+        self.result_.save(os.path.join(self._output_dir, 'cv_result.json'))
         
-        tprint(f"CV completed: {result.summary()}")
-        return result
+        tprint(f"CV completed: {self.result_.summary()}")
+        return self
+    
+    def run_cv(self, 
+               n_folds: int = 5, 
+               epochs: int = 50) -> CVResult:
+        """
+        Backward-compatible alias for ``fit_cv()``.
+        Returns CVResult directly.
+        """
+        self.fit_cv(n_folds=n_folds, epochs=epochs)
+        return self.result_
     
     def summary(self) -> None:
         print("\n")

@@ -22,14 +22,17 @@ lora:
   lora_alpha: 32
   merge_lora_for_inference: false
 split:
+  split_seed: 350234  # Patient-level split random seed; vary it for robust multi-seed evaluation.
   test_rate: 0.1 # Test set ratio (held out completely from training)
   val_rate: 0.1 # Validation set ratio (from train+val pool, used for early stopping)
   n_folds: 5  # Number of folds for cross-validation (0 = disabled, use hold-out)
   batch_size: 256  # This refers to the size on a single GPU.
   patch_size: 31  # Pixel size of image patches.
   eval_batch_size: 256  # Smaller eval batch size for CPU training
+  pg_center_boost: 1.4  # >1 increases sampling frequency of PG-centered patches.
+  pg_tg_boundary_boost: 1.8  # >1 emphasizes PG<->TG boundary hard examples.
 preprocess:
-  pca_components: 48  # Number of PCA components to retain.
+  pca_components: 15  # Number of PCA components to retain.
 memory:
   pin_memory: true  # true is faster but may cause memoleak in distant server.
   num_workers: 4  # Workers on single GPU. More memory usage to accelerate data loading.
@@ -41,13 +44,14 @@ path:
   label: /data/chenhaoran/processed_npy_64_norm
   output: /home/chenhaoran/LoLA_hsViT/output
 clsf:
-  num: 6
+  num: 3
   targets:
     - 'PG'   # ⭐Parathyroid gland
-    - 'FAT'
+    # - 'FAT'
     - 'TG'   # ⭐Thyroid gland
     # - 'LN'   # Lymph Node
-    - 'MS'   # Muscle
+    # - 'MS'   # Muscle
     # - 'Blood'
     - 'Tra'  # Trachea
-    - 'ES'   # Esophagus
+    # - 'ES'   # Esophagus
+    # - 'Other' # ⭐ all non-target tissues

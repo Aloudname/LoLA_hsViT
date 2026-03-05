@@ -11,21 +11,22 @@ import numpy as np
 import seaborn as sns
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import cv2, gc, json, os, time, torch, traceback, warnings, copy, matplotlib
 
 from tqdm import tqdm
 from munch import Munch
 from torch.nn import Module
-from pipeline.monitor import tprint
 from typing import Tuple, Callable, Dict
+from concurrent.futures import as_completed
 from pipeline.dataset import AbstractHSDataset
 from torch.cuda.amp import GradScaler, autocast
+from pipeline.monitor import tprint, _managed_pool
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from sklearn.base import BaseEstimator
 from sklearn.metrics import (confusion_matrix as _cm, roc_curve,
                              precision_recall_fscore_support, auc)
-import torch.nn.functional as F
 
 warnings.filterwarnings("ignore")
 
@@ -289,9 +290,16 @@ class ModelEMA:
             b_m.data   = b_s.data
             b_s.data   = tmp
 
-class hsTrainer:
+class hsTrainer(BaseEstimator):
     """
-    Trainer for hyperspectral dataset.
+    Sklearn-compatible trainer for hyperspectral classification.
+
+    Follows sklearn API convention::
+
+        trainer = hsTrainer(config=config, dataLoader=dataset, ...)
+        trainer.fit()                    # train model, returns self
+        predictions = trainer.predict()  # predict on test set
+        accuracy = trainer.score()       # evaluate on test set
     """
     
     def __init__(
@@ -372,18 +380,69 @@ class hsTrainer:
         if hasattr(self.dataLoader, 'describe'):
             self.dataLoader.describe(top_k=3)
 
-    def fit(self, *_args, **_kwargs):
-        """Alias of train() for a cleaner external API."""
-        return self.train(*_args, **_kwargs)
+    def fit(self, X=None, y=None, **fit_params):
+        """
+        Train the model. Follows sklearn ``fit`` convention.
 
-    def fit_cv(self, *args, **kwargs):
-        """Call static cross_validate with current config and dataloader."""
-        return hsTrainer.cross_validate(self.config, self.dataLoader,
-                        kwargs.get('n_folds', self.config.common.cv_folds),
-                        self.epochs, self._model_ctor,
-                        model_name=self.model_name,
-                        num_gpus=self.num_gpus,
-                        debug_mode=self.debug_mode)
+        Args:
+            X : ignored (data comes from internal DataLoaders).
+            y : ignored.
+            **fit_params:
+                _cv_mode (bool): skip per-fold visualizations in CV.
+
+        Returns:
+            self
+        """
+        _cv_mode = fit_params.pop('_cv_mode', False)
+        self.results_ = self.train(_cv_mode=_cv_mode)
+        return self
+
+    def predict(self, X=None):
+        """
+        Predict class labels using the trained model.
+
+        Args:
+            X : DataLoader to predict on, or None (uses test_loader).
+
+        Returns:
+            np.ndarray of predicted class labels.
+        """
+        _, _, _, predictions, _ = self.evaluate(collect_extra=True, loader=X)
+        return predictions
+
+    def score(self, X=None, y=None):
+        """
+        Evaluate and return balanced accuracy.
+
+        Args:
+            X : DataLoader to evaluate on, or None (uses val/test loader).
+            y : ignored (labels come from DataLoader).
+
+        Returns:
+            float: balanced accuracy percentage.
+        """
+        _, acc, _, _, _ = self.evaluate(loader=X)
+        return acc
+
+    def fit_cv(self, n_folds=None, **kwargs):
+        """
+        Cross-validation fit. Follows sklearn convention, returns ``self``.
+
+        Args:
+            n_folds : int or None (defaults to config.common.cv_folds).
+
+        Returns:
+            self
+        """
+        if n_folds is None:
+            n_folds = self.config.common.cv_folds
+        self.cv_results_ = hsTrainer.cross_validate(
+            self.config, self.dataLoader,
+            n_folds, self.epochs, self._model_ctor,
+            model_name=self.model_name,
+            num_gpus=self.num_gpus,
+            debug_mode=self.debug_mode)
+        return self
     
     def _setup_device(self) -> None:
         """setup device and validate multi-GPU configuration"""
@@ -464,10 +523,7 @@ class hsTrainer:
                 # Legacy 2-loader mode: use test as val for backward compatibility
                 self.train_loader, self.test_loader = loaders
                 self.val_loader = None
-            print(f"  training set: {len(self.train_loader)} batches")
-            if self.val_loader:
-                print(f"  validation set: {len(self.val_loader)} batches")
-            print(f"  test set: {len(self.test_loader)} batches")
+            tprint(f"Data loaders created!")
         except Exception as e:
             raise RuntimeError(f"Error during data loading: {e}")
     
@@ -1083,7 +1139,8 @@ class hsTrainer:
                 test_loader=f_test_loader,
             )
 
-            result = trainer.train(_cv_mode=True)
+            trainer.fit(_cv_mode=True)
+            result = trainer.results_
 
             # Scalar metrics
             fold_results.append(result)
@@ -1234,7 +1291,7 @@ class hsTrainer:
 
         t0 = time.perf_counter()
         max_workers = min(len(plot_tasks), (os.cpu_count() or 4))
-        with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        with _managed_pool(max_workers, "CV plot workers") as pool:
             futures = {pool.submit(fn, *args): fn.__name__
                        for fn, args in plot_tasks}
             for fut in as_completed(futures):
@@ -1595,7 +1652,7 @@ class hsTrainer:
 
         t0 = time.perf_counter()
         max_workers = min(len(tasks), (os.cpu_count() or 4))
-        with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        with _managed_pool(max_workers, "single-run plot workers") as pool:
             futures = {pool.submit(fn, *args): fn.__name__
                        for fn, args in tasks}
             for fut in as_completed(futures):

@@ -8,12 +8,144 @@ from munch import Munch
 from pipeline.monitor import tprint
 from abc import ABC, abstractmethod
 from typing import Tuple, Dict, Any, Optional, List
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.model_selection import train_test_split
 from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import Dataset, WeightedRandomSampler
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources.*")
+
+
+class HSPreprocessor(BaseEstimator, TransformerMixin):
+    """
+    Sklearn-compatible preprocessor for hyperspectral data.
+
+    Pipeline: Z-score normalization -> PCA dimensionality reduction.
+    Fits on non-background pixels, then transforms raw per-patient data.
+
+    Follows sklearn's ``fit`` / ``transform`` API::
+
+        preprocessor = HSPreprocessor(pca_components=48)
+        preprocessor.fit(non_bg_pixels)             # compute stats + fit PCA
+        processed = preprocessor.transform(raw_data) # normalize + project
+
+    Attributes (set after ``fit``):
+        global_mean_                  : np.ndarray, shape (n_bands,)
+        global_std_                   : np.ndarray, shape (n_bands,)
+        pca_                          : sklearn PCA object or None
+        pca_components_               : np.ndarray (n_components, n_bands) or None
+        pca_mean_                     : np.ndarray (n_bands,) or None
+        pca_explained_variance_ratio_ : np.ndarray or None
+        n_features_out_               : int, output channel count
+    """
+
+    def __init__(self, pca_components=48, max_fit_samples=2_000_000,
+                 max_pca_samples=500_000, random_state=350234):
+        self.pca_components = pca_components
+        self.max_fit_samples = max_fit_samples
+        self.max_pca_samples = max_pca_samples
+        self.random_state = random_state
+
+    def fit(self, X, y=None):
+        """
+        Fit normalization statistics and PCA on raw pixel data.
+
+        Args:
+            X : np.ndarray, shape (n_pixels, n_bands) -- non-background pixels.
+            y : ignored (sklearn convention).
+
+        Returns:
+            self
+        """
+        from sklearn.decomposition import PCA
+
+        c = X.shape[1]
+
+        # Subsample for stable mean/std (memory ~ max_fit * c * 4 bytes)
+        if len(X) > self.max_fit_samples:
+            rng_fit = np.random.RandomState(350235)
+            fit_idx = rng_fit.choice(len(X), self.max_fit_samples, replace=False)
+            fit_data = X[fit_idx]
+        else:
+            fit_data = X
+
+        self.global_mean_ = fit_data.mean(axis=0).astype(np.float32)
+        self.global_std_  = fit_data.std(axis=0).astype(np.float32) + 1e-8
+        tprint(f"  normalization fit on {len(fit_data):,} non-bg pixels")
+
+        # PCA fit on Z-score normalized pixels, capped at max_pca_samples
+        # O(n * p^2); 500K is sufficient for stable eigenvectors
+        if self.pca_components and self.pca_components < c:
+            normalized_fit = (fit_data - self.global_mean_) / self.global_std_
+            del fit_data
+
+            if len(normalized_fit) > self.max_pca_samples:
+                rng_pca = np.random.RandomState(42)
+                pca_idx = rng_pca.choice(len(normalized_fit),
+                                         self.max_pca_samples, replace=False)
+                pca_fit = normalized_fit[pca_idx]
+            else:
+                pca_fit = normalized_fit
+
+            self.pca_ = PCA(n_components=self.pca_components,
+                            svd_solver='randomized',
+                            random_state=self.random_state)
+            self.pca_.fit(pca_fit)
+
+            explained = sum(self.pca_.explained_variance_ratio_) * 100
+            tprint(f"  pca: {c} -> {self.pca_components} channels, "
+                   f"explained variance: {explained:.1f}%, "
+                   f"fit on {len(pca_fit):,} pixels")
+
+            # Pre-compute float32 projection matrix for fast transform
+            self.pca_components_ = self.pca_.components_.astype(np.float32)
+            self.pca_mean_ = self.pca_.mean_.astype(np.float32)
+            self.pca_explained_variance_ratio_ = \
+                self.pca_.explained_variance_ratio_.astype(np.float32)
+            self.n_features_out_ = self.pca_components
+
+            del normalized_fit, pca_fit
+        else:
+            del fit_data
+            self.pca_ = None
+            self.pca_components_ = None
+            self.pca_mean_ = None
+            self.pca_explained_variance_ratio_ = None
+            self.n_features_out_ = c
+
+        return self
+
+    def transform(self, X):
+        """
+        Apply fitted Z-score normalization + PCA projection.
+
+        OPTIMIZATION: manual float32 matmul avoids sklearn's internal
+        float64 upcast, halving memory bandwidth.
+
+        Args:
+            X : np.ndarray, shape (n_pixels, n_bands) or (H, W, n_bands).
+
+        Returns:
+            np.ndarray: transformed data with reduced channels.
+        """
+        is_3d = (X.ndim == 3)
+        if is_3d:
+            h, w, c = X.shape
+            flat = X.reshape(-1, c)
+        else:
+            flat = X
+
+        # Z-score normalization
+        result = (flat - self.global_mean_) / self.global_std_
+
+        # PCA projection (float32 matmul, no upcast)
+        if self.pca_components_ is not None:
+            result = (result - self.pca_mean_) @ self.pca_components_.T
+
+        if is_3d:
+            return result.reshape(h, w, self.n_features_out_)
+        return result
 
 
 class AbstractHSDataset(ABC, Dataset):
@@ -48,6 +180,7 @@ class AbstractHSDataset(ABC, Dataset):
         self.transform = transform
         self.kwargs = kwargs
         self.test_rate = config.split.test_rate
+        self.split_seed = int(getattr(config.split, 'split_seed', 350234))
 
         # Core data structures
         self.raw_data: np.ndarray = None
@@ -214,16 +347,31 @@ class AbstractHSDataset(ABC, Dataset):
         return label_patch.copy()
 
     def _sampler_balance(self, indices: np.ndarray) -> WeightedRandomSampler:
-        """Build a weighted sampler using sqrt-inverse class frequency.
+        """Build a weighted sampler with class balance + PG hard-example boosts.
 
-        Sqrt-inverse provides moderate oversampling for rare classes without
-        extreme repetition that pure inverse-frequency would cause.
+        Base weights are inverse class frequency. Optional boosts:
+        - PG center boost: increase PG patch sampling frequency.
+        - PG-TG boundary boost: focus on boundary-confusion hard samples.
         """
         labels = self.patch_labels[indices]
         class_counts = np.bincount(labels, minlength=self.num).astype(np.float64)
         class_counts = np.maximum(class_counts, 1)
-        sample_weight = 1.0 / np.sqrt(class_counts)
-        weights = sample_weight[labels]
+        sample_weight = 1.0 / class_counts
+        weights = sample_weight[labels].astype(np.float64)
+
+        # Optional PG-focused weighting knobs from config
+        pg_center_boost = float(getattr(self.config.split, 'pg_center_boost', 1.0))
+        pg_tg_boundary_boost = float(getattr(self.config.split, 'pg_tg_boundary_boost', 1.0))
+
+        if pg_center_boost > 1.0:
+            targets = list(getattr(self.config.clsf, 'targets', []))
+            pg_idx = targets.index('PG') if 'PG' in targets else 0
+            weights[labels == pg_idx] *= pg_center_boost
+
+        if pg_tg_boundary_boost > 1.0 and self.patch_pg_tg_boundary is not None:
+            boundary_flags = self.patch_pg_tg_boundary[indices]
+            weights[boundary_flags] *= pg_tg_boundary_boost
+
         return WeightedRandomSampler(
             weights=torch.from_numpy(weights).double(),
             num_samples=len(indices),
@@ -317,6 +465,7 @@ class NpyHSDataset(AbstractHSDataset):
         self.pca_explained_variance: Optional[np.ndarray] = None
         self.feature_dim: Optional[int] = None
         self._label_remap: Optional[np.ndarray] = None
+        self.patch_pg_tg_boundary: Optional[np.ndarray] = None
 
         # per-patient pipeline (_load_data + _preprocess_data + _create_patches)
         self._per_patient_pipeline()
@@ -355,7 +504,6 @@ class NpyHSDataset(AbstractHSDataset):
           2. added robust validation for raw data and labels (shape, finite values, label range)
         """
         
-        from sklearn.decomposition import PCA
         pairs = self._pair_data_and_labels_()
         if self.limit_pairs is not None:
             pairs = pairs[: self.limit_pairs]
@@ -369,13 +517,13 @@ class NpyHSDataset(AbstractHSDataset):
         _label_remap = np.array([
             0,  # 0: background -> background
             1,  # 1: PG         -> PG    (1)
-            2,  # 2: FAT        -> FAT   (2)
-            3,  # 3: TG         -> TG    (3)
+            0,  # 2: FAT        -> FAT   (2)
+            2,  # 3: TG         -> TG    (3)
             0,  # 4: LN         -> LN    (4)
-            4,  # 5: MS         -> MS    (5)
+            0,  # 5: MS         -> MS    (5)
             0,  # 6: Blood      -> Blood (6)
-            5,  # 7: Tra        -> Tra   (7)
-            6,  # 8: ES         -> ES    (8)
+            3,  # 7: Tra        -> Tra   (7)
+            0,  # 8: ES         -> ES    (8)
         ], dtype=np.int32)
         self._label_remap = _label_remap
 
@@ -436,76 +584,31 @@ class NpyHSDataset(AbstractHSDataset):
         self._num_patients = len(_patient_id_map)
         tprint(f"  {len(pairs)} pairs, {self._num_patients} unique patients")
 
-        # norm + pca on non-bg pixels
+        # norm + pca on non-bg pixels (via sklearn-compatible HSPreprocessor)
         # excludes background and zero-padding -> cleaner statistics
         tprint("fitting norm + pca...")
         all_real = np.concatenate(all_real_pixels, axis=0)   # shape: (n_total_real, c)
         del all_real_pixels
         c = all_real.shape[1]
 
-        # subsample for normalization stats 
-        # use up to 2M pixels for stable mean/std
-        # larger sample = more acc global stats;
-        # memory cost ~(max_fit * c * 4) bytes
-        max_fit = 2_000_000
-        if len(all_real) > max_fit:
-            rng_fit = np.random.RandomState(350235)
-            fit_idx = rng_fit.choice(len(all_real), max_fit, replace=False)
-            fit_data = all_real[fit_idx]   # shape: (max_fit, c) independent copy
-            del all_real                   # free large array immediately
-        else:
-            fit_data = all_real
-            all_real = None               # release reference; fit_data keeps the data
-
-        # global normalization stats fit on non-bg pixels only
-        global_mean = fit_data.mean(axis=0).astype(np.float32)       # shape: (c,)
-        global_std  = fit_data.std(axis=0).astype(np.float32) + 1e-8 # shape: (c,)
-        self.global_mean = global_mean
-        self.global_std = global_std
-        tprint(f"  normalization fit on {len(fit_data):,} non-bg pixels")
-
-        # pca fit on normalized non-bg pixels, capped at 500K
-        # O(n * p^2); 500K is sufficient for stable eigenvectors)
         n_components = self.config.preprocess.pca_components
-        pca_obj = None
-        
-        # global mean: shape (c,), global std: shape (c,),
-        # Z-score normalization on fit_data before PCA fitting,
-        # to remove possible sensor bias and ensure PCA captures meaningful variance directions.
-        if n_components and n_components < c:
-            normalized_fit = (fit_data - global_mean) / global_std  # shape: (n_fit, c)
-            max_pca = 500_000
-            if len(normalized_fit) > max_pca:
-                rng_pca = np.random.RandomState(42)
-                pca_idx = rng_pca.choice(len(normalized_fit), max_pca, replace=False)
-                pca_fit = normalized_fit[pca_idx]   # shape: (max_pca, c)
-            else:
-                pca_fit = normalized_fit            # already within budget
+        self.preprocessor = HSPreprocessor(
+            pca_components=n_components,
+            max_fit_samples=2_000_000,
+            max_pca_samples=500_000,
+            random_state=350234,
+        )
+        self.preprocessor.fit(all_real)
+        del all_real
 
-            pca_obj = PCA(n_components=n_components, svd_solver='randomized',
-                          random_state=350234)
-            pca_obj.fit(pca_fit)
-            explained = sum(pca_obj.explained_variance_ratio_) * 100
-            tprint(f"  pca: {c} -> {n_components} channels, "
-                   f"explained variance: {explained:.1f}%, "
-                   f"fit on {len(pca_fit):,} pixels")
-            del normalized_fit, pca_fit
-        del fit_data
-
-        # pre-compute pca projection matrix in float32
-        if pca_obj is not None:
-            pca_components = pca_obj.components_.astype(np.float32)  # shape: (n_components, c)
-            pca_mean = pca_obj.mean_.astype(np.float32)              # shape: (c,)
-            self.pca_explained_variance = pca_obj.explained_variance_ratio_.astype(np.float32)
-            c_out = n_components
-        else:
-            pca_components = None
-            pca_mean = None
-            c_out = c
-
-        self.pca_components = pca_components
-        self.pca_mean = pca_mean
-        self.feature_dim = c_out
+        # Backward-compatible attribute aliases (point to fitted preprocessor)
+        self.global_mean = self.preprocessor.global_mean_
+        self.global_std = self.preprocessor.global_std_
+        self.pca_components = self.preprocessor.pca_components_
+        self.pca_mean = self.preprocessor.pca_mean_
+        self.pca_explained_variance = self.preprocessor.pca_explained_variance_ratio_
+        self.feature_dim = self.preprocessor.n_features_out_
+        c_out = self.feature_dim
 
         # patient norm -> pca -> pad -> extract patches
         # patient padded independently, no cross-patient boundary bleeding
@@ -516,21 +619,13 @@ class NpyHSDataset(AbstractHSDataset):
         all_patch_indices   = []  # each row: (patient_list_idx, row_padded, col_padded)
         all_patch_labels    = []  # 0-based center-pixel label
         all_patient_groups  = []  # patient group id for each patch
+        all_pg_tg_boundary  = []  # bool flag: center is on PG<->TG boundary
 
         for data, labels, pid_idx in patient_records:
             h, w, c_raw = data.shape                     # per-patient: (h_i, w_i, c)
-            flat = data.reshape(-1, c_raw)               # shape: (h_i * w_i, c)
 
-            # normalize using global stats (fit on non-bg pixels only)
-            flat = (flat - global_mean) / global_std
-
-            # pca projection
-            # pca_mean is the mean of normalized training pixels (≈0 but not exactly)
-            # must subtract before projection to match sklearn's PCA.transform() behavior.
-            if pca_components is not None:
-                flat = (flat - pca_mean) @ pca_components.T  # shape: (h_i*w_i, n_components)
-
-            processed = flat.reshape(h, w, c_out)        # shape: (h_i, w_i, c_out)
+            # apply fitted preprocessor (Z-score + PCA) via sklearn transform API
+            processed = self.preprocessor.transform(data) # shape: (h_i, w_i, c_out)
 
             padded_data = self._pad_with_zeros(processed, self.margin)
             # padded shape: (h_i + 2*margin, w_i + 2*margin, c_out)
@@ -550,6 +645,24 @@ class NpyHSDataset(AbstractHSDataset):
             patient_list_idx = len(self._patient_padded_data)
             self._patient_padded_data.append(padded_data)
             self._patient_padded_labels.append(padded_lbl)
+
+            # pre-compute PG<->TG boundary map for center-pixel hard-example mining
+            # labels are 1-based here: 1=PG, 2=TG, 3=Tra, 0=bg
+            pg_mask = (labels == 1)
+            tg_mask = (labels == 2)
+            boundary_map = np.zeros_like(labels, dtype=bool)
+            for dr, dc in [(-1, -1), (-1, 0), (-1, 1),
+                           (0, -1),           (0, 1),
+                           (1, -1),  (1, 0),  (1, 1)]:
+                pg_nb = np.roll(pg_mask, shift=(dr, dc), axis=(0, 1))
+                tg_nb = np.roll(tg_mask, shift=(dr, dc), axis=(0, 1))
+                boundary_map |= (pg_mask & tg_nb) | (tg_mask & pg_nb)
+
+            # remove wrapped edges introduced by np.roll
+            boundary_map[0, :] = False
+            boundary_map[-1, :] = False
+            boundary_map[:, 0] = False
+            boundary_map[:, -1] = False
 
             # extract patch centers: only non-background pixels
             rows, cols = np.where(labels > 0)
@@ -572,12 +685,14 @@ class NpyHSDataset(AbstractHSDataset):
 
             patch_labels = (labels[rows, cols] - 1).astype(np.int32)   # shape: (n_patches,)
             patient_groups = np.full(n_patches, pid_idx, dtype=np.int32)
+            boundary_flags = boundary_map[rows, cols].astype(np.bool_)
 
             all_patch_indices.append(indices)
             all_patch_labels.append(patch_labels)
             all_patient_groups.append(patient_groups)
+            all_pg_tg_boundary.append(boundary_flags)
         # del inside the loop only removed loop-variable
-            del data, labels, flat, processed, padded_data, padded_lbl
+            del data, labels, processed, padded_data, padded_lbl, boundary_map
         # patient_records still held references until here
         del patient_records, _patient_id_map
 
@@ -585,6 +700,7 @@ class NpyHSDataset(AbstractHSDataset):
         self.patch_indices = np.concatenate(all_patch_indices, axis=0)          # (N, 3)
         self.patch_labels = np.concatenate(all_patch_labels, axis=0)            # (N,)
         self.patch_patient_groups = np.concatenate(all_patient_groups, axis=0)  # (N,)
+        self.patch_pg_tg_boundary = np.concatenate(all_pg_tg_boundary, axis=0)  # (N,), bool
 
         unique_groups, group_counts = np.unique(
             self.patch_patient_groups, return_counts=True)
@@ -682,7 +798,8 @@ class NpyHSDataset(AbstractHSDataset):
         # stratified patient-level split into train+val vs test
         # StratifiedGroupKFold preserves class proportions while ensuring patient isolation.
         # use 5-fold split: take 1 fold as test (20%), 4 folds as train+val pool.
-        sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=350234)
+        split_seed = int(getattr(self.config.split, 'split_seed', self.split_seed))
+        sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=split_seed)
         trainval_idx, test_idx = next(sgkf.split(
             total_indices, self.patch_labels,
             groups=self.patch_patient_groups
@@ -691,7 +808,7 @@ class NpyHSDataset(AbstractHSDataset):
         # split train+val pool into train vs val (patient-level)
         # GroupShuffleSplit on the trainval pool: 10% val.
         val_rate = self.config.split.val_rate
-        gss = GroupShuffleSplit(n_splits=1, test_size=val_rate, random_state=350234)
+        gss = GroupShuffleSplit(n_splits=1, test_size=val_rate, random_state=split_seed)
         train_rel, val_rel = next(gss.split(
             np.arange(len(trainval_idx)),
             self.patch_labels[trainval_idx],
@@ -707,8 +824,8 @@ class NpyHSDataset(AbstractHSDataset):
         assert len(train_patients & val_patients) == 0, "Leakage: train/val overlap!"
         assert len(train_patients & test_patients) == 0, "Leakage: train/test overlap!"
         assert len(val_patients & test_patients) == 0, "Leakage: val/test overlap!"
-        tprint(f"Patient-level split: {len(train_patients)} train, "
-              f"{len(val_patients)} val, {len(test_patients)} test (0 overlap)")
+        tprint(f"Patient-level split(seed={split_seed}): {len(train_patients)} train, "
+               f"{len(val_patients)} val, {len(test_patients)} test (0 overlap)")
         
         # check class coverage
         for name, idx in [("Train", train_idx), ("Val", val_idx), ("Test", test_idx)]:
@@ -780,9 +897,9 @@ class NpyHSDataset(AbstractHSDataset):
         )
         
         tprint('\n')
-        print(f"Training set: {len(train_loader)} batches ({len(train_idx)} samples) [balanced sampler]")
-        print(f"Validation set: {len(val_loader)} batches ({len(val_idx)} samples)")
-        print(f"Test set: {len(test_loader)} batches ({len(test_idx)} samples)")
+        print(f"Training set: {len(train_loader)} batches of {len(train_idx)} samples,\n\t with distribution: {np.bincount(self.patch_labels[train_idx], minlength=self.num)}\n")
+        print(f"Validation set: {len(val_loader)} batches of {len(val_idx)} samples,\n\t with distribution: {np.bincount(self.patch_labels[val_idx], minlength=self.num)}\n")
+        print(f"Test set: {len(test_loader)} batches of {len(test_idx)} samples,\n\t with distribution: {np.bincount(self.patch_labels[test_idx], minlength=self.num)}\n")
         print(f"DataLoader config: num_workers={num_workers}, batch_size={batch_size}, pin_memory={actual_pin_memory}")
         
         return train_loader, val_loader, test_loader
@@ -806,8 +923,9 @@ class NpyHSDataset(AbstractHSDataset):
         total_indices = np.arange(len(self.patch_indices))
         all_classes = set(np.unique(self.patch_labels))
 
+        split_seed = int(getattr(self.config.split, 'split_seed', self.split_seed))
         sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True,
-                                    random_state=350234)
+                        random_state=split_seed)
 
         if batch_size is None:
             batch_size = self.batch_size if hasattr(self, 'batch_size') else 32
@@ -816,7 +934,7 @@ class NpyHSDataset(AbstractHSDataset):
         fold_loaders = []
 
         tprint(f"\n[Cross-Validation Split] {n_folds} folds, "
-              f"patient-level StratifiedGroupKFold")
+               f"patient-level StratifiedGroupKFold (seed={split_seed})")
 
         for fold_idx, (train_idx, test_idx) in enumerate(
                 sgkf.split(total_indices, self.patch_labels,
@@ -1099,7 +1217,8 @@ class _AugmentedSubset(Dataset):
       - Spectral: Gaussian noise, band-wise dropout (zero out random bands)
       - Mixup-style: CutOut (mask random spatial region)
     
-    Labels are augmented consistently for dense (segmentation) tasks.
+    Returns:
+    Augmented patch and label shapes of (C, H, W) and (H, W).
     """
     def __init__(self, dataset: AbstractHSDataset, indices: np.ndarray,
                  noise_std: float = 0.02,
@@ -1110,8 +1229,8 @@ class _AugmentedSubset(Dataset):
         """Augment subset with optional rare-class copy-paste blending.
 
         Args:
-            minority_threshold: classes with < threshold * max_count are treated as rare.
-            minority_blend_prob: probability to apply rare-class blend on rare-class samples.
+            minority_threshold: classes with < threshold * max_count as rare.
+            minority_blend_prob: prob to apply rare-class blend on rare-class samples.
         """
         self.dataset = dataset
         self.indices = indices

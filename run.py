@@ -15,6 +15,9 @@ Usage:
 """
 
 import argparse
+import copy
+import json
+import numpy as np
 import sys
 import os
 
@@ -47,8 +50,22 @@ def parse_args():
                         help='GPU num, auto for default.')
     parser.add_argument('--analyze_dataset', '-a', action='store_true',
                         help='Analyze dataset distribution and generate plots.')
+    parser.add_argument('--seeds', type=str, default=None,
+                        help='comma-separated split seeds, e.g. "350234,350235,350236"')
     
     return parser.parse_args()
+
+
+def _parse_seed_list(seed_text: str):
+    if seed_text is None:
+        return []
+    out = []
+    for token in seed_text.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        out.append(int(token))
+    return out
 
 
 def train_single_model(config, dataset, model_name: str, 
@@ -85,11 +102,11 @@ def train_single_model(config, dataset, model_name: str,
     pipeline.summary()
     
     if cv_folds > 0:
-        result = pipeline.run_cv(n_folds=cv_folds, epochs=epochs)
+        pipeline.fit_cv(n_folds=cv_folds, epochs=epochs)
     else:
-        result = pipeline.run(epochs=epochs)
+        pipeline.fit(epochs=epochs)
     
-    return result
+    return pipeline.result_
 
 
 def compare_models(config, dataset, epochs: int, cv_folds: int = 0,
@@ -166,13 +183,80 @@ def main():
     
     if args.analyze_dataset:
         tprint("Analyzing mode enabled.")
-        config = load_config()
-        print(f"Loading dataset from: {config.path.data}")
-        dataset = NpyHSDataset(config=config)
         analyze_dataset(dataset, show_split=True)
         tprint("Dataset analysis complete.")
         raise SystemExit(0)
     
+    seed_list = _parse_seed_list(args.seeds)
+
+    if seed_list:
+        if args.compare:
+            raise ValueError("--seeds currently supports single-model mode only (no --compare)")
+
+        all_results = []
+        tprint(f"Running multi-seed evaluation with {len(seed_list)} seeds: {seed_list}")
+
+        for seed in seed_list:
+            run_cfg = copy.deepcopy(config)
+            run_cfg.split.split_seed = int(seed)
+            dataset.config = run_cfg
+
+            seed_exp_name = args.name or f"{args.model}_seed{seed}"
+            tprint(f"\n[Seed {seed}] start")
+            result = train_single_model(
+                config=run_cfg,
+                dataset=dataset,
+                model_name=args.model,
+                epochs=args.epochs,
+                cv_folds=args.cv,
+                exp_name=seed_exp_name,
+                debug=args.debug,
+                num_gpus=args.gpus
+            )
+
+            if isinstance(result, CVResult):
+                all_results.append({
+                    'seed': seed,
+                    'mode': 'cv',
+                    'accuracy_mean': float(result.accuracy_mean),
+                    'accuracy_std': float(result.accuracy_std),
+                    'kappa_mean': float(result.kappa_mean),
+                    'kappa_std': float(result.kappa_std),
+                    'miou_mean': float(result.miou_mean),
+                    'output_dir': result.output_dir,
+                })
+            else:
+                all_results.append({
+                    'seed': seed,
+                    'mode': 'holdout',
+                    'best_accuracy': float(result.best_accuracy),
+                    'final_accuracy': float(result.final_accuracy),
+                    'final_kappa': float(result.final_kappa),
+                    'final_miou': float(result.final_miou),
+                    'output_dir': result.output_dir,
+                })
+
+        print("\n")
+        print("Multi-seed summary:")
+        if all_results[0]['mode'] == 'cv':
+            acc_means = np.array([r['accuracy_mean'] for r in all_results], dtype=np.float64)
+            print(f"  CV accuracy_mean over seeds: {acc_means.mean():.2f}% ± {acc_means.std():.2f}%")
+            for r in all_results:
+                print(f"  seed={r['seed']}: acc={r['accuracy_mean']:.2f}% ± {r['accuracy_std']:.2f}%")
+        else:
+            final_accs = np.array([r['final_accuracy'] for r in all_results], dtype=np.float64)
+            best_accs = np.array([r['best_accuracy'] for r in all_results], dtype=np.float64)
+            print(f"  final_accuracy over seeds: {final_accs.mean():.2f}% ± {final_accs.std():.2f}%")
+            print(f"  best(val)_accuracy over seeds: {best_accs.mean():.2f}% ± {best_accs.std():.2f}%")
+            for r in all_results:
+                print(f"  seed={r['seed']}: final={r['final_accuracy']:.2f}%, best_val={r['best_accuracy']:.2f}%")
+
+        summary_path = os.path.join(config.path.output, f"{args.model}_multiseed_summary.json")
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump({'seeds': seed_list, 'results': all_results}, f, indent=2)
+        print(f"  saved: {summary_path}")
+        return
+
     if args.compare:
         results = compare_models(
             config=config,

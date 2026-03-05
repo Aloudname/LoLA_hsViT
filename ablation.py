@@ -263,7 +263,8 @@ class Runner:
                     num_gpus=self.num_gpus,
                 )
 
-                results = trainer.train()
+                trainer.fit()
+                results = trainer.results_
 
                 # Overwrite param counts from actual model (includes DP wrapper)
                 total_params = sum(p.numel() for p in trainer.model.parameters())
@@ -865,7 +866,8 @@ def _run_smoke_test(args) -> bool:
             test_loader=test_loader,
         )
 
-        results = trainer.train()
+        trainer.fit()
+        results = trainer.results_
         assert 'final_accuracy' in results, "Missing final_accuracy in results"
         assert 'final_kappa' in results, "Missing final_kappa in results"
         tprint(f"    Training done: acc={results['final_accuracy']:.2f}%, "

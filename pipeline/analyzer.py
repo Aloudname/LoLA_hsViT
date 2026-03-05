@@ -389,10 +389,28 @@ class DatasetAnalyzer:
         class_names = list(self.dataset.targets)
         num_classes = self.dataset.num
 
+        rng = np.random.RandomState(350234)
+
+        # raw labels per split
+        train_raw = self.dataset.patch_labels[train_idx]
+        val_raw = self.dataset.patch_labels[val_idx]
+        test_raw = self.dataset.patch_labels[test_idx]
+
+        # simulate balanced re-sampling used by WeightedRandomSampler (weights=1/class_counts)
+        raw_counts = np.bincount(train_raw, minlength=num_classes)
+        if (raw_counts == 0).any():
+            # fallback: keep raw if any class missing
+            resampled_train = train_raw
+            resampled_counts = raw_counts
+        else:
+            prob = np.ones(num_classes, dtype=np.float64) / num_classes
+            resampled_counts = rng.multinomial(len(train_raw), prob)
+            resampled_train = np.repeat(np.arange(num_classes), resampled_counts)
+
         split_labels = [
-            ("Train", self.dataset.patch_labels[train_idx]),
-            ("Val", self.dataset.patch_labels[val_idx]),
-            ("Test", self.dataset.patch_labels[test_idx]),
+            ("Train", resampled_train),
+            ("Val", val_raw),
+            ("Test", test_raw),
         ]
 
         fig, ax = plt.subplots(figsize=(10, 0.7 * num_classes + 1.5))
@@ -402,7 +420,16 @@ class DatasetAnalyzer:
         plt.close(fig)
 
         stats = {}
-        for name, lbl in split_labels:
+        # include both raw and resampled stats for transparency
+        stats["Train_raw"] = {
+            "counts": raw_counts,
+            "pct": raw_counts / raw_counts.sum() * 100,
+        }
+        stats["Train_resampled"] = {
+            "counts": resampled_counts,
+            "pct": resampled_counts / resampled_counts.sum() * 100,
+        }
+        for name, lbl in [("Val", val_raw), ("Test", test_raw)]:
             counts = np.bincount(lbl, minlength=num_classes)
             stats[name] = {
                 "counts": counts,
@@ -570,7 +597,7 @@ class DatasetAnalyzer:
         return summary
 
 
-def analyze_dataset(show_split: bool = False,
+def analyze_dataset(dataset: NpyHSDataset, show_split: bool = False,
                     loader_kwargs: Optional[Dict] = None) -> None:
     """
     Run full distribution analysis on a loaded NpyHSDataset.
@@ -588,11 +615,6 @@ def analyze_dataset(show_split: bool = False,
     output_dir = config.path.output + "/analysis"
     
     tprint("Starting dataset analysis, output path:\n", output_dir)
-    
-    tprint('Dataset loading...')
-    dataset = NpyHSDataset(config)
-    tprint('Dataset loaded, analyzing...')
-
     analyzer = DatasetAnalyzer(dataset, output_dir)
     summary = analyzer.run_all()
     # Optionally print summary stats to console

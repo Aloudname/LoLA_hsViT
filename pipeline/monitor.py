@@ -3,19 +3,41 @@
 Monitor GPU and memory.
 """
 
-import os
-import time
-import psutil
-import argparse
-import threading
-import subprocess
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+import os, time, psutil, argparse, threading, subprocess, warnings
+
+
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 def tprint(*args, **kwargs):
     """Print with [HH:MM:SS] timestamp prefix."""
     print(datetime.now().strftime('[%H:%M:%S]'), *args, **kwargs)
+
+from contextlib import contextmanager
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+@contextmanager
+def _managed_pool(max_workers: int, desc: str):
+    """Ensure process pool is always shut down, even on Ctrl+C.
+
+    Cancels pending tasks on interruption to avoid lingering child processes
+    or leaked shared memory segments.
+    """
+    pool = ProcessPoolExecutor(max_workers=max_workers)
+    try:
+        yield pool
+    except KeyboardInterrupt:
+        tprint(f"{desc} interrupted, cancelling pending tasks...")
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    except Exception:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 @dataclass
 class MemorySnapshot:
@@ -42,7 +64,7 @@ class Monitor:
     """
     
     def __init__(self, 
-                 log_file: str = "outputs/logs/monitor.log",
+                 log_file: str = f"output/logs/{datetime.now().strftime('%m-%d-%Y_%H-%M-%S')}.log",
                  interval: float = 2.0,
                  gpu_ids: Optional[List[int]] = None,
                  show_gpu_process: bool = True,
@@ -318,6 +340,8 @@ class Monitor:
             
             if snapshot.gpu_util is not None:
                 print(f'  └─ Occupation rate: {snapshot.gpu_util:.0f}%')
+            elif snapshot.gpu_util is None:
+                print(f'  └─ Occupation rate: 0')
         else:
             print(f'\n\033[1;35m GPU memory undefined\033[0m')
         
@@ -358,6 +382,20 @@ class Monitor:
         if self.enable_log:
             self.save_log()
     
+    def get_summary(self, enable:bool = False) -> List[str]:
+        if enable:
+            try:
+                import torch
+                summary = ['Sys Summary:\n']
+                for device in range(self.gpu_device_count):
+                    info = f"GPU {device}:" + torch.cuda.memory_summary(device=device) + '\n'
+                    summary.append(info)
+            except Exception as e:
+                print(f"Error occurred while generating summary: {e}")
+            return summary
+        else:
+            return []
+
     def save_log(self):
         """
         save as log.
@@ -371,8 +409,7 @@ class Monitor:
             f.write(f"Total samples: {len(self.memory_snapshots)}\n")
                 
             # table head
-            f.write("Timestamp          | RAM_Used(GB) | RAM_Avail(GB) | RAM_%  | Proc_MB | GPU_Used(GB) | GPU_%  | GPU_Temp\n")
-            f.write("-" * 100 + "\n")
+            f.write("Timestamp          | RAM_Used(GB) | RAM_Avail(GB) | RAM_%  | Proc_MB | GPU_Used(GB) | GPU_%  | GPU_Temp\n\n")
             
             for s in self.memory_snapshots:
                 gpu_str = f"{s.gpu_allocated_gb:.1f}/{s.gpu_total_gb:.1f}" if s.gpu_allocated_gb else "N/A"
@@ -382,7 +419,11 @@ class Monitor:
                 f.write(f"{s.timestamp} | {s.sys_used_gb:>10.1f} | {s.sys_available_gb:>11.1f} | "
                         f"{s.sys_percent:>5.1f} | {s.process_mb:>7.0f} | {gpu_str:>13} | "
                         f"{gpu_percent:>6} | {gpu_temp:>7}\n")
-        
+
+            summary = self.get_summary(enable=False)
+            for info in summary:
+                f.write(f"  {info}\n")
+
         print(f"Log saved at {self.log_file}")
 
 
