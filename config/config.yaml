@@ -5,7 +5,7 @@ common:
   weight_decay: 0.10
   eval_interval: 2  # Evaluate every x epoch
   focal_gamma: 2.0    # Focal Loss focusing parameter (0 = CE, higher = more focus on hard samples)
-                      # Raised to 2.0: combined with balanced sampler for better rare class handling
+                      # 2.0: combined with balanced sampler for better rare class handling
   patience: 20  # More patience for patient-level split
   use_amp: true  # Enable mixed precision (will auto-disable on CPU)
   scheduler:
@@ -42,7 +42,7 @@ memory:
 path:
   data: /data/chenhaoran/processed_npy_64_norm
   label: /data/chenhaoran/processed_npy_64_norm
-  output: /home/chenhaoran/LoLA_hsViT/output
+  output: /home/chenhaoran/output/LoLA_hsViT
 clsf:
   num: 3
   targets:
