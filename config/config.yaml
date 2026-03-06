@@ -32,7 +32,7 @@ split:
   pg_center_boost: 1.4  # >1 increases sampling frequency of PG-centered patches.
   pg_tg_boundary_boost: 1.8  # >1 emphasizes PG<->TG boundary hard examples.
 preprocess:
-  pca_components: 15  # Number of PCA components to retain.
+  pca_components: 48  # Number of PCA components to retain.
 memory:
   pin_memory: true  # true is faster but may cause memoleak in distant server.
   num_workers: 4  # Workers on single GPU. More memory usage to accelerate data loading.

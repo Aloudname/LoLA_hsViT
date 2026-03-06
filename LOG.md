@@ -171,7 +171,7 @@ LoLA_hsViT/
 - 新增core.py、visualize.py，将功能和封装单拎出来。
 - 新增数据集分析入口analyzer.py，兼容入口程序run.py。
 
-用法： 
+用法：
 ```bash
 python run.py -a
 ```

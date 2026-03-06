@@ -1791,14 +1791,14 @@ class hsTrainer(BaseEstimator):
         if self.best_model_state is None:
             return
         
-        model_path = os.path.join(self.output, 'models', f'{self.model_name}_best.pth')
-        # Extract state_dict and remove 'module.' prefix if using DataParallel
-        state_dict = self.best_model_state['model_state']
-        if isinstance(self.model, nn.DataParallel):
-            # Remove 'module.' prefix added by DataParallel
-            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        # dummy input (1, C, H, W) for caculation graph tracing.
+        dummy_input = torch.randn(1, self.config.preprocess.pca_components,
+                                    self.config.split.patch_size,
+                                    self.config.split.patch_size
+                                  ).to(self.device)
         
-        torch.save(state_dict, model_path)
+        model_path = os.path.join(self.output, 'models', f'{self.model_name}_best.pth')
+        torch.onnx.export(self.model, dummy_input, "model.onnx")
         tprint(f"  Model saved to: {model_path}")
     
     def _compute_gradcam(self, x: torch.Tensor, class_idx: int) -> np.ndarray:
