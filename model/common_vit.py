@@ -243,7 +243,6 @@ class CommonViT(nn.Module):
                     )
                 )
         
-        
         # Kept for CAM generation compatibility
         self.final_feature_map = None  # for CAM
         self.norm = nn.LayerNorm(self.dims[-1])
@@ -399,6 +398,41 @@ class CommonViT(nn.Module):
         
         return output
 
+
+class CommonViT_reduced(CommonViT):
+    """Reduced CommonViT: dim=64, depths=[2,3,3]."""
+    _defaults = dict(dim=64, depths=[2, 3, 3], num_heads=[4, 8, 16], mlp_ratio=4., drop_path_rate=0.2)
+
+    def __init__(self, **kwargs):
+        merged = {**self._defaults, **kwargs}
+        super().__init__(**merged)
+
+
+class CommonViT_tiny(CommonViT):
+    """Tiny CommonViT: dim=64, depths=[2,2,2]."""
+    _defaults = dict(dim=64, depths=[2, 2, 2], num_heads=[4, 8, 16], mlp_ratio=2., drop_path_rate=0.2)
+
+    def __init__(self, **kwargs):
+        merged = {**self._defaults, **kwargs}
+        super().__init__(**merged)
+
+
+class CommonViT_mini(CommonViT):
+    """Mini CommonViT: dim=48, depths=[1,1,2]."""
+    _defaults = dict(dim=48, depths=[1, 1, 2], num_heads=[2, 4, 8], mlp_ratio=4., drop_path_rate=0.2)
+
+    def __init__(self, **kwargs):
+        merged = {**self._defaults, **kwargs}
+        super().__init__(**merged)
+
+
+class CommonViT_2layer(CommonViT):
+    """2-layer CommonViT: dim=16, depths=[1,1]."""
+    _defaults = dict(dim=16, depths=[1, 1], num_heads=[2, 4], mlp_ratio=4., drop_path_rate=0.2)
+
+    def __init__(self, **kwargs):
+        merged = {**self._defaults, **kwargs}
+        super().__init__(**merged)
 
 if __name__ == "__main__":
     model = CommonViT(

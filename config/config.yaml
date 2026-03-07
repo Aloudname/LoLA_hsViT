@@ -1,21 +1,21 @@
 # configuration of model hyperparams in training.py
 common:
   dataset_name: 'placeholder'
-  lr: 0.0001
-  weight_decay: 0.10
-  eval_interval: 2  # Evaluate every x epoch
-  focal_gamma: 2.0    # Focal Loss focusing parameter (0 = CE, higher = more focus on hard samples)
-                      # 2.0: combined with balanced sampler for better rare class handling
-  patience: 20  # More patience for patient-level split
-  use_amp: true  # Enable mixed precision (will auto-disable on CPU)
+  lr: 0.00005             # Reduced from 1e-4 to slow down early convergence
+  weight_decay: 0.15      # Increased from 0.10 for stronger L2 regularization
+  eval_interval: 2        # Evaluate every x epoch
+  focal_gamma: 2.0        # Focal Loss focusing parameter (0 = CE, higher = more focus on hard samples)
+  patience: 25            # Slightly more patience to let slower LR explore
+  use_amp: true           # Enable mixed precision (will auto-disable on CPU)
+  label_smoothing: 0.1    # Label smoothing to prevent overconfident predictions
   scheduler:
-    T_0: 5   # Warm restart period (shorter = faster LR decay in limited epochs)
+    T_0: 10               # Longer warm restart period (was 5) — slower LR decay
     T_mult: 2
-    eta_min: 0.00001
-  warmup_epochs: 2  # Short warmup, avoid staying at high LR too long
-  grad_clip: 0.5  # mixed precision settings
-  gradient_accumulation_steps: 2  # Reduced for CPU training
-  cv_folds: 1  # Default number of folds for cross-validation (0 = disabled, use hold-out)
+    eta_min: 0.000005     # Lower floor LR
+  warmup_epochs: 5        # Longer warmup (was 2) — gradual ramp prevents early memorization
+  grad_clip: 0.5          # mixed precision settings
+  gradient_accumulation_steps: 2
+  cv_folds: 1             # Default number of folds for cross-validation (0 = disabled)
 lora:
   lora_dropout: 0.2
   lora_rank: 16
@@ -42,7 +42,7 @@ memory:
 path:
   data: /data/chenhaoran/processed_npy_64_norm
   label: /data/chenhaoran/processed_npy_64_norm
-  output: /home/chenhaoran/output/LoLA_hsViT
+  output: /home/chenhaoran/LoLA_hsViT/output
 clsf:
   num: 3
   targets:

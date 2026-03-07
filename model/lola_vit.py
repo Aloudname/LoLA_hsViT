@@ -837,6 +837,50 @@ class LoLA_hsViT(nn.Module):
             return output, cam
         return output
 
+class LoLA_hsViT_reduced(LoLA_hsViT):
+    """Reduced LoLA_hsViT: dim=64, depths=[2,3,3]."""
+    _defaults = dict(dim=64, depths=[2, 3, 3], num_heads=[4, 8, 16],
+                     window_size=[7, 7, 7], mlp_ratio=4., drop_path_rate=0.2,
+                     r=16, lora_alpha=32)
+
+    def __init__(self, **kwargs):
+        merged = {**self._defaults, **kwargs}
+        super().__init__(**merged)
+
+
+class LoLA_hsViT_tiny(LoLA_hsViT):
+    """Tiny LoLA_hsViT: dim=64, depths=[2,2,2]."""
+    _defaults = dict(dim=64, depths=[2, 2, 2], num_heads=[4, 8, 16],
+                     window_size=[7, 7, 7], mlp_ratio=2., drop_path_rate=0.2,
+                     r=16, lora_alpha=32)
+
+    def __init__(self, **kwargs):
+        merged = {**self._defaults, **kwargs}
+        super().__init__(**merged)
+
+
+class LoLA_hsViT_mini(LoLA_hsViT):
+    """Mini LoLA_hsViT: dim=48, depths=[1,1,2]."""
+    _defaults = dict(dim=48, depths=[1, 1, 2], num_heads=[2, 4, 8],
+                     window_size=[7, 7, 7], mlp_ratio=4., drop_path_rate=0.2,
+                     r=16, lora_alpha=32)
+
+    def __init__(self, **kwargs):
+        merged = {**self._defaults, **kwargs}
+        super().__init__(**merged)
+
+
+class LoLA_hsViT_2layer(LoLA_hsViT):
+    """2-layer LoLA_hsViT: dim=16, depths=[2,2]."""
+    _defaults = dict(dim=16, depths=[2, 2], num_heads=[2, 4],
+                     window_size=[7, 7], mlp_ratio=4., drop_path_rate=0.2,
+                     r=16, lora_alpha=32)
+
+    def __init__(self, **kwargs):
+        merged = {**self._defaults, **kwargs}
+        super().__init__(**merged)
+
+
 if __name__ == "__main__":
     # Example usage and testing of the model.
     model = LoLA_hsViT(in_channels=15, num_classes=8, dim=96, depths=[3, 4, 5],

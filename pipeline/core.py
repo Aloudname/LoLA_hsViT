@@ -124,17 +124,20 @@ class ModelFactory:
     """
     Unified model creator for hsi classification.
     
-    model options:
-        - 'lola' -> LoLA_hsViT
-        - 'common' -> CommonViT
-        - 'unet' -> Unet
+    Supports base models and tagged variants:
+        - 'lola' / 'lola_reduced' / 'lola_tiny' / 'lola_mini' / 'lola_2layer'
+        - 'common' / 'common_reduced' / 'common_tiny' / 'common_mini' / 'common_2layer'
+        - 'unet'
     
     Usage:
-        model_fn = ModelFactory.create("LoLA_hsViT", config)
+        model_fn = ModelFactory.create("lola_mini", config)
         model = model_fn()
     """
     
     _registry: Dict[str, type] = {}
+    
+    # Valid tags for variant selection
+    VALID_TAGS = ('full', 'reduced', 'tiny', 'mini', '2layer')
     
     @classmethod
     def register(cls, name: str, model_class: type) -> None:
@@ -148,6 +151,18 @@ class ModelFactory:
         return list(cls._registry.keys())
     
     @classmethod
+    def resolve_name(cls, model_short: str, tag: str = 'full') -> str:
+        """Resolve a (model_short, tag) pair to a registry key.
+        
+        Examples:
+            resolve_name('lola', 'mini')  -> 'lola_mini'
+            resolve_name('common', 'full') -> 'common'
+        """
+        if tag == 'full':
+            return model_short.lower()
+        return f"{model_short.lower()}_{tag}"
+    
+    @classmethod
     def create(cls, 
                model_name: str, 
                config: Munch,
@@ -156,7 +171,7 @@ class ModelFactory:
         model creator with config and optional overrides.
         
         Args:
-            model_name: optional of LoLA_hsViT/CommonViT/Unet
+            model_name: e.g. 'lola', 'common_mini', 'lola_2layer', 'unet'
             config: Munch
             **override_kwargs: key-value pairs could override default model params.
         
@@ -180,8 +195,8 @@ class ModelFactory:
             'patch_size': config.split.patch_size,
         }
         
-        # LoLA params
-        if name_lower == 'lola':
+        # LoRA params for lola variants
+        if name_lower.startswith('lola'):
             base_kwargs.update({
                 'r': config.lora.lora_rank,
                 'lora_alpha': config.lora.lora_alpha,
@@ -205,10 +220,22 @@ class ModelFactory:
         if cls._registry:
             return
         
-        from model import LoLA_hsViT, CommonViT, Unet
+        from model import (LoLA_hsViT, CommonViT, Unet,
+                           LoLA_hsViT_reduced, LoLA_hsViT_tiny,
+                           LoLA_hsViT_mini, LoLA_hsViT_2layer,
+                           CommonViT_reduced, CommonViT_tiny,
+                           CommonViT_mini, CommonViT_2layer)
         cls._registry = {
             'lola': LoLA_hsViT,
+            'lola_reduced': LoLA_hsViT_reduced,
+            'lola_tiny': LoLA_hsViT_tiny,
+            'lola_mini': LoLA_hsViT_mini,
+            'lola_2layer': LoLA_hsViT_2layer,
             'common': CommonViT,
+            'common_reduced': CommonViT_reduced,
+            'common_tiny': CommonViT_tiny,
+            'common_mini': CommonViT_mini,
+            'common_2layer': CommonViT_2layer,
             'unet': Unet,
         }
 

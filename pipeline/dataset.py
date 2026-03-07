@@ -840,7 +840,7 @@ class NpyHSDataset(AbstractHSDataset):
             tprint(f"  {name} class dist: {dict(zip(self.config.clsf.targets, pct))}")
         
         # create indexed subsets
-        # augmentation for train only
+        # augmentation for train only, no resampling to preserve original distribution
         train_subset = _AugmentedSubset(
             self, train_idx,
             noise_std=0.02,
@@ -856,14 +856,10 @@ class NpyHSDataset(AbstractHSDataset):
                          getattr(self, 'batch_size', 32))
         actual_pin_memory = pin_memory and torch.cuda.is_available()
         
-        # balanced sampler for training
-        # sqrt-inverse weighting to handle class imbalance
-        train_sampler = self._sampler_balance(train_idx)
-        
         train_loader = torch.utils.data.DataLoader(
             train_subset,
             batch_size=batch_size,
-            sampler=train_sampler,  # balanced sampling instead of shuffle
+            shuffle=True,  # plain shuffle, no resampling — preserves original distribution
             num_workers=num_workers,
             pin_memory=actual_pin_memory,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
@@ -969,13 +965,10 @@ class NpyHSDataset(AbstractHSDataset):
             )
             test_subset = _IndexedSubset(self, test_idx)
 
-            # Balanced sampler per fold
-            train_sampler = self._sampler_balance(train_idx)
-
             train_loader = torch.utils.data.DataLoader(
                 train_subset,
                 batch_size=batch_size,
-                sampler=train_sampler,
+                shuffle=True,  # no resampling — preserves original distribution
                 num_workers=num_workers,
                 pin_memory=actual_pin_memory,
                 prefetch_factor=prefetch_factor if num_workers > 0 else None,

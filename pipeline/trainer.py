@@ -39,15 +39,17 @@ class FocalLoss(nn.Module):
     ```
     Down-weights well-classified samples so training focuses on hard / rare ones.
     Supports segmentation outputs (N, C, H, W) with ignore_index masking.
+    Optional label smoothing to prevent overconfident predictions.
     """
 
     def __init__(self, weight=None, gamma=2.0, ignore_index=-100,
-                 reduction='mean'):
+                 reduction='mean', label_smoothing=0.0):
         super().__init__()
         self.register_buffer('weight', weight)  # per-class weights (C,)
         self.gamma = gamma
         self.ignore_index = ignore_index
         self.reduction = reduction
+        self.label_smoothing = label_smoothing
 
     def forward(self, logits, targets):
         # Flatten to 2D: (N*H*W, C) and (N*H*W,)
@@ -67,11 +69,24 @@ class FocalLoss(nn.Module):
         if logits.numel() == 0:
             return logits.sum() * 0.0
 
+        C = logits.shape[-1]
         log_p = F.log_softmax(logits, dim=-1)
-        p_t = log_p.exp().gather(1, targets.unsqueeze(1)).squeeze(1)
-        log_p_t = log_p.gather(1, targets.unsqueeze(1)).squeeze(1)
+        p = log_p.exp()
 
-        loss = -((1 - p_t) ** self.gamma) * log_p_t
+        # Label smoothing: soft targets
+        if self.label_smoothing > 0:
+            smooth = self.label_smoothing / C
+            onehot = torch.zeros_like(log_p).scatter_(
+                1, targets.unsqueeze(1), 1.0)
+            soft_targets = onehot * (1.0 - self.label_smoothing) + smooth
+            # Focal modulation on the true-class probability
+            p_t = p.gather(1, targets.unsqueeze(1)).squeeze(1)
+            focal_weight = (1 - p_t) ** self.gamma
+            loss = -(soft_targets * log_p).sum(dim=-1) * focal_weight
+        else:
+            p_t = p.gather(1, targets.unsqueeze(1)).squeeze(1)
+            log_p_t = log_p.gather(1, targets.unsqueeze(1)).squeeze(1)
+            loss = -((1 - p_t) ** self.gamma) * log_p_t
 
         if self.weight is not None:
             loss = self.weight.to(logits.device)[targets] * loss
@@ -607,8 +622,10 @@ class hsTrainer(BaseEstimator):
             print(f"  Warning: uniform class weights ({e})")
         
         self.criterion = FocalLoss(
-            weight=class_weights, gamma=focal_gamma, ignore_index=255)
-        print(f"  FocalLoss(gamma={focal_gamma})")
+            weight=class_weights, gamma=focal_gamma, ignore_index=255,
+            label_smoothing=getattr(self.config.common, 'label_smoothing', 0.0))
+        print(f"  FocalLoss(gamma={focal_gamma}, "
+              f"label_smoothing={getattr(self.config.common, 'label_smoothing', 0.0)})")
         
         # Mixed precision
         use_amp = self.config.common.use_amp and self.device.type == 'cuda'
@@ -961,7 +978,7 @@ class hsTrainer(BaseEstimator):
                         'kappa': kappa
                     }
                     self._save_model()
-                    tprint(f"  Best model saved (BA: {eval_acc:.2f}%) at {os.path.join(self.output, 'models', f'{self.model_name}_best.pth')}")
+                    tprint(f"  Best model saved (BA: {eval_acc:.2f}%) at {os.path.join(self.output, 'models', f'{self.model_name}_best.onnx')}")
                 else:
                     # early stopping check
                     if epoch - self.best_epoch > self.patience:
@@ -1011,7 +1028,7 @@ class hsTrainer(BaseEstimator):
             'final_accuracy': final_acc,
             'final_kappa': final_kappa,
             'training_time': training_time,
-            'model_path': os.path.join(self.output, 'models', f'{self.model_name}_best.pth')
+            'model_path': os.path.join(self.output, 'models', f'{self.model_name}_best.onnx')
         }
         # Always include mIoU
         if hasattr(self, '_last_miou'):
@@ -1790,16 +1807,40 @@ class hsTrainer(BaseEstimator):
     def _save_model(self) -> None:
         if self.best_model_state is None:
             return
-        
-        # dummy input (1, C, H, W) for caculation graph tracing.
-        dummy_input = torch.randn(1, self.config.preprocess.pca_components,
-                                    self.config.split.patch_size,
-                                    self.config.split.patch_size
-                                  ).to(self.device)
-        
-        model_path = os.path.join(self.output, 'models', f'{self.model_name}_best.pth')
-        torch.onnx.export(self.model, dummy_input, "model.onnx")
-        tprint(f"  Model saved to: {model_path}")
+
+        # Load best EMA weights into the model for export
+        raw_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+
+        # Save as ONNX
+        onnx_path = os.path.join(self.output, 'models', f'{self.model_name}_best.onnx')
+        dummy_input = torch.randn(
+            1, self.config.preprocess.pca_components,
+            self.config.split.patch_size,
+            self.config.split.patch_size
+        ).to(self.device)
+
+        raw_model.eval()
+        try:
+            torch.onnx.export(
+                raw_model,
+                dummy_input,
+                onnx_path,
+                export_params=True,
+                opset_version=14,
+                do_constant_folding=True,
+                input_names=['input'],
+                output_names=['output'],
+                dynamic_axes={
+                    'input': {0: 'batch_size'},
+                    'output': {0: 'batch_size'}
+                }
+            )
+            tprint(f"  ONNX model saved to: {onnx_path}")
+        except Exception as e:
+            # Fallback: save as .pth if ONNX export fails
+            pth_path = os.path.join(self.output, 'models', f'{self.model_name}_best.pth')
+            torch.save(self.best_model_state, pth_path)
+            tprint(f"  ONNX export failed ({e}), saved .pth to: {pth_path}")
     
     def _compute_gradcam(self, x: torch.Tensor, class_idx: int) -> np.ndarray:
         """Compute Grad-CAM heatmap for model interpretability.
