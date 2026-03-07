@@ -186,6 +186,8 @@ LoLA_hsViT/
 
 用法：
 ```bash
+bash
+
 python run.py -a
 ```
 

@@ -7,29 +7,45 @@
 
 run.py作程序入口, 支持消融实验
 
----
+
+
+### 工作流
+
+```
+                 模型架构层
+              ↗  model.py ↘  
+    配置文件                  训练算法层 -> 封装总线 -> 用户层接口
+  config.yaml ↘           ↗ trainer.py   core.py     run.py
+                 数据处理层
+                 dataset.py
+```
+
 ## 工作结构
 ```
 LoLA_hsViT/
-├── config/       # 参数设置
+├── config/                 # 参数设置
 │   ├── __init__.py
-│   ├── config.yaml
+│   ├── config.yaml         # 配置文件
 │   └── config_yaml.py
-├── model/        # 模型定义
+├── model/                  # 模型架构层
 │   ├── __init__.py
 │   ├── u_net.py
 │   ├── lola_vit.py
 │   ├── common_vit.py
 │   └── ...
-├── pipeline/     # 工作流类
+├── pipeline/               # 工作流类
 │   ├── __init__.py
 │   ├── core.py             # 封装总线
 │   ├── trainer.py          # 训练算法层
-│   ├── dataset.py          # 数据层
-│   ├── monitor.py          # 花样服务
+│   ├── dataset.py          # 数据处理层
+│   ├── monitor.py          # 栈外服务
 │   ├── analyzer.py
 │   └── visualize.py
-├── run.py        # 用户层入口
+├── src/                    # .md插图资源
+│   ├── xxx.png
+│   └── ...
+├── run.py                  # 用户层入口
+├── monitor.py              # 资源监视器 (服务调用)
 ├── LOG.md
 ├── README.md
 ├── requirements.txt
@@ -77,26 +93,15 @@ outputs/
 
 通过 `run.py` 执行结构消融实验, 逐步缩参, 兼顾 **性能-参数量**。
 
-```
+```bash
 bash
 
 python run.py \
     <--tag/-t> { /reduced/tiny/mini/2layer} \
     <--model/-m> { /common/lola/unet} \
     <--epoch/-e> {num_epochs}
-
 ```
 
-### 工作流
-
-```
-                 模型架构层
-              ↗  model.py ↘  
-    配置文件                  训练算法层 -> 封装总线 -> 用户接口
-  config.yaml ↘           ↗ trainer.py   core.py    run.py
-                 数据处理层
-                 dataset.py
-```
 
 1. **模型架构**：预定义 10 组配置(CommonViT * 5 + LoLA_hsViT * 5)：
 
@@ -114,7 +119,7 @@ python run.py \
 
 1. **自动消融**：对选定的配置，顺序训练, 模型结束后立刻回收显存。
 
-2. **最优选择与清理**：按综合评分排名, **保留**每类模型中 Balance Score 最高的 checkpoint (.pth)和**所有实验的可视化结果**。
+2. **最优选择与清理**：按综合评分排名, **保留**每类模型中 Balance Score 最高的 checkpoint (`.onnx`)和**所有实验的可视化结果**。
 
 ### 评估标准
 
