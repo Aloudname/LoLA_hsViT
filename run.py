@@ -153,23 +153,23 @@ def main():
     dataset = NpyHSDataset(config)
     tprint(f"Dataset loaded: {len(dataset)} patches")
 
-    # Dataset analysis mode
+    # dataset analysis mode
     if args.analyze_dataset:
         tprint("Analyzing mode enabled.")
         analyze_dataset(dataset, show_split=True)
         tprint("Dataset analysis complete.")
         raise SystemExit(0)
 
-    # Validate tags
+    # validate tags
     for tag in args.tag:
         if tag not in ModelFactory.VALID_TAGS:
             raise ValueError(f"Invalid tag '{tag}'. "
                              f"Valid tags: {ModelFactory.VALID_TAGS}")
 
-    # Build run queue (cartesian product of models x tags)
+    # build run queue (models * tags)
     run_queue = _build_run_queue(args.model, args.tag)
 
-    # Validate all model names before starting
+    # validate all model names before starting
     available = ModelFactory.available_models()
     for registry_key, _ in run_queue:
         if registry_key not in available:
@@ -178,14 +178,14 @@ def main():
 
     seed_list = _parse_seed_list(args.seeds)
 
-    # -- Multi-seed evaluation --
+    # multi-seed eval
     if seed_list:
         tprint(f"Multi-seed evaluation: {len(seed_list)} seeds x "
                f"{len(run_queue)} model(s)")
 
         for registry_key, display_name in run_queue:
             all_results = []
-            tprint(f"\n{'='*60}")
+            print("\n")
             tprint(f"Model: {display_name}, seeds: {seed_list}")
 
             for seed in seed_list:
@@ -222,7 +222,7 @@ def main():
                     })
                 _release_resources()
 
-            # Print summary
+            # summary
             print(f"\nMulti-seed summary for {display_name}:")
             if all_results[0]['mode'] == 'cv':
                 acc_means = np.array([r['accuracy_mean'] for r in all_results])
@@ -241,15 +241,15 @@ def main():
             _release_resources()
         return
 
-    # -- Sequential model training --
+    # sequential training
     total = len(run_queue)
     all_results = {}
 
     tprint(f"\nRun queue: {total} model(s)")
     for i, (registry_key, display_name) in enumerate(run_queue):
-        tprint(f"\n{'='*60}")
+        print("\n")
         tprint(f"[{i+1}/{total}] Training: {display_name}")
-        tprint(f"{'='*60}")
+        print("\n")
 
         exp_name = args.name if (total == 1 and args.name) else f"{registry_key}_exp"
 
@@ -261,7 +261,7 @@ def main():
                 debug=args.debug, num_gpus=args.gpus)
 
             all_results[registry_key] = result
-            print(f"\n  {display_name} complete: {result}")
+            tprint(f"\n  {display_name} complete: {result}")
 
         except Exception as e:
             tprint(f"  ERROR training {display_name}: {e}")
@@ -270,11 +270,11 @@ def main():
         finally:
             _release_resources()
 
-    # -- Summary --
+    # summary
     if total > 1:
-        print(f"\n{'='*60}")
+        print("\n")
         print(f"  SUMMARY ({total} models)")
-        print(f"{'='*60}")
+        print("\n")
         for name, r in all_results.items():
             if isinstance(r, CVResult):
                 print(f"  {name:<20} Acc={r.accuracy_mean:.2f}% "
@@ -285,10 +285,10 @@ def main():
         print()
     elif all_results:
         name, r = next(iter(all_results.items()))
-        print(f"\nTraining complete!")
+        tprint(f"\nTraining complete!")
         print(r)
         out = r.output_dir if hasattr(r, 'output_dir') else 'N/A'
-        print(f"Output: {out}")
+        tprint(f"Output: {out}")
 
 
 if __name__ == '__main__':

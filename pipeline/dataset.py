@@ -180,7 +180,6 @@ class AbstractHSDataset(ABC, Dataset):
         self.transform = transform
         self.kwargs = kwargs
         self.test_rate = config.split.test_rate
-        self.split_seed = int(getattr(config.split, 'split_seed', 350234))
 
         # Core data structures
         self.raw_data: np.ndarray = None
@@ -798,7 +797,7 @@ class NpyHSDataset(AbstractHSDataset):
         # stratified patient-level split into train+val vs test
         # StratifiedGroupKFold preserves class proportions while ensuring patient isolation.
         # use 5-fold split: take 1 fold as test (20%), 4 folds as train+val pool.
-        split_seed = int(getattr(self.config.split, 'split_seed', self.split_seed))
+        split_seed = self.config.split.split_seed
         sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=split_seed)
         trainval_idx, test_idx = next(sgkf.split(
             total_indices, self.patch_labels,
@@ -919,7 +918,7 @@ class NpyHSDataset(AbstractHSDataset):
         total_indices = np.arange(len(self.patch_indices))
         all_classes = set(np.unique(self.patch_labels))
 
-        split_seed = int(getattr(self.config.split, 'split_seed', self.split_seed))
+        split_seed = self.config.split.split_seed
         sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True,
                         random_state=split_seed)
 
