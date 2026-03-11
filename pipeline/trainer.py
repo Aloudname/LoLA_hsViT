@@ -335,8 +335,7 @@ class hsTrainer(BaseEstimator):
         self.config = config
         self.dataLoader = dataLoader
         self.epochs = epochs
-        self._model_ctor = model
-        self.model = None
+        self.model = model
         self.model_name = model_name
         self.debug_mode = debug_mode
         self.num_gpus = num_gpus
@@ -453,7 +452,7 @@ class hsTrainer(BaseEstimator):
             n_folds = self.config.common.cv_folds
         self.cv_results_ = hsTrainer.cross_validate(
             self.config, self.dataLoader,
-            n_folds, self.epochs, self._model_ctor,
+            n_folds, self.epochs, self.model,
             model_name=self.model_name,
             num_gpus=self.num_gpus,
             debug_mode=self.debug_mode)
@@ -546,9 +545,10 @@ class hsTrainer(BaseEstimator):
         """create model and print parameter count"""
         tprint("Creating model with:")
         try:
-            if self._model_ctor is None:
+            if self.model is None:
                 raise RuntimeError("model constructor is None; please pass a callable when initializing hsTrainer")
-            self.model = self._model_ctor(**self.kwargs)
+            if self.kwargs:
+                self.model = self.model(**self.kwargs)
             self.model.to(self.device)  # optimize for convolutional models
             
             # stats for model parameter count
@@ -617,7 +617,8 @@ class hsTrainer(BaseEstimator):
             raw_weights = raw_weights / raw_weights.mean()
             class_weights = torch.FloatTensor(raw_weights).to(self.device)
             imbalance = class_counts.max() / (class_counts.min() + 1)
-            print(f"  Class weights (effective-number): imbalance ratio {imbalance:.1f}x, {num_cls} classes")
+            print(f"  Imbalance report: imbalance ratio {imbalance:.1f}x, {num_cls} classes")
+            print(f"  Class weights: {dict(zip(self.config.clsf.targets, raw_weights))}")
         except Exception as e:
             print(f"  Warning: uniform class weights ({e})")
         
@@ -831,14 +832,13 @@ class hsTrainer(BaseEstimator):
                     outputs = self.model(hsi)
                     loss = self.criterion(outputs, labels)
                 total_loss += loss.item()
-
-                _, predicted = torch.max(outputs, 1)
-
+                logits, predicted = torch.max(outputs, 1)
+                
                 # filter padding/background (ignore_index = 255)
                 valid_mask  = (labels != 255)
                 pred_valid  = predicted[valid_mask]   # shape: (n_valid,)
                 tgt_valid   = labels[valid_mask]      # shape: (n_valid,)
-
+        
                 # linearise (true_cls, pred_cls) -> flat index and accumulate
                 # cm_gpu[t, p] += 1  equivalent, without any Python loop
                 linear_idx = tgt_valid * num_classes + pred_valid

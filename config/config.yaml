@@ -44,7 +44,7 @@ path:
   label: /data/chenhaoran/processed_npy_64_norm
   output: /home/chenhaoran/LoLA_hsViT/output
 clsf:
-  num: 3
+  num: 2
   targets:
     - 'PG'   # ⭐Parathyroid gland
     # - 'FAT'
@@ -52,6 +52,6 @@ clsf:
     # - 'LN'   # Lymph Node
     # - 'MS'   # Muscle
     # - 'Blood'
-    - 'Tra'  # Trachea
+    # - 'Tra'  # Trachea
     # - 'ES'   # Esophagus
     # - 'Other' # ⭐ all non-target tissues

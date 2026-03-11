@@ -3,11 +3,9 @@
 
 `HyperspectralTrainer` for highlighting the ~~superiority~~ of LoLA-hsViT over common ViT.
 
-毕业设计用, LoLA-hsViT的本地部署部分
+毕业设计用, LoLA-hsViT的本地训练部分
 
 run.py作程序入口, 支持消融实验
-
-
 
 ### 工作流
 

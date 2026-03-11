@@ -521,7 +521,7 @@ class NpyHSDataset(AbstractHSDataset):
             0,  # 4: LN         -> LN    (4)
             0,  # 5: MS         -> MS    (5)
             0,  # 6: Blood      -> Blood (6)
-            3,  # 7: Tra        -> Tra   (7)
+            0,  # 7: Tra        -> Tra   (7)
             0,  # 8: ES         -> ES    (8)
         ], dtype=np.int32)
         self._label_remap = _label_remap
@@ -555,7 +555,6 @@ class NpyHSDataset(AbstractHSDataset):
                 print(f"\t\tWARNING: {os.path.basename(label_file)} has label value "
                        f"{max_raw} exceeding remap table max "
                        f"{len(_label_remap)-1}, will be clipped")
-            # CRITICAL: clip to len(_label_remap)-1 (=8), NOT config.clsf.num (=7).
             # clipping to 7 would map ES(8) -> _label_remap[7]=Tra, silently corrupting ES labels.
             labels_clipped = np.clip(labels_raw, 0, len(_label_remap) - 1)
             labels = _label_remap[labels_clipped]  # shape: (h_i, w_i), now 1-based merged
@@ -836,7 +835,7 @@ class NpyHSDataset(AbstractHSDataset):
         for name, idx in [("Train", train_idx), ("Val", val_idx), ("Test", test_idx)]:
             dist = np.bincount(self.patch_labels[idx], minlength=self.num)
             pct = (dist / dist.sum() * 100).round(1)
-            tprint(f"  {name} class dist: {dict(zip(self.config.clsf.targets, pct))}")
+            print(f"  {name} label distribution: {dict(zip(self.config.clsf.targets, pct))}")
         
         # create indexed subsets
         # augmentation for train only, no resampling to preserve original distribution
@@ -1215,7 +1214,7 @@ class _AugmentedSubset(Dataset):
     def __init__(self, dataset: AbstractHSDataset, indices: np.ndarray,
                  noise_std: float = 0.02,
                  band_drop_rate: float = 0.05,
-                 cutout_ratio: float = 0.15,
+                 cutout_ratio: float = 0.05,
                  minority_threshold: float = 0.3,
                  minority_blend_prob: float = 0.5):
         """Augment subset with optional rare-class copy-paste blending.
