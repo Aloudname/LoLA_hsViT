@@ -16,6 +16,7 @@ common:
   grad_clip: 0.5          # mixed precision settings
   gradient_accumulation_steps: 2
   cv_folds: 1             # Default number of folds for cross-validation (0 = disabled)
+  vis_samples: 8         # Number of samples to visualize in fin eval
 lora:
   lora_dropout: 0.2
   lora_rank: 16

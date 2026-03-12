@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-import cv2, gc, json, os, time, torch, traceback, warnings, copy, matplotlib
+import cv2, gc, json, os, re, time, torch, traceback, warnings, copy, matplotlib
 
 from tqdm import tqdm
 from munch import Munch
@@ -802,16 +802,19 @@ class hsTrainer(BaseEstimator):
         targets_list     = [] if collect_extra else None
         probas_list      = [] if collect_extra else None   # sub-sampled; see roc_per_batch
         roc_targets_list = [] if collect_extra else None   # targets paired with sub-sampled probas
+        vis_pairs        = [] if collect_extra else None   # small set of (pred_map, label_map) for visualization
 
         # Default loader selection: val for epoch eval, test only for final
         if loader is None:
             eval_loader = self.val_loader if self.val_loader else self.test_loader
         else:
             eval_loader = loader
+        recon_state = self._init_reconstruction_state(eval_loader) if collect_extra else None
         # ROC sub-sampling budget: keep ≤2M pixels total (~1350 per batch for typical test set).
         # ROC AUC is statistically stable with ≥1M samples; this avoids the 14 GB y_onehot
         # allocation and the 4.4B-iteration Python loop in _save_all_plots.
         roc_per_batch = max(256, 2_000_000 // max(len(eval_loader), 1)) if collect_extra else 0
+        max_vis_samples = self.config.common.vis_samples
         pbar = tqdm(eval_loader, desc='Evaluating', leave=False)
 
         with torch.no_grad():
@@ -820,7 +823,7 @@ class hsTrainer(BaseEstimator):
                 hsi    = hsi.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
 
-                # format check
+                # [B, H, W, C] -> [B, C, H, W]
                 if hsi.dim() == 4 and hsi.shape[-1] <= 16:
                     hsi = hsi.permute(0, 3, 1, 2)
 
@@ -850,6 +853,18 @@ class hsTrainer(BaseEstimator):
                 if collect_extra:
                     predictions_list.append(pred_valid)   # stays on GPU
                     targets_list.append(tgt_valid)        # stays on GPU
+                    self._accumulate_reconstruction_batch(recon_state, predicted, labels)
+
+                    # Cache a few full-size map pairs for final comparison figure.
+                    if len(vis_pairs) < max_vis_samples and predicted.dim() == 3 and labels.dim() == 3:
+                        remaining = max_vis_samples - len(vis_pairs)
+                        take_n = min(predicted.shape[0], remaining)
+                        for b_idx in range(take_n):
+                            vis_pairs.append((
+                                predicted[b_idx].detach().cpu().numpy(),
+                                labels[b_idx].detach().cpu().numpy(),
+                            ))
+
                     # Sub-sample probas: keep at most roc_per_batch valid pixels per batch.
                     # Avoids storing all 4.4B×8-class float32 (~14 GB) in host RAM.
                     proba = outputs.softmax(dim=1)                       # [B, K, H, W]
@@ -902,6 +917,8 @@ class hsTrainer(BaseEstimator):
         if collect_extra:
             predictions = torch.cat(predictions_list, dim=0).cpu().numpy()
             targets     = torch.cat(targets_list,     dim=0).cpu().numpy()
+            self._last_vis_pairs = vis_pairs
+            self._last_reconstruction = recon_state
             if probas_list:
                 self._last_probas         = np.concatenate(probas_list, axis=0)
                 self._last_probas_targets = np.concatenate(roc_targets_list, axis=0)
@@ -912,6 +929,8 @@ class hsTrainer(BaseEstimator):
             # epoch-level eval: callers only use scalar metrics
             predictions = np.empty(0, dtype=np.int64)
             targets     = np.empty(0, dtype=np.int64)
+            self._last_vis_pairs = None
+            self._last_reconstruction = None
 
         # restore original weights via second swap
         # e.g. if EMA was used, swap back to original model weights
@@ -1012,6 +1031,7 @@ class hsTrainer(BaseEstimator):
         # This is the only time test set is used, ensuring unbiased generalization estimate
         final_loss, final_acc, final_kappa, final_pred, final_target = self.evaluate(
             collect_extra=True, loader=self.test_loader)
+        self._last_ba = final_acc
         tprint(f"Final eval on TEST set completed (BA: {final_acc:.2f}%)")
         
         # Store for CV aggregation (accessed before trainer is deleted)
@@ -1020,6 +1040,8 @@ class hsTrainer(BaseEstimator):
         
         # single-model visualizations, skip in CV mode for aggregated plots
         if not _cv_mode:
+            self._save_full_reconstruction_maps()
+            self._save_prediction_label_comparison()
             self._save_all_plots(final_target, final_pred)
         
         results = {
@@ -1579,6 +1601,269 @@ class hsTrainer(BaseEstimator):
         plt.close()
         tprint(f"  CV gradient norm saved to {path}")
 
+    # for visual reconstructions.
+    def _save_prediction_label_comparison(self) -> None:
+        """Save side-by-side prediction/label map images from final eval."""
+        vis_pairs = getattr(self, '_last_vis_pairs', None)
+        if not vis_pairs:
+            return
+
+        num_classes = int(self.config.clsf.num)
+        max_items = int(getattr(self.config.common, 'vis_samples', 8))
+        num_items = min(len(vis_pairs), max_items)
+        if num_items <= 0:
+            return
+
+        out_dir = os.path.join(self.output, 'outputs')
+        os.makedirs(out_dir, exist_ok=True)
+
+        fig, axes = plt.subplots(num_items, 2, figsize=(8, 3.5 * num_items))
+        if num_items == 1:
+            axes = np.expand_dims(axes, axis=0)
+
+        cmap = plt.cm.get_cmap('tab20', num_classes)
+        for idx in range(num_items):
+            pred_map, label_map = vis_pairs[idx]
+            pred_show = pred_map.astype(np.float32).copy()
+            label_show = label_map.astype(np.float32).copy()
+            ignore_mask = (label_show == 255)
+            pred_show[ignore_mask] = np.nan
+            label_show[ignore_mask] = np.nan
+
+            axes[idx, 0].imshow(pred_show, cmap=cmap, vmin=0, vmax=max(num_classes - 1, 0))
+            axes[idx, 0].set_title(f'Predicted #{idx + 1}')
+            axes[idx, 0].axis('off')
+
+            axes[idx, 1].imshow(label_show, cmap=cmap, vmin=0, vmax=max(num_classes - 1, 0))
+            axes[idx, 1].set_title(f'Label #{idx + 1}')
+            axes[idx, 1].axis('off')
+
+        plt.tight_layout()
+        save_path = os.path.join(out_dir, 'prediction_vs_label.png')
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        tprint(f"  Prediction-vs-label plot saved to {save_path}")
+
+    def _resolve_dataset_and_indices(self, loader):
+        """Resolve base dataset and subset indices from a possibly wrapped loader dataset."""
+        if loader is None or not hasattr(loader, 'dataset'):
+            return None, None
+
+        ds = loader.dataset
+        indices = None
+        visited = set()
+        while ds is not None and id(ds) not in visited:
+            visited.add(id(ds))
+            if hasattr(ds, 'indices') and indices is None:
+                try:
+                    indices = np.asarray(ds.indices)
+                except Exception:
+                    indices = None
+            if hasattr(ds, 'dataset'):
+                ds = ds.dataset
+            else:
+                break
+        return ds, indices
+
+    def _init_reconstruction_state(self, loader):
+        """Initialize full-image reconstruction state from loader metadata."""
+        base_ds, subset_indices = self._resolve_dataset_and_indices(loader)
+        if base_ds is None or not hasattr(base_ds, 'patch_indices'):
+            return None
+
+        margin = int(getattr(base_ds, 'margin', 0))
+        patch_indices = base_ds.patch_indices
+        if len(patch_indices) == 0:
+            return None
+
+        # Multi-patient NpyHSDataset: patch_indices is (N, 3) => (patient, r, c)
+        if hasattr(base_ds, '_patient_padded_labels') and patch_indices.shape[1] == 3:
+            pred_maps = []
+            label_maps = []
+            patient_names = []
+            for p_idx, padded_lbl in enumerate(base_ds._patient_padded_labels):
+                if margin > 0:
+                    h = padded_lbl.shape[0] - 2 * margin
+                    w = padded_lbl.shape[1] - 2 * margin
+                else:
+                    h, w = padded_lbl.shape
+                pred_maps.append(np.full((h, w), 255, dtype=np.int32))
+                label_maps.append(np.full((h, w), 255, dtype=np.int32))
+                if hasattr(base_ds, '_patient_names'):
+                    patient_names.append(str(base_ds._patient_names.get(p_idx, f'patient_{p_idx:02d}')))
+                else:
+                    patient_names.append(f'patient_{p_idx:02d}')
+
+            return {
+                'enabled': True,
+                'mode': 'multi_patient',
+                'base_ds': base_ds,
+                'subset_indices': subset_indices,
+                'sample_ptr': 0,
+                'margin': margin,
+                'pred_maps': pred_maps,
+                'label_maps': label_maps,
+                'patient_names': patient_names,
+                'patch_counts': np.zeros(len(pred_maps), dtype=np.int64),
+            }
+
+        # Single-image dataset: patch_indices is (N, 2) => (r, c)
+        if hasattr(base_ds, 'raw_labels') and patch_indices.shape[1] == 2:
+            h, w = base_ds.raw_labels.shape
+            return {
+                'enabled': True,
+                'mode': 'single_image',
+                'base_ds': base_ds,
+                'subset_indices': subset_indices,
+                'sample_ptr': 0,
+                'margin': margin,
+                'pred_maps': [np.full((h, w), 255, dtype=np.int32)],
+                'label_maps': [np.full((h, w), 255, dtype=np.int32)],
+                'patient_names': ['full_image'],
+                'patch_counts': np.zeros(1, dtype=np.int64),
+            }
+
+        return None
+
+    def _accumulate_reconstruction_batch(self, recon_state, predicted, labels) -> None:
+        """Accumulate center-pixel predictions into full reconstructed maps."""
+        if not recon_state or not recon_state.get('enabled', False):
+            return
+
+        base_ds = recon_state['base_ds']
+        patch_indices = base_ds.patch_indices
+        subset_indices = recon_state['subset_indices']
+        margin = recon_state['margin']
+
+        batch_size = int(predicted.shape[0])
+        for b_idx in range(batch_size):
+            global_idx = recon_state['sample_ptr'] + b_idx
+            if subset_indices is not None:
+                if global_idx >= len(subset_indices):
+                    continue
+                original_idx = int(subset_indices[global_idx])
+            else:
+                if global_idx >= len(patch_indices):
+                    continue
+                original_idx = global_idx
+
+            if patch_indices.shape[1] == 3:
+                p_idx, r_pad, c_pad = patch_indices[original_idx]
+            else:
+                p_idx = 0
+                r_pad, c_pad = patch_indices[original_idx]
+
+            rr = int(r_pad) - margin
+            cc = int(c_pad) - margin
+            if rr < 0 or cc < 0:
+                continue
+            if rr >= recon_state['pred_maps'][p_idx].shape[0] or cc >= recon_state['pred_maps'][p_idx].shape[1]:
+                continue
+
+            pred_center = int(predicted[b_idx, margin, margin].detach().item())
+            label_center = int(labels[b_idx, margin, margin].detach().item())
+
+            recon_state['pred_maps'][p_idx][rr, cc] = pred_center
+            recon_state['label_maps'][p_idx][rr, cc] = label_center
+            recon_state['patch_counts'][p_idx] += 1
+
+        recon_state['sample_ptr'] += batch_size
+
+    def _save_full_reconstruction_maps(self) -> None:
+        """Save reconstructed full-image prediction-vs-label maps with rich metadata."""
+        recon = getattr(self, '_last_reconstruction', None)
+        if not recon or not recon.get('enabled', False):
+            tprint("  Full reconstruction skipped: no reconstruction state available")
+            return
+
+        out_dir = os.path.join(self.output, 'outputs', 'reconstruction')
+        os.makedirs(out_dir, exist_ok=True)
+
+        num_classes = int(self.config.clsf.num)
+        class_names = list(self.config.clsf.targets[:num_classes])
+        oa = float(getattr(self, '_last_oa', 0.0))
+        ba = float(getattr(self, '_last_ba', self.best_acc))
+        miou = float(getattr(self, '_last_miou', 0.0))
+        timestamp = time.strftime('%Y%m%d_%H%M%S')
+
+        cmap = plt.cm.get_cmap('tab20', num_classes)
+        total_saved = 0
+        summary_lines = []
+
+        for p_idx, (pred_map, label_map) in enumerate(zip(recon['pred_maps'], recon['label_maps'])):
+            patient_name = recon['patient_names'][p_idx]
+            safe_patient = re.sub(r'[^A-Za-z0-9_.-]+', '_', patient_name)
+
+            valid_mask = (label_map != 255)
+            covered = int(valid_mask.sum())
+            if covered == 0:
+                continue
+            correct = int(((pred_map == label_map) & valid_mask).sum())
+            pixel_acc = 100.0 * correct / covered
+
+            # -1 denotes uncovered pixels; keeps disagreement view explicit.
+            diff_map = np.full_like(pred_map, fill_value=-1, dtype=np.int32)
+            diff_map[valid_mask] = (pred_map[valid_mask] != label_map[valid_mask]).astype(np.int32)
+
+            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+            pred_show = pred_map.astype(np.float32).copy()
+            pred_show[pred_map == 255] = np.nan
+            label_show = label_map.astype(np.float32).copy()
+            label_show[label_map == 255] = np.nan
+
+            im0 = axes[0].imshow(pred_show, cmap=cmap, vmin=0, vmax=max(num_classes - 1, 0))
+            axes[0].set_title('Reconstructed Prediction')
+            axes[0].axis('off')
+
+            axes[1].imshow(label_show, cmap=cmap, vmin=0, vmax=max(num_classes - 1, 0))
+            axes[1].set_title('Reconstructed Label')
+            axes[1].axis('off')
+
+            axes[2].imshow(diff_map, cmap='coolwarm', vmin=-1, vmax=1)
+            axes[2].set_title('Mismatch Map (red=error, white=correct, blue=uncovered)')
+            axes[2].axis('off')
+
+            cbar = fig.colorbar(im0, ax=axes[:2], fraction=0.028, pad=0.02)
+            cbar.set_label('Class Index')
+
+            title = (
+                f"{self.model_name} | TEST Reconstruction | patient={patient_name} | "
+                f"patches={int(recon['patch_counts'][p_idx])} | covered_px={covered} | "
+                f"pixel_acc={pixel_acc:.2f}% | OA={oa:.2f}% | BA={ba:.2f}% | mIoU={miou:.2f}%"
+            )
+            fig.suptitle(title, fontsize=11, fontweight='bold')
+            plt.tight_layout()
+
+            save_name = (
+                f"recon_{safe_patient}_pxacc{pixel_acc:.2f}_oa{oa:.2f}_"
+                f"miou{miou:.2f}_{timestamp}.png"
+            )
+            save_path = os.path.join(out_dir, save_name)
+            plt.savefig(save_path, dpi=180, bbox_inches='tight')
+            plt.close()
+
+            summary_lines.append(
+                f"patient={patient_name}, patches={int(recon['patch_counts'][p_idx])}, "
+                f"covered_px={covered}, correct_px={correct}, pixel_acc={pixel_acc:.4f}, "
+                f"OA={oa:.4f}, BA={ba:.4f}, mIoU={miou:.4f}, file={save_name}"
+            )
+            total_saved += 1
+
+        if total_saved == 0:
+            tprint("  Full reconstruction skipped: no valid labeled pixels found")
+            return
+
+        summary_path = os.path.join(out_dir, f'reconstruction_summary_{timestamp}.txt')
+        with open(summary_path, 'w') as f:
+            f.write(f"model={self.model_name}\n")
+            f.write(f"timestamp={timestamp}\n")
+            f.write(f"classes={class_names}\n")
+            f.write(f"OA={oa:.4f}, BA={ba:.4f}, mIoU={miou:.4f}\n")
+            f.write("\n".join(summary_lines))
+
+        tprint(f"  Full reconstruction plots saved: {total_saved} file(s) -> {out_dir}")
+
     def _save_all_plots(self, final_target, final_pred):
         """generate all single-model plots in parallel.
 
@@ -1767,7 +2052,7 @@ class hsTrainer(BaseEstimator):
         except Exception as e:
             tprint(f"Error during generating CAM: {e}")
             traceback.print_exc()
-    
+
     def _unpack_batch(self, batch_data) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Unpack batch data from DataLoader.
