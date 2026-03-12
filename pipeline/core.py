@@ -151,16 +151,16 @@ class ModelFactory:
         return list(cls._registry.keys())
     
     @classmethod
-    def resolve_name(cls, model_short: str, tag: str = 'full') -> str:
-        """Resolve a (model_short, tag) pair to a registry key.
+    def resolve_name(cls, model: str, tag: str = 'full') -> str:
+        """Resolve a (model, tag) pair to a registry key.
         
         Examples:
             resolve_name('lola', 'mini')  -> 'lola_mini'
             resolve_name('common', 'full') -> 'common'
         """
         if tag == 'full':
-            return model_short.lower()
-        return f"{model_short.lower()}_{tag}"
+            return model.lower()
+        return f"{model.lower()}_{tag}"
     
     @classmethod
     def create(cls, 
