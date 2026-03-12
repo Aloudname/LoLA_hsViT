@@ -546,10 +546,25 @@ class hsTrainer(BaseEstimator):
         tprint("Creating model with:")
         try:
             if self.model is None:
-                raise RuntimeError("model constructor is None; please pass a callable when initializing hsTrainer")
-            if self.kwargs:
-                self.model = self.model(**self.kwargs)
-            self.model.to(self.device)  # optimize for convolutional models
+                raise RuntimeError("model is None; please pass a model constructor or nn.Module when initializing hsTrainer")
+
+            # self.model could be callable or nn.Module
+            if isinstance(self.model, nn.Module):
+                pass
+            elif callable(self.model):
+                self.model = self.model(**self.kwargs) if self.kwargs else self.model()
+                if not isinstance(self.model, nn.Module):
+                    raise TypeError(
+                        "model constructor must return torch.nn.Module, "
+                        f"got {type(self.model)}"
+                    )
+            else:
+                raise TypeError(
+                    "model must be either a callable constructor or torch.nn.Module, "
+                    f"got {type(self.model)}"
+                )
+
+            self.model.to(self.device)
             
             # stats for model parameter count
             total_params = sum(p.numel() for p in self.model.parameters())
@@ -616,6 +631,10 @@ class hsTrainer(BaseEstimator):
             raw_weights = 1.0 / (effective_num + 1e-8)
             raw_weights = raw_weights / raw_weights.mean()
             class_weights = torch.FloatTensor(raw_weights).to(self.device)
+            
+            # only for balance trials.
+            # class_weights = torch.tensor([4, 1], device=self.device)
+            
             imbalance = class_counts.max() / (class_counts.min() + 1)
             print(f"  Imbalance report: imbalance ratio {imbalance:.1f}x, {num_cls} classes")
             print(f"  Class weights: {dict(zip(self.config.clsf.targets, raw_weights))}")
@@ -1614,7 +1633,7 @@ class hsTrainer(BaseEstimator):
         if num_items <= 0:
             return
 
-        out_dir = os.path.join(self.output, 'outputs')
+        out_dir = os.path.join(self.output, 'reconstruction')
         os.makedirs(out_dir, exist_ok=True)
 
         fig, axes = plt.subplots(num_items, 2, figsize=(8, 3.5 * num_items))
@@ -1639,7 +1658,7 @@ class hsTrainer(BaseEstimator):
             axes[idx, 1].axis('off')
 
         plt.tight_layout()
-        save_path = os.path.join(out_dir, 'prediction_vs_label.png')
+        save_path = os.path.join(out_dir, 'cmp_pred_label.png')
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
         tprint(f"  Prediction-vs-label plot saved to {save_path}")
@@ -1776,7 +1795,7 @@ class hsTrainer(BaseEstimator):
             tprint("  Full reconstruction skipped: no reconstruction state available")
             return
 
-        out_dir = os.path.join(self.output, 'outputs', 'reconstruction')
+        out_dir = os.path.join(self.output, 'reconstruction')
         os.makedirs(out_dir, exist_ok=True)
 
         num_classes = int(self.config.clsf.num)
@@ -1813,15 +1832,20 @@ class hsTrainer(BaseEstimator):
             label_show[label_map == 255] = np.nan
 
             im0 = axes[0].imshow(pred_show, cmap=cmap, vmin=0, vmax=max(num_classes - 1, 0))
-            axes[0].set_title('Reconstructed Prediction')
+            axes[0].set_title('Prediction')
             axes[0].axis('off')
 
             axes[1].imshow(label_show, cmap=cmap, vmin=0, vmax=max(num_classes - 1, 0))
-            axes[1].set_title('Reconstructed Label')
+            axes[1].set_title('Label')
             axes[1].axis('off')
 
             axes[2].imshow(diff_map, cmap='coolwarm', vmin=-1, vmax=1)
-            axes[2].set_title('Mismatch Map (red=error, white=correct, blue=uncovered)')
+            axes[2].set_title('Mismatch Map')
+            axes[2].legend(handles=[
+                plt.Line2D([0], [0], marker='s', color='w', label='√', markerfacecolor='green', markersize=10),
+                plt.Line2D([0], [0], marker='s', color='w', label='x', markerfacecolor='red', markersize=10),
+                plt.Line2D([0], [0], marker='s', color='w', label='BG', markerfacecolor='blue', markersize=10)
+            ], loc='upper right')
             axes[2].axis('off')
 
             cbar = fig.colorbar(im0, ax=axes[:2], fraction=0.028, pad=0.02)
