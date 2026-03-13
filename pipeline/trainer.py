@@ -461,6 +461,19 @@ class hsTrainer(BaseEstimator):
             num_gpus=self.num_gpus,
             debug_mode=self.debug_mode)
         return self
+
+    @staticmethod
+    def _metric_labels_from_config(config: Munch, num_classes: int):
+        """Return class indices used for metrics (optionally exclude BG=0)."""
+        exclude_bg = bool(getattr(config.common, 'exclude_bg_in_metrics', True))
+        if exclude_bg and num_classes > 1:
+            labels = list(range(1, num_classes))
+        else:
+            labels = list(range(num_classes))
+        return labels if labels else [0]
+
+    def _metric_labels(self, num_classes: int):
+        return hsTrainer._metric_labels_from_config(self.config, num_classes)
     
     def _setup_device(self) -> None:
         """setup device and validate multi-GPU configuration"""
@@ -634,10 +647,7 @@ class hsTrainer(BaseEstimator):
             effective_num = 1.0 - np.power(beta, class_counts)
             raw_weights = 1.0 / (effective_num + 1e-8)
             raw_weights = raw_weights / raw_weights.mean()
-            # class_weights = torch.FloatTensor(raw_weights).to(self.device)
-            
-            # only for balance trials.
-            class_weights = torch.tensor([4, 1], device=self.device)
+            class_weights = torch.FloatTensor(raw_weights).to(self.device)
             
             imbalance = class_counts.max() / (class_counts.min() + 1)
             print(f"  Imbalance report: imbalance ratio {imbalance:.1f}x, {num_cls} classes")
@@ -812,6 +822,7 @@ class hsTrainer(BaseEstimator):
         self.model.eval()
         model_ref = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         num_classes = model_ref.num_classes
+        metric_labels = self._metric_labels(num_classes)
 
         total_loss = 0.0
 
@@ -910,20 +921,28 @@ class hsTrainer(BaseEstimator):
         # overall Accuracy
         oa = float(diag.sum()) / total * 100 if total > 0 else 0.0
 
-        # balanced Accuracy (mean per-class recall, ignoring absent classes)
-        valid_cls     = row_sums > 0
+        # balanced Accuracy: average recall over non-bg
+        valid_cls = row_sums > 0
+        eval_valid = np.zeros_like(valid_cls, dtype=bool)
+        eval_valid[np.array(metric_labels, dtype=np.int64)] = True
+        eval_valid = eval_valid & valid_cls
         per_cls_recall = np.where(valid_cls, diag / np.maximum(row_sums, 1), 0.0)
-        acc = float(per_cls_recall[valid_cls].mean()) * 100 if valid_cls.any() else 0.0
+        acc = float(per_cls_recall[eval_valid].mean()) * 100 if eval_valid.any() else 0.0
 
-        # Cohen's Kappa (analytical formula, no sklearn)
-        expected = row_sums.astype(np.float64) * col_sums.astype(np.float64) / max(total, 1)
-        p_o = float(diag.sum()) / max(total, 1)
-        p_e = float(expected.sum()) / max(total, 1)
+        # Cohen's Kappa on metric classes, bg excluded
+        cm_eval = cm_np[np.ix_(metric_labels, metric_labels)]
+        eval_row_sums = cm_eval.sum(axis=1)
+        eval_col_sums = cm_eval.sum(axis=0)
+        eval_diag = np.diag(cm_eval)
+        eval_total = int(cm_eval.sum())
+        expected = eval_row_sums.astype(np.float64) * eval_col_sums.astype(np.float64) / max(eval_total, 1)
+        p_o = float(eval_diag.sum()) / max(eval_total, 1)
+        p_e = float(expected.sum()) / max(eval_total, 1)
         kappa = ((p_o - p_e) / max(1.0 - p_e, 1e-8)) * 100
 
         # mIoU (tp / (tp + fp + fn) per class, from confusion matrix columns/rows)
         miou_vals = []
-        for c in range(num_classes):
+        for c in metric_labels:
             tp    = int(cm_np[c, c])
             fp    = int(col_sums[c]) - tp
             fn    = int(row_sums[c]) - tp
@@ -935,6 +954,7 @@ class hsTrainer(BaseEstimator):
         loss = total_loss / len(eval_loader)
         self._last_oa   = oa
         self._last_miou = miou
+        self._metric_labels_used = metric_labels
 
         # final-eval: full arrays for plots / ROC (single GPU -> CPU transfer)
         if collect_extra:
@@ -1158,6 +1178,9 @@ class hsTrainer(BaseEstimator):
             )
 
         num_classes = config.clsf.num
+        metric_labels = hsTrainer._metric_labels_from_config(config, num_classes)
+        eval_num_classes = len(metric_labels)
+        class_names = [config.clsf.targets[i] for i in metric_labels if i < len(config.clsf.targets)]
         common_fpr = np.linspace(0, 1, 200)
 
         fold_results = []
@@ -1169,13 +1192,13 @@ class hsTrainer(BaseEstimator):
         total_time = 0.0
 
         # Incremental accumulators for mean/std of confusion matrix, precision, recall, F1, ROC curves
-        sum_cm_norm = np.zeros((num_classes, num_classes), dtype=np.float64)
-        sum_cm_norm_sq = np.zeros((num_classes, num_classes), dtype=np.float64)
-        fold_precisions = []   # list of (num_classes,) arrays
+        sum_cm_norm = np.zeros((eval_num_classes, eval_num_classes), dtype=np.float64)
+        sum_cm_norm_sq = np.zeros((eval_num_classes, eval_num_classes), dtype=np.float64)
+        fold_precisions = []   # list of (eval_num_classes,) arrays
         fold_recalls = []
         fold_f1s = []
-        roc_tprs = [[] for _ in range(num_classes)]  # interpolated TPR per class
-        roc_aucs = [[] for _ in range(num_classes)]
+        roc_tprs = [[] for _ in range(eval_num_classes)]  # interpolated TPR per class
+        roc_aucs = [[] for _ in range(eval_num_classes)]
 
         for fold_idx, (f_train_loader, f_test_loader) in enumerate(fold_loaders):
             print("\n")
@@ -1234,13 +1257,13 @@ class hsTrainer(BaseEstimator):
             pred = trainer._final_pred
             target = trainer._final_target
 
-            cm = _cm(target, pred, labels=range(num_classes))
+            cm = _cm(target, pred, labels=metric_labels)
             cm_norm = cm.astype(np.float64) / (cm.sum(axis=1, keepdims=True) + 1e-8)
             sum_cm_norm += cm_norm
             sum_cm_norm_sq += cm_norm ** 2
 
             p, r, f1, _ = precision_recall_fscore_support(
-                target, pred, labels=range(num_classes), zero_division=0)
+                target, pred, labels=metric_labels, zero_division=0)
             fold_precisions.append(p)
             fold_recalls.append(r)
             fold_f1s.append(f1)
@@ -1248,13 +1271,13 @@ class hsTrainer(BaseEstimator):
             # release output label memory
             if hasattr(trainer, '_last_probas') and trainer._last_probas is not None:
                 probas = trainer._last_probas
-                for cls_i in range(num_classes):
+                for local_idx, cls_i in enumerate(metric_labels):
                     y_bin = (target == cls_i).astype(int)
                     if y_bin.sum() > 0:
                         fpr_arr, tpr_arr, _ = roc_curve(y_bin, probas[:, cls_i])
-                        roc_tprs[cls_i].append(
+                        roc_tprs[local_idx].append(
                             np.interp(common_fpr, fpr_arr, tpr_arr))
-                        roc_aucs[cls_i].append(auc(fpr_arr, tpr_arr))
+                        roc_aucs[local_idx].append(auc(fpr_arr, tpr_arr))
                 del probas
 
             del pred, target
@@ -1325,7 +1348,6 @@ class hsTrainer(BaseEstimator):
         tprint(f"  Cross validation summary saved to {summary_path}")
 
         # generate all plots in parallel, fast
-        class_names = list(config.clsf.targets[:num_classes])
         mious_arr = np.array(all_mious) if all_mious else None
 
         # Derive mean/std confusion matrix from running sums
@@ -1339,14 +1361,14 @@ class hsTrainer(BaseEstimator):
             (hsTrainer._plot_training_curves,
              (fold_curves, model_name, cv_output)),
             (hsTrainer._plot_confusion_matrix,
-             (mean_cm, std_cm, num_classes, class_names,
+                         (mean_cm, std_cm, eval_num_classes, class_names,
               model_name, cv_output)),
             (hsTrainer._plot_per_class_metrics,
              (fold_precisions, fold_recalls, fold_f1s,
-              num_classes, class_names, model_name, cv_output)),
+                            eval_num_classes, class_names, model_name, cv_output)),
             (hsTrainer._plot_roc_curves,
              (roc_tprs, roc_aucs, common_fpr,
-              num_classes, class_names, model_name, cv_output)),
+                            eval_num_classes, class_names, model_name, cv_output)),
             (hsTrainer._plot_grad_norms,
              (fold_curves, model_name, cv_output)),
         ]
@@ -1901,7 +1923,9 @@ class hsTrainer(BaseEstimator):
         ~10 min to ~seconds.
         """
         num_classes = self.config.clsf.num
-        class_names = list(self.config.clsf.targets[:num_classes])
+        metric_labels = self._metric_labels(num_classes)
+        eval_num_classes = len(metric_labels)
+        class_names = [self.config.clsf.targets[i] for i in metric_labels if i < len(self.config.clsf.targets)]
         probas = getattr(self, '_last_probas', None)
 
         # pre-compute heavy metrics in main process (avoids pickle of huge arrays)
@@ -1909,16 +1933,16 @@ class hsTrainer(BaseEstimator):
         t_pre = time.perf_counter()
 
         # confusion matrix — cm: shape (num_classes, num_classes) int
-        cm = _cm(final_target, final_pred, labels=range(num_classes))
+        cm = _cm(final_target, final_pred, labels=metric_labels)
         cm_norm = cm.astype('float') / (cm.sum(axis=1, keepdims=True) + 1e-8)
 
         # per-class precision, recall, f1 — each shape (num_classes,)
         precision, recall, f1, _ = precision_recall_fscore_support(
-            final_target, final_pred, labels=range(num_classes), zero_division=0)
+            final_target, final_pred, labels=metric_labels, zero_division=0)
 
         # format metrics text for saving
         report_lines = []
-        for i in range(num_classes):
+        for i in range(eval_num_classes):
             name = class_names[i] if i < len(class_names) else f'Class_{i}'
             report_lines.append(
                 f"{name}: P={precision[i]:.4f}, R={recall[i]:.4f}, F1={f1[i]:.4f}")
@@ -1934,7 +1958,7 @@ class hsTrainer(BaseEstimator):
         probas_targets = getattr(self, '_last_probas_targets', None)
         if probas is not None and probas_targets is not None:
             roc_data = []
-            for cls_i in range(num_classes):
+            for cls_i in metric_labels:
                 y_bin = (probas_targets == cls_i).astype(np.uint8)  # (n_sampled,)
                 if y_bin.sum() == 0:
                     roc_data.append(None)   # absent class — worker will skip
@@ -1967,10 +1991,10 @@ class hsTrainer(BaseEstimator):
              (cm, cm_norm, metrics_text,
               class_names, self.model_name, self.output)),
             (_worker_plot_per_class_metrics,
-             (precision, recall, f1, num_classes, class_names,
+                         (precision, recall, f1, eval_num_classes, class_names,
               self.model_name, self.output)),
             (_worker_plot_roc_curves,
-             (roc_data, num_classes, class_names,
+                         (roc_data, eval_num_classes, class_names,
               self.model_name, self.output)),
             (_worker_plot_grad_norm,
              (list(self.grad_norms), self.model_name, self.output)),

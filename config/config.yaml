@@ -44,9 +44,9 @@ path:
   data: /data/chenhaoran/processed_npy_64_norm
   label: /data/chenhaoran/processed_npy_64_norm
   output: /home/chenhaoran/LoLA_hsViT/output
+# hereby only declares front targets, except BG.
 clsf:
   num: 2
-# add BG
   targets:
     - 'PG'   # ⭐Parathyroid gland
     # - 'FAT'

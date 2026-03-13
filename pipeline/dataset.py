@@ -17,6 +17,23 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources.*")
 
 
+def _ensure_background_class(config: Munch) -> None:
+    """Ensure config uses an explicit background class at index 0.
+
+    Existing label maps in this project use 0 for background. To train/evaluate
+    segmentation with background included, we reserve class-0 for BG and shift
+    foreground class count to ``len(targets) + 1`` when BG is not explicitly set.
+    """
+    targets = list(getattr(config.clsf, 'targets', []))
+    if targets and str(targets[0]).strip().upper() == 'BG':
+        config.clsf.targets = targets
+        config.clsf.num = len(targets)
+        return
+
+    config.clsf.targets = ['BG'] + targets
+    config.clsf.num = len(config.clsf.targets)
+
+
 class HSPreprocessor(BaseEstimator, TransformerMixin):
     """
     Sklearn-compatible preprocessor for hyperspectral data.
@@ -170,6 +187,7 @@ class AbstractHSDataset(ABC, Dataset):
            **kwargs: Additional format-specific parameters.
         """
 
+        _ensure_background_class(config)
         self.config = config  # store for get_dataset_info() etc.
         self.data_path = config.path.data
         self.label_path = config.path.label
@@ -279,8 +297,8 @@ class AbstractHSDataset(ABC, Dataset):
         """
         Extract spatial patches from preprocessed data.
         
-        Patches are extracted with zero-padding at image boundaries. Only patches
-        with non-zero labels are included (background/zero labels are excluded).
+        Patches are extracted with zero-padding at image boundaries.
+        All center pixels are included, including background label 0.
         
         OPTIMIZATION: Padding is done once and cached to avoid re-padding for each sample.
         OPTIMIZATION: Vectorized with np.where instead of nested Python for-loop.
@@ -288,16 +306,18 @@ class AbstractHSDataset(ABC, Dataset):
         # Add zero padding around the image (ONCE at initialization)
         self.padded_data = self._pad_with_zeros(self.processed_data, self.margin)
         
-        # Vectorized: find all non-background pixel positions at once
-        rows, cols = np.where(self.raw_labels > 0)
+        # Vectorized: include all center pixels (background included)
+        rows, cols = np.indices(self.raw_labels.shape)
+        rows = rows.reshape(-1)
+        cols = cols.reshape(-1)
         
         # Convert to padded coordinates (offset by margin)
         self.patch_indices = np.stack(
             [rows + self.margin, cols + self.margin], axis=1
         ).astype(np.int32)
         
-        # Convert labels to 0-based index
-        self.patch_labels = (self.raw_labels[rows, cols] - 1).astype(np.int32)
+        # Labels are kept as-is: 0=background, 1..K=foreground classes.
+        self.patch_labels = self.raw_labels[rows, cols].astype(np.int32)
         tprint(f"Created {len(self.patch_indices)} indices for patch.")
         print(f"Cached padded data shape: {self.padded_data.shape} (padding happens once at init)")
 
@@ -307,10 +327,8 @@ class AbstractHSDataset(ABC, Dataset):
              self.raw_labels.shape[1] + 2 * self.margin),
             fill_value=255, dtype=np.int32
         )
-        # Convert to 0-based class indices; background (label==0) -> ignore (255)
+        # Keep background as a valid class; only padding remains ignore_index=255.
         label_region = self.raw_labels.copy().astype(np.int32)
-        label_region[label_region > 0] -= 1
-        label_region[self.raw_labels == 0] = 255
         self.padded_labels[self.margin:self.margin + self.raw_labels.shape[0],
                            self.margin:self.margin + self.raw_labels.shape[1]] = label_region
         tprint(f"Created padded label map: {self.padded_labels.shape}")
@@ -440,6 +458,7 @@ class NpyHSDataset(AbstractHSDataset):
         """
         Dataset.__init__(self)
 
+        _ensure_background_class(config)
         self.config = config
         self.data_path = config.path.data
         self.label_path = config.path.label
@@ -628,15 +647,13 @@ class NpyHSDataset(AbstractHSDataset):
             padded_data = self._pad_with_zeros(processed, self.margin)
             # padded shape: (h_i + 2*margin, w_i + 2*margin, c_out)
 
-            # pad labels: bg / padding -> 255 (ignore_index)
+            # pad labels: keep bg=0 as a valid class; only padding is 255
             # lbl shape: (h_i + 2*margin, w_i + 2*margin)
             padded_lbl = np.full(
                 (h + 2 * self.margin, w + 2 * self.margin),
                 fill_value=255, dtype=np.int32
                 )       
             lbl_region = labels.copy().astype(np.int32)
-            lbl_region[lbl_region > 0] -= 1    # 1-based -> 0-based class index
-            lbl_region[labels == 0] = 255      # background -> ignore
             padded_lbl[self.margin:self.margin + h,
                        self.margin:self.margin + w] = lbl_region
 
@@ -662,8 +679,10 @@ class NpyHSDataset(AbstractHSDataset):
             boundary_map[:, 0] = False
             boundary_map[:, -1] = False
 
-            # extract patch centers: only non-background pixels
-            rows, cols = np.where(labels > 0)
+            # extract patch centers: include background pixels
+            rows, cols = np.indices(labels.shape)
+            rows = rows.reshape(-1)
+            cols = cols.reshape(-1)
             n_patches = len(rows)
 
             if self.max_patches_per_patient is not None and n_patches > self.max_patches_per_patient:
@@ -681,7 +700,7 @@ class NpyHSDataset(AbstractHSDataset):
                 (cols + self.margin).astype(np.int32),
             ], axis=1)   # shape: (n_patches, 3)
 
-            patch_labels = (labels[rows, cols] - 1).astype(np.int32)   # shape: (n_patches,)
+            patch_labels = labels[rows, cols].astype(np.int32)   # shape: (n_patches,)
             patient_groups = np.full(n_patches, pid_idx, dtype=np.int32)
             boundary_flags = boundary_map[rows, cols].astype(np.bool_)
 
