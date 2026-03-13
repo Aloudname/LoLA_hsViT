@@ -200,3 +200,11 @@ python run.py -a
   - 合并`ablation.py`和`run.py`的训练逻辑。用户接口统一划入`run.py`。
 - 应当继续做类别平衡调整。
 
+
+### 3.13
+
+- 加入了Nvidia MONAI推理前端：
+https://github.com/Aloudname/StreamCat.git
+详见`StreamCat/README.md`。提供流式的视频帧/单/批次hsi数据输入、本地(`localhost:8000`)部署、快速http响应。
+启动效果：
+![frontend](src/frontend.png)
