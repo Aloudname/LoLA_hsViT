@@ -13,11 +13,13 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-import cv2, gc, json, os, re, time, torch, traceback, warnings, copy, matplotlib
+import cv2, gc, json, os, re, time, \
+        torch, traceback, warnings, copy, matplotlib
 
 from tqdm import tqdm
 from munch import Munch
 from torch.nn import Module
+from datetime import datetime
 from typing import Tuple, Callable, Dict
 from concurrent.futures import as_completed
 from pipeline.dataset import AbstractHSDataset
@@ -339,7 +341,9 @@ class hsTrainer(BaseEstimator):
         self.model_name = model_name
         self.debug_mode = debug_mode
         self.num_gpus = num_gpus
-        self.output = self.config.path.output + f'/{self.model_name}'
+        self.output = self.config.path.output + \
+                        f'/{self.model_name}' + \
+                        f'{datetime.now().strftime("%m-%d-%Y_%H-%M-%S")}'
         self.kwargs = kwargs
         
         os.makedirs(self.output, exist_ok=True)
@@ -630,14 +634,14 @@ class hsTrainer(BaseEstimator):
             effective_num = 1.0 - np.power(beta, class_counts)
             raw_weights = 1.0 / (effective_num + 1e-8)
             raw_weights = raw_weights / raw_weights.mean()
-            class_weights = torch.FloatTensor(raw_weights).to(self.device)
+            # class_weights = torch.FloatTensor(raw_weights).to(self.device)
             
             # only for balance trials.
-            # class_weights = torch.tensor([4, 1], device=self.device)
+            class_weights = torch.tensor([4, 1], device=self.device)
             
             imbalance = class_counts.max() / (class_counts.min() + 1)
             print(f"  Imbalance report: imbalance ratio {imbalance:.1f}x, {num_cls} classes")
-            print(f"  Class weights: {dict(zip(self.config.clsf.targets, raw_weights))}")
+            print(f"  Class weights: {dict(zip(self.config.clsf.targets, class_weights.cpu().numpy()))}")
         except Exception as e:
             print(f"  Warning: uniform class weights ({e})")
         
@@ -1842,7 +1846,7 @@ class hsTrainer(BaseEstimator):
             axes[2].imshow(diff_map, cmap='coolwarm', vmin=-1, vmax=1)
             axes[2].set_title('Mismatch Map')
             axes[2].legend(handles=[
-                plt.Line2D([0], [0], marker='s', color='w', label='√', markerfacecolor='green', markersize=10),
+                plt.Line2D([0], [0], marker='s', color='w', label='√', markerfacecolor='grey', markersize=10),
                 plt.Line2D([0], [0], marker='s', color='w', label='x', markerfacecolor='red', markersize=10),
                 plt.Line2D([0], [0], marker='s', color='w', label='BG', markerfacecolor='blue', markersize=10)
             ], loc='upper right')

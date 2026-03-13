@@ -46,6 +46,7 @@ path:
   output: /home/chenhaoran/LoLA_hsViT/output
 clsf:
   num: 2
+# add BG
   targets:
     - 'PG'   # ⭐Parathyroid gland
     # - 'FAT'
