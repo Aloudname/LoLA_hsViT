@@ -246,24 +246,24 @@ $$
 
 定义：**在模型最后一层未激活的原始输出**为**logits**，logits反映了各类别的未归一化得分。
 
-对真实类别为 \(y\) 的单个像素，设模型输出的 logits 为 \(\mathbf{z} \in \mathbb{R}^{C}\)。
+对真实类别为 $y$ 的单个像素，设模型输出的 logits 为 $\mathbf{z} \in \mathbb{R}^{C}$。
 
 对于整个批次，原始形状为 `(B, C, H, W)`，在损失计算前会被展平为 `(N*H*W, C)`，然后对每个像素独立计算。
 
 首先通过 softmax 将 logits 转换为概率$p_{c}$：
 
-\[
+$$
 p_c = \frac{\exp(z_c)}{\sum_{j=1}^C \exp(z_j)},\quad c=1,\dots,C
-\]
+$$
 
 定义真实类别上的概率为 $p_t$，得$p_t = p_y$。
 
 对于容易区分的样本，需降低其权重，对难分类别样本分配更多注意力。
 因此，Focal Loss 引入调制因子 $(1-p_t)^\gamma$ 来降低易分样本的权重：
 
-\[
+$$
 \mathcal{L}_{\text{FL}} = - (1-p_t)^\gamma \log(p_t)
-\]
+$$
 
 接下来对于有无标签平滑的两种情况，分别讨论。
 
@@ -271,33 +271,34 @@ p_c = \frac{\exp(z_c)}{\sum_{j=1}^C \exp(z_j)},\quad c=1,\dots,C
 
 此时损失为：
 
-\[
+$$
 \mathcal{L}_{\text{FL}} = - (1 - p_t)^\gamma \log(p_t)
-\]
+$$
 
-若有类别权重 \(w_y\)，则乘以该权重：
+若有类别权重 $w_y$，则乘以该权重：
 
-\[
+$$
 \mathcal{L}_{\text{FL}} = - w_y \cdot (1 - p_t)^\gamma \log(p_t)
-\]
+$$
 
 **(2) 带标签平滑**
 
-设平滑因子为 \(\varepsilon\)，平滑后的目标分布为：
+设平滑因子为 $\varepsilon$，平滑后的目标分布为：
 
-\[
+$$
 q_c = (1 - \varepsilon) \cdot \mathbf{1}_{c=y} + \frac{\varepsilon}{C}
-\]
+$$
 
 此时损失为：
-\[
+$$
 \mathcal{L}_{\text{FL}}^{\text{smooth}} = - (1 - p_t)^\gamma \sum_{c=1}^C q_c \log(p_c)
-\]
+$$
 
 若有权重 \(w_y\)，则乘以 \(w_y\)：
-\[
+
+$$
 \mathcal{L}_{\text{FL}}^{\text{smooth}} = - w_y \cdot (1 - p_t)^\gamma \sum_{c=1}^C q_c \log(p_c)
-\]
+$$
 
 ---
 
@@ -316,16 +317,19 @@ q_c = (1 - \varepsilon) \cdot \mathbf{1}_{c=y} + \frac{\varepsilon}{C}
 **(1) 前景子类损失**
 
 构造前景子类标签 $y_{\text{fg}}$：
-\[
+
+$$
 y_{\text{fg}} = \begin{cases}
 y - 1, & \text{if } y > 0 \\
 \text{ignore}, & \text{otherwise}
 \end{cases}
-\]
+$$
+
 前景子类损失直接使用标准 `FocalLoss`（公式 `1.1` 或 `1.2`，带类别权重和标签平滑）：
-\[
+
+$$
 \mathcal{L}_{\text{fg}} = \text{FocalLoss}(\mathbf{z}_{\text{fg}},\; y_{\text{fg}})
-\]
+$$
 
 **(2) 二分类损失**
 
@@ -334,37 +338,37 @@ y - 1, & \text{if } y > 0 \\
 
 由此，构造二分类阶段的真实标签 $y_{\text{bin}} \in \{0,1\}$：
 
-\[
+$$
 y_{\text{bin}} = \begin{cases}
 1, & \text{if } y > 0 \\
 0, & \text{if } y = 0 \\
 \text{ignore}, & \text{if } y = \text{ignore}
 \end{cases}
-\]
+$$
 
 二分类损失使用 `Binary Focal Loss`：
 
-\[
+$$
 \mathcal{L}_{\text{bin}} = \text{FocalLoss}_{\text{bin}}(\mathbf{z}_{\text{bg}},\; y_{\text{bin}})
-\]
+$$
 
 **(3) 总损失**
 
 最终总损失为两者的加权和：
 
-\[
+$$
 \mathcal{L}_{\text{total}} = w_{\text{fg}} \cdot \mathcal{L}_{\text{fg}} + w_{\text{bgfg}} \cdot \mathcal{L}_{\text{bin}}
-\]
+$$
 
 其中 $w_{\text{fg}}$ 和 $w_{\text{bgfg}}$ 是人为指定的权重。
 
-另外，所有损失计算前，可以通过掩码 $\mathcal{V}$ 剔除标签为 `ignore` 的像素（不参与梯度计算）。数学上可表示为仅对有效像素集合 \(\mathcal{V}\) 求和/平均：
+另外，所有损失计算前，可以通过掩码 $\mathcal{V}$ 剔除标签为 `ignore` 的像素（不参与梯度计算）。数学上可表示为仅对有效像素集合 $\mathcal{V}$ 求和/平均：
 
-\[
+$$
 \mathcal{L} = \frac{1}{|\mathcal{V}|} \sum_{i \in \mathcal{V}} \ell_i
-\]
+$$
 
-其中 \(\ell_i\) 为第 $i$ 个像素的损失值。
+其中 $\ell_i$ 为第 $i$ 个像素的损失值。
 推导完毕。
 
 ---
