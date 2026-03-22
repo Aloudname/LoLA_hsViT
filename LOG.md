@@ -376,4 +376,4 @@ $$
 
 ### 3.23
 
-- 稍微修改程序，追加对两个子损失 $\mathcal{L}_{\text{bin}}$ 和 $\mathcal{L}_{\text{cls}}$ 的记录和损失曲线可视化。
+- 稍微修改程序，追加对两个子损失 $\mathcal{L}_{\text{bin}}$ 和 $\mathcal{L}_{\text{cls}}$ 的记录以及损失曲线的可视化。
