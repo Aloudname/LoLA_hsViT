@@ -306,7 +306,7 @@ $$
 根据上述推导，可组合得出 $\mathcal{L}_{\text{total}}$，即`HierarchicalSegLoss`损失函数的表达式。
 
 将分割任务分解为**背景/前景二分类**和**前景子类多分类**两部分。
-设总类别数为 $C_{\text{total}}$，其中 $0$ 为背景，$1,\dots,C_{\text{total}}-1$ 为前景子类。
+设总类别数为 $C_{\text{total}}$，其中 $0$ 为背景， $\{1,\dots,C_{\text{total}}-1\}$ 为前景子类。
 原始目标标签 $y \in \{0,\dots,C_{\text{total}}-1\}$，忽略索引记为 $\text{ignore}$。
 
 模型输出有两个分支：
