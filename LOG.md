@@ -250,13 +250,13 @@ $$
 
 对于整个批次，原始形状为 `(B, C, H, W)`，在损失计算前会被展平为 `(N*H*W, C)`，然后对每个像素独立计算。
 
-首先通过 softmax 将 logits 转换为概率$p_{c}$：
+首先通过 softmax 将 logits 转换为概率 $p_c$：
 
 $$
 p_c = \frac{\exp(z_c)}{\sum_{j=1}^C \exp(z_j)},\quad c=1,\dots,C
 $$
 
-定义真实类别上的概率为 $p_t$，得$p_t = p_y$。
+定义真实类别上的概率为 $p_t$，得 $p_t = p_y$。
 
 对于容易区分的样本，需降低其权重，对难分类别样本分配更多注意力。
 因此，Focal Loss 引入调制因子 $(1-p_t)^\gamma$ 来降低易分样本的权重：
@@ -295,7 +295,7 @@ $$
 \mathcal{L}_{\text{FL}}^{\text{smooth}} = - (1 - p_t)^\gamma \sum_{c=1}^C q_c \log(p_c)
 $$
 
-若有权重 \(w_y\)，则乘以 \(w_y\)：
+若有权重 $w_y$，则乘以 $w_y$：
 
 $$
 \mathcal{L}_{\text{FL}}^{\text{smooth}} = - w_y \cdot (1 - p_t)^\gamma \sum_{c=1}^C q_c \log(p_c)
@@ -303,7 +303,7 @@ $$
 
 ---
 
-根据上述推导，可组合得出$\mathcal{L}_{\text{total}}$，即`HierarchicalSegLoss`损失函数的表达式。
+根据上述推导，可组合得出 $\mathcal{L}_{\text{total}}$，即`HierarchicalSegLoss`损失函数的表达式。
 
 将分割任务分解为**背景/前景二分类**和**前景子类多分类**两部分。
 设总类别数为 $C_{\text{total}}$，其中 $0$ 为背景，$1,\dots,C_{\text{total}}-1$ 为前景子类。
