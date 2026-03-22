@@ -33,6 +33,38 @@ def check_form(config: Munch = None) -> bool:
         raise ValueError(f"clsf.num must match length of targets, got {config.clsf.num} and {len(config.clsf.targets)}")
     if config.clsf.num < 2:
         raise ValueError(f"clsf.num must be >= 2, got {config.clsf.num}")
+
+    # Dataset-stage validation for remap and preprocessor-fit settings
+    unknown_policy = str(getattr(config.clsf, 'unknown_label_policy', 'error')).lower()
+    if unknown_policy not in ['error', 'map_to_bg']:
+        raise ValueError(
+            f"clsf.unknown_label_policy must be 'error' or 'map_to_bg', got {unknown_policy}"
+        )
+
+    if hasattr(config.preprocess, 'bg_sample_ratio'):
+        bg_ratio = float(config.preprocess.bg_sample_ratio)
+        if bg_ratio < 0:
+            raise ValueError(f"preprocess.bg_sample_ratio must be >= 0, got {bg_ratio}")
+
+    if hasattr(config.split, 'boundary_pair'):
+        pair = config.split.boundary_pair
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise ValueError(
+                f"split.boundary_pair must be a list/tuple of 2 class names, got {pair}"
+            )
+
+    if hasattr(config.common, 'early_stop_metric'):
+        metric = str(config.common.early_stop_metric).lower()
+        if metric not in ['composite', 'fg', 'all']:
+            raise ValueError(
+                f"common.early_stop_metric must be one of composite/fg/all, got {metric}"
+            )
+
+    if hasattr(config.common, 'metric_weight_fg') and hasattr(config.common, 'metric_weight_all'):
+        w_fg = float(config.common.metric_weight_fg)
+        w_all = float(config.common.metric_weight_all)
+        if w_fg < 0 or w_all < 0:
+            raise ValueError("common.metric_weight_fg and metric_weight_all must be >= 0")
     return True
     # Add more checks as needed
 

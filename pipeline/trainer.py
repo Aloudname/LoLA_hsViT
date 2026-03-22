@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+import csv
 import cv2, gc, json, os, re, time, \
         torch, traceback, warnings, copy, matplotlib
 
@@ -20,7 +21,8 @@ from tqdm import tqdm
 from munch import Munch
 from torch.nn import Module
 from datetime import datetime
-from typing import Tuple, Callable, Dict
+from typing import Tuple, Callable, Dict, Any, Iterable
+from contextlib import contextmanager
 from concurrent.futures import as_completed
 from pipeline.dataset import AbstractHSDataset
 from torch.cuda.amp import GradScaler, autocast
@@ -39,6 +41,7 @@ class FocalLoss(nn.Module):
     ```
     FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
     ```
+    
     Down-weights well-classified samples so training focuses on hard / rare ones.
     Supports segmentation outputs (N, C, H, W) with ignore_index masking.
     Optional label smoothing to prevent overconfident predictions.
@@ -96,8 +99,93 @@ class FocalLoss(nn.Module):
         return loss.mean() if self.reduction == 'mean' else loss.sum()
 
 
-def _worker_plot_training_curves(train_losses, eval_losses, train_accs,
-                                 eval_accs, eval_interval, debug_mode,
+class HierarchicalSegLoss(nn.Module):
+    """
+    Hierarchical segmentation loss: BG/FG + foreground subclass loss.
+    Expects model outputs with two-stage heads:
+    
+    - fg_bg_logits: binary logits for foreground/background separation.
+    - fg_class_logits: multi-class logits for foreground subclass classification.
+    
+    Computes:
+        total_loss = w_fg_loss * fg_class_loss + w_bgfg_loss * fg_bg_loss
+    
+    This encourages to first learn a coarse FG/BG distinction,
+    then focus on fine-grained classification within the foreground.
+    """
+
+    def __init__(self,
+                 num_classes: int,
+                 class_weight=None,
+                 fg_weight: float = 1.0,
+                 bgfg_weight: float = 0.5,
+                 gamma: float = 2.0,
+                 ignore_index: int = 255,
+                 label_smoothing: float = 0.0):
+        
+        super().__init__()
+        self.num_classes = int(num_classes)
+        self.fg_weight = float(fg_weight)
+        self.bgfg_weight = float(bgfg_weight)
+        self.ignore_index = int(ignore_index)
+
+        self.multi_cls_loss = FocalLoss(
+            weight=class_weight,
+            gamma=gamma,
+            ignore_index=ignore_index,
+            reduction='mean',
+            label_smoothing=label_smoothing,
+        )
+        self.binary_loss = FocalLoss(
+            weight=None,
+            gamma=gamma,
+            ignore_index=ignore_index,
+            reduction='mean',
+            label_smoothing=0.0,
+        )
+
+    def decompose(self, outputs, targets: torch.Tensor):
+        if not isinstance(outputs, (dict, tuple, list)):
+            raise TypeError("HierarchicalSegLoss expects model outputs with two-stage heads")
+
+        if isinstance(outputs, dict):
+            fg_bg_logits = outputs.get('fg_bg_logits')
+            fg_class_logits = outputs.get('fg_class_logits')
+        else:
+            if len(outputs) < 3:
+                raise ValueError("HierarchicalSegLoss expects (fused_logits, fg_bg_logits, fg_class_logits)")
+            fg_bg_logits = outputs[1]
+            fg_class_logits = outputs[2]
+
+        if fg_bg_logits is None or fg_class_logits is None:
+            raise ValueError("Missing fg_bg_logits/fg_class_logits for direct two-stage supervision")
+
+        # Foreground subclass loss on classes [1..C-1] with direct fg_class_logits.
+        fg_targets = targets.clone()
+        valid_fg = (fg_targets != self.ignore_index) & (fg_targets > 0)
+        fg_targets[valid_fg] = fg_targets[valid_fg] - 1
+        fg_targets[(fg_targets == 0) & (~valid_fg)] = self.ignore_index
+        fg_loss = self.multi_cls_loss(fg_class_logits, fg_targets)
+
+        # Binary BG/FG loss with direct fg_bg_logits.
+        bin_targets = targets.clone()
+        valid = (bin_targets != self.ignore_index)
+        bin_targets[valid] = (bin_targets[valid] > 0).long()
+        bin_loss = self.binary_loss(fg_bg_logits, bin_targets)
+
+        total = self.fg_weight * fg_loss + self.bgfg_weight * bin_loss
+        return total, bin_loss, fg_loss
+
+    def forward(self, outputs, targets: torch.Tensor) -> torch.Tensor:
+        total, _, _ = self.decompose(outputs, targets)
+        return total
+
+
+def _worker_plot_training_curves(train_losses, eval_losses,
+                                 train_bgfg_losses, train_fg_class_losses,
+                                 eval_bgfg_losses, eval_fg_class_losses,
+                                 train_accs, eval_accs,
+                                 eval_interval, debug_mode,
                                  best_acc, model_name, output):
     """Worker: training loss/accuracy curves."""
     matplotlib.use('Agg')
@@ -111,11 +199,18 @@ def _worker_plot_training_curves(train_losses, eval_losses, train_accs,
             eval_epochs.append(e)
     eval_epochs = eval_epochs[:len(eval_losses)]
 
-    axes[0].plot(train_losses, label='Train Loss', marker='o', markersize=4)
-    if eval_losses:
-        axes[0].plot(eval_epochs, eval_losses, label='Test Loss', marker='s', markersize=4)
+    axes[0].plot(train_bgfg_losses, '--', color='#1f77b4', linewidth=1.8,
+                 label='Train bgfg_loss')
+    axes[0].plot(train_fg_class_losses, '--', color='#ff7f0e', linewidth=1.8,
+                 label='Train fg_class_loss')
+    if eval_bgfg_losses:
+        axes[0].plot(eval_epochs, eval_bgfg_losses, '--', color='#2ca02c', linewidth=1.8,
+                     label='Eval bgfg_loss')
+    if eval_fg_class_losses:
+        axes[0].plot(eval_epochs, eval_fg_class_losses, '--', color='#d62728', linewidth=1.8,
+                     label='Eval fg_class_loss')
     axes[0].set_xlabel('Epoch'); axes[0].set_ylabel('Loss')
-    axes[0].set_title('Training Loss Curve'); axes[0].legend(); axes[0].grid(True, alpha=0.3)
+    axes[0].set_title('Training Sub-loss Curves'); axes[0].legend(); axes[0].grid(True, alpha=0.3)
 
     axes[1].plot(train_accs, label='Train Acc', marker='o', markersize=4)
     if eval_accs:
@@ -307,6 +402,50 @@ class ModelEMA:
             b_m.data   = b_s.data
             b_s.data   = tmp
 
+
+class _CudaBatchPrefetcher:
+    """Prefetch DataLoader batches to device on a dedicated CUDA stream."""
+
+    def __init__(self, loader, device: torch.device):
+        self.loader = loader
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device)
+        self.iter_loader = iter(loader)
+        self.next_batch = None
+        self._preload()
+
+    def _to_device(self, obj: Any):
+        if torch.is_tensor(obj):
+            return obj.to(self.device, non_blocking=True)
+        if isinstance(obj, (tuple, list)):
+            moved = [self._to_device(x) for x in obj]
+            return type(obj)(moved)
+        if isinstance(obj, dict):
+            return {k: self._to_device(v) for k, v in obj.items()}
+        return obj
+
+    def _preload(self):
+        try:
+            batch = next(self.iter_loader)
+        except StopIteration:
+            self.next_batch = None
+            return
+
+        with torch.cuda.stream(self.stream):
+            self.next_batch = self._to_device(batch)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.next_batch is None:
+            raise StopIteration
+
+        torch.cuda.current_stream(self.device).wait_stream(self.stream)
+        batch = self.next_batch
+        self._preload()
+        return batch
+
 class hsTrainer(BaseEstimator):
     """
     Sklearn-compatible trainer for hyperspectral classification.
@@ -371,6 +510,11 @@ class hsTrainer(BaseEstimator):
         self.train_accs = []
         self.eval_accs = []
         self.eval_losses = []
+        self.train_bgfg_losses = []
+        self.train_fg_class_losses = []
+        self.eval_bgfg_losses = []
+        self.eval_fg_class_losses = []
+        self.epoch_metrics = []
         self.best_acc = 0.0
         self.best_epoch = 0
         self.best_model_state = None
@@ -474,6 +618,70 @@ class hsTrainer(BaseEstimator):
 
     def _metric_labels(self, num_classes: int):
         return hsTrainer._metric_labels_from_config(self.config, num_classes)
+
+    @staticmethod
+    def _metrics_from_confusion(cm_np: np.ndarray, labels: list) -> Tuple[float, float, float]:
+        """Compute BA/Kappa/mIoU from confusion matrix over selected labels."""
+        row_sums = cm_np.sum(axis=1)
+        col_sums = cm_np.sum(axis=0)
+        diag = np.diag(cm_np)
+
+        valid_cls = row_sums > 0
+        eval_valid = np.zeros_like(valid_cls, dtype=bool)
+        eval_valid[np.array(labels, dtype=np.int64)] = True
+        eval_valid = eval_valid & valid_cls
+
+        per_cls_recall = np.where(valid_cls, diag / np.maximum(row_sums, 1), 0.0)
+        ba = float(per_cls_recall[eval_valid].mean()) * 100 if eval_valid.any() else 0.0
+
+        cm_eval = cm_np[np.ix_(labels, labels)]
+        eval_row = cm_eval.sum(axis=1)
+        eval_col = cm_eval.sum(axis=0)
+        eval_diag = np.diag(cm_eval)
+        eval_total = int(cm_eval.sum())
+        expected = eval_row.astype(np.float64) * eval_col.astype(np.float64) / max(eval_total, 1)
+        p_o = float(eval_diag.sum()) / max(eval_total, 1)
+        p_e = float(expected.sum()) / max(eval_total, 1)
+        kappa = ((p_o - p_e) / max(1.0 - p_e, 1e-8)) * 100
+
+        miou_vals = []
+        for c in labels:
+            tp = int(cm_np[c, c])
+            fp = int(col_sums[c]) - tp
+            fn = int(row_sums[c]) - tp
+            denom = tp + fp + fn
+            if denom > 0:
+                miou_vals.append(tp / denom)
+        miou = float(np.mean(miou_vals)) * 100 if miou_vals else 0.0
+        return ba, kappa, miou
+
+    def _select_early_stop_score(self) -> float:
+        """Choose scalar score for early stopping according to config."""
+        metric = getattr(self, 'early_stop_metric', 'composite')
+        if metric == 'fg':
+            return float(getattr(self, '_last_ba_fg', 0.0))
+        if metric == 'all':
+            return float(getattr(self, '_last_ba_all', 0.0))
+        fg = float(getattr(self, '_last_ba_fg', 0.0))
+        all_ = float(getattr(self, '_last_ba_all', 0.0))
+        return self.metric_weight_fg * fg + self.metric_weight_all * all_
+
+    def _parse_model_outputs(self, outputs):
+        """Parse model outputs and return (fused_logits, fg_bg_logits, fg_class_logits)."""
+        if isinstance(outputs, dict):
+            fused = outputs.get('fused_logits')
+            fg_bg = outputs.get('fg_bg_logits')
+            fg_cls = outputs.get('fg_class_logits')
+        elif isinstance(outputs, (tuple, list)):
+            if len(outputs) < 3:
+                raise ValueError("Model must return (fused_logits, fg_bg_logits, fg_class_logits)")
+            fused, fg_bg, fg_cls = outputs[0], outputs[1], outputs[2]
+        else:
+            raise TypeError("Model output must be tuple/list/dict with two-stage heads")
+
+        if fused is None or fg_bg is None or fg_cls is None:
+            raise ValueError("Model output missing required two-stage logits")
+        return fused, fg_bg, fg_cls
     
     def _setup_device(self) -> None:
         """setup device and validate multi-GPU configuration"""
@@ -503,6 +711,57 @@ class hsTrainer(BaseEstimator):
         
         os.environ['OMP_NUM_THREADS'] = '4'
         os.environ['MKL_NUM_THREADS'] = '4'
+
+    @contextmanager
+    def _dataset_import_manager(self):
+        """Context manager for DataLoader import/build lifecycle."""
+        tic = time.perf_counter()
+        tprint("[dataset_import_manager] start")
+        try:
+            yield
+        finally:
+            toc = time.perf_counter()
+            train_batches = len(self.train_loader) if hasattr(self, 'train_loader') else 0
+            val_batches = len(self.val_loader) if hasattr(self, 'val_loader') and self.val_loader else 0
+            test_batches = len(self.test_loader) if hasattr(self, 'test_loader') else 0
+            tprint("[dataset_import_manager] done in "
+                   f"{toc - tic:.2f}s, batches(train/val/test): "
+                   f"{train_batches}/{val_batches}/{test_batches}")
+
+    @contextmanager
+    def _training_manager(self):
+        """Context manager for training lifecycle and post-train cleanup."""
+        tic = time.perf_counter()
+        tprint(f"[training_manager] start: {self.model_name}")
+        try:
+            yield
+        finally:
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize()
+            toc = time.perf_counter()
+            tprint(f"[training_manager] finished in {toc - tic:.2f}s")
+
+    @contextmanager
+    def _batch_stream_manager(self, loader):
+        """Context manager yielding a stream-ready batch iterator.
+
+        On CUDA, prefetches upcoming batch to overlap host->device copies with
+        current-step compute. On CPU, falls back to the original loader.
+        """
+        use_stream_prefetch = (
+            self.device.type == 'cuda'
+            and loader is not None
+        )
+
+        if use_stream_prefetch:
+            batch_iter = _CudaBatchPrefetcher(loader, self.device)
+        else:
+            batch_iter = loader
+
+        try:
+            yield batch_iter
+        finally:
+            batch_iter = None
     
     def _load_data(self) -> None:
         """load & create data loaders with optimized performance settings"""
@@ -541,20 +800,21 @@ class hsTrainer(BaseEstimator):
                 raise RuntimeError("Dataset object does not expose get_loaders/create_data_loader")
 
             # New API returns (train, val, test); supports legacy 2-tuple fallback
-            loaders = loader_fn(
-                num_workers=num_workers,
-                batch_size=batch_size,
-                pin_memory=self.config.memory.pin_memory,
-                prefetch_factor=prefetch_factor,
-                persistent_workers=persistent_workers
-            )
-            if len(loaders) == 3:
-                self.train_loader, self.val_loader, self.test_loader = loaders
-            else:
-                # Legacy 2-loader mode: use test as val for backward compatibility
-                self.train_loader, self.test_loader = loaders
-                self.val_loader = None
-            tprint(f"Data loaders created!")
+            with self._dataset_import_manager():
+                loaders = loader_fn(
+                    num_workers=num_workers,
+                    batch_size=batch_size,
+                    pin_memory=self.config.memory.pin_memory,
+                    prefetch_factor=prefetch_factor,
+                    persistent_workers=persistent_workers
+                )
+                if len(loaders) == 3:
+                    self.train_loader, self.val_loader, self.test_loader = loaders
+                else:
+                    # Legacy 2-loader mode: use test as val for backward compatibility
+                    self.train_loader, self.test_loader = loaders
+                    self.val_loader = None
+                tprint(f"Data loaders created!")
         except Exception as e:
             raise RuntimeError(f"Error during data loading: {e}")
     
@@ -633,33 +893,69 @@ class hsTrainer(BaseEstimator):
         
         print(f"  AdamW(lr={lr}, wd={weight_decay}) + CosineWR(T0={T_0}, Tm={T_mult})")
         
-        # Class-weighted Focal Loss (handles severe class imbalance better than CE)
+        # Class-weighted loss from dense pixel labels (ignore padding=255)
         focal_gamma = self.config.common.focal_gamma
         class_weights = None
         try:
-            train_labels = self.dataLoader.patch_labels[
-                self.train_loader.dataset.indices]
             num_cls = self.config.clsf.num
-            class_counts = np.bincount(train_labels, minlength=num_cls).astype(np.float64)
+            class_counts = np.zeros(num_cls, dtype=np.float64)
+
+            train_indices = getattr(self.train_loader.dataset, 'indices', None)
+            if train_indices is None:
+                raise RuntimeError("train_loader.dataset must expose indices for pixel-level class weighting")
+
+            for idx in train_indices:
+                label_patch = self.dataLoader._get_label_patch_(int(idx))
+                valid = label_patch != 255
+                if valid.any():
+                    cnt = np.bincount(
+                        label_patch[valid].reshape(-1), minlength=num_cls
+                    ).astype(np.float64)
+                    class_counts += cnt
+
             total_samples = class_counts.sum()
+            if total_samples <= 0:
+                raise RuntimeError("no valid training pixels found for class weighting")
+
             # Effective number weighting (Cui et al., CVPR 2019)
             beta = (total_samples - 1) / total_samples
             effective_num = 1.0 - np.power(beta, class_counts)
             raw_weights = 1.0 / (effective_num + 1e-8)
+
+            # Avoid exploding/invalid weights for unseen classes.
+            raw_weights[class_counts <= 0] = 0.0
             raw_weights = raw_weights / raw_weights.mean()
             class_weights = torch.FloatTensor(raw_weights).to(self.device)
             
             imbalance = class_counts.max() / (class_counts.min() + 1)
-            print(f"  Imbalance report: imbalance ratio {imbalance:.1f}x, {num_cls} classes")
+            print(f"  Imbalance report (pixel-level): imbalance ratio {imbalance:.1f}x, {num_cls} classes")
             print(f"  Class weights: {dict(zip(self.config.clsf.targets, class_weights.cpu().numpy()))}")
         except Exception as e:
             print(f"  Warning: uniform class weights ({e})")
+
+        self.early_stop_metric = str(getattr(self.config.common, 'early_stop_metric', 'composite')).lower()
+        self.metric_weight_fg = float(getattr(self.config.common, 'metric_weight_fg', 0.5))
+        self.metric_weight_all = float(getattr(self.config.common, 'metric_weight_all', 0.5))
+
+        if self.config.clsf.num <= 1:
+            raise ValueError("Two-stage supervision requires clsf.num > 1")
+
+        fg_w = float(getattr(self.config.common, 'fg_loss_weight', 1.0))
+        bgfg_w = float(getattr(self.config.common, 'bgfg_loss_weight', 0.5))
         
-        self.criterion = FocalLoss(
-            weight=class_weights, gamma=focal_gamma, ignore_index=255,
-            label_smoothing=getattr(self.config.common, 'label_smoothing', 0.0))
-        print(f"  FocalLoss(gamma={focal_gamma}, "
-              f"label_smoothing={getattr(self.config.common, 'label_smoothing', 0.0)})")
+        # HierarchicalSegLoss combines:
+        # fg_bg_seghead: binary loss for fg/bg separation.
+        # fg_class_seghead: focal loss for fg inner classification.
+        self.criterion = HierarchicalSegLoss(
+            num_classes=self.config.clsf.num,
+            class_weight=class_weights,
+            fg_weight=fg_w,
+            bgfg_weight=bgfg_w,
+            gamma=focal_gamma,
+            ignore_index=255,
+            label_smoothing=getattr(self.config.common, 'label_smoothing', 0.0),
+        )
+        print(f"  HierarchicalSegLoss(gamma={focal_gamma}, fg_w={fg_w}, bgfg_w={bgfg_w})")
         
         # Mixed precision
         use_amp = self.config.common.use_amp and self.device.type == 'cuda'
@@ -681,7 +977,7 @@ class hsTrainer(BaseEstimator):
         else:
             print(f"  EMA(decay={ema_decay}), patience={self.patience}")
     
-    def train_epoch(self, epoch: int) -> Tuple[float, float]:
+    def train_epoch(self, epoch: int) -> Tuple[float, float, float, float]:
         """
         Train for a single epoch.
         This method uses indexed batch unpacking and non-blocking transfers,
@@ -696,82 +992,78 @@ class hsTrainer(BaseEstimator):
         """
         self.model.train()
         total_loss = 0.0
+        total_bgfg_loss = 0.0
+        total_fg_class_loss = 0.0
         correct = 0
         total = 0
-        
-        # lr warm-up
+
         if epoch < self.warmup_epochs:
             warmup_factor = (epoch + 1) / self.warmup_epochs
             lr = self.config.common.lr * warmup_factor
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lr
-        
-        pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{self.epochs}', leave=False)
-        
-        # use idx to unpack batch-by-batch.
-        for batch_idx, batch_data in enumerate(pbar):
-            hsi, labels = self._unpack_batch(batch_data)
-            # non_blocking=True to:
-            # transfer new batch from memory to GPU parallel with last GPU conduct.
-            hsi = hsi.to(self.device, non_blocking=True)
-            labels = labels.to(self.device, non_blocking=True, memory_format=torch.contiguous_format)
-            
-            # NOTE: method permute() may cause incontinuous memory, FATAL ERROR.
-            # try permute().contiguous() if goes wrong.
-            # see https://blog.csdn.net/weixin_42046845/article/details/134667338.
-            if hsi.dim() == 4 and hsi.shape[-1] <= 16:  # [B, H, W, C]
-                hsi = hsi.permute(0, 3, 1, 2)  # [B, C, H, W]
-            
-            self.optimizer.zero_grad()
-            
-            if self.use_amp:
-                with autocast():
+
+        with self._batch_stream_manager(self.train_loader) as batch_iter:
+            pbar = tqdm(batch_iter, total=len(self.train_loader),
+                        desc=f'Epoch {epoch+1}/{self.epochs}', leave=False)
+
+            for batch_idx, batch_data in enumerate(pbar):
+                hsi, labels = self._unpack_batch(batch_data)
+
+                if hsi.device.type != self.device.type:
+                    hsi = hsi.to(self.device, non_blocking=True)
+                if labels.device.type != self.device.type:
+                    labels = labels.to(self.device, non_blocking=True,
+                                       memory_format=torch.contiguous_format)
+
+                if hsi.dim() == 4 and hsi.shape[-1] <= 16:
+                    hsi = hsi.permute(0, 3, 1, 2)
+
+                self.optimizer.zero_grad()
+                if self.use_amp:
+                    with autocast():
+                        outputs = self.model(hsi)
+                        fused_logits, _, _ = self._parse_model_outputs(outputs)
+                        loss, bgfg_loss, fg_class_loss = self.criterion.decompose(outputs, labels)
+                    self.scaler.scale(loss).backward()
+                    if self.grad_clip > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
                     outputs = self.model(hsi)
-                    loss = self.criterion(outputs, labels)
-                self.scaler.scale(loss).backward()
-                if self.grad_clip > 0:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                outputs = self.model(hsi)
-                loss = self.criterion(outputs, labels)
-                loss.backward()
-                if self.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                self.optimizer.step()
-            
-            # update EMA shadow weights (negligible overhead)
-            self.ema.update(self.model)
-            
-            # update lr after warmup
-            if epoch >= self.warmup_epochs:
-                self.scheduler.step(epoch + batch_idx / len(self.train_loader))
-            
-            total_loss += loss.item()
-            with torch.no_grad():
-                _, predicted = torch.max(outputs.detach(), 1)
-                # Pixel-wise accuracy excluding ignore pixels (label==255)
-                valid_mask = (labels != 255)
-                total += valid_mask.sum().item()
-                correct += ((predicted == labels) & valid_mask).sum().item()
-            
-            # tqdm
-            acc = 100.0 * correct / total if total > 0 else 0.0
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'acc': f'{acc:.2f}%',
-                'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
-            })
-            
-            # NOTE:
-            # torch.cuda.empty_cache() removed here.
-            # it forces a device sync every 5 steps,
-            # resulting in a significant shutdown for GPU units,
-            # which is time counter-productive.
-        
-        epoch_loss = total_loss / len(self.train_loader)
+                    fused_logits, _, _ = self._parse_model_outputs(outputs)
+                    loss, bgfg_loss, fg_class_loss = self.criterion.decompose(outputs, labels)
+                    loss.backward()
+                    if self.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    self.optimizer.step()
+
+                self.ema.update(self.model)
+                if epoch >= self.warmup_epochs:
+                    self.scheduler.step(epoch + batch_idx / len(self.train_loader))
+
+                total_loss += float(loss.item())
+                total_bgfg_loss += float(bgfg_loss.item())
+                total_fg_class_loss += float(fg_class_loss.item())
+                with torch.no_grad():
+                    _, predicted = torch.max(fused_logits.detach(), 1)
+                    valid_mask = (labels != 255)
+                    total += int(valid_mask.sum().item())
+                    correct += int(((predicted == labels) & valid_mask).sum().item())
+
+                acc = 100.0 * correct / total if total > 0 else 0.0
+                pbar.set_postfix({
+                    'bgfg_loss': f'{bgfg_loss.item():.4f}',
+                    'fg_class_loss': f'{fg_class_loss.item():.4f}',
+                    'acc': f'{acc:.2f}%',
+                    'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
+                })
+
+        epoch_loss = total_loss / max(len(self.train_loader), 1)
+        epoch_bgfg_loss = total_bgfg_loss / max(len(self.train_loader), 1)
+        epoch_fg_class_loss = total_fg_class_loss / max(len(self.train_loader), 1)
         epoch_acc = 100.0 * correct / total if total > 0 else 0.0
         
         # record lr for this epoch
@@ -784,7 +1076,7 @@ class hsTrainer(BaseEstimator):
                 total_norm += p.grad.data.norm(2).item() ** 2
         self.grad_norms.append(total_norm ** 0.5)
         
-        return epoch_loss, epoch_acc
+        return epoch_loss, epoch_acc, epoch_bgfg_loss, epoch_fg_class_loss
     
     @torch.no_grad()
     def evaluate(self, collect_extra: bool = False, use_ema: bool = False,
@@ -815,81 +1107,74 @@ class hsTrainer(BaseEstimator):
             empty arrays otherwise (sufficient for epoch-level logging).
             When collect_extra is True, also stores self._last_probas.
         """
-        # Swap in EMA shadow weights (zero-copy pointer exchange; call again to restore)
         if use_ema:
             self.ema.swap(self.model)
 
         self.model.eval()
         model_ref = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-        num_classes = model_ref.num_classes
-        metric_labels = self._metric_labels(num_classes)
+        num_classes = int(model_ref.num_classes)
+        metric_labels_fg = self._metric_labels(num_classes)
+        metric_labels_all = list(range(num_classes))
 
         total_loss = 0.0
-
-        # GPU-side confusion matrix — shape (C, C), int64
-        # Updated in-loop via scatter_add_; only C² numbers transferred to CPU at end.
+        total_bgfg_loss = 0.0
+        total_fg_class_loss = 0.0
         cm_gpu = torch.zeros(num_classes, num_classes,
                              dtype=torch.long, device=self.device)
 
-        # collect_extra: per-pixel arrays needed for final plots & ROC curves only
         predictions_list = [] if collect_extra else None
-        targets_list     = [] if collect_extra else None
-        probas_list      = [] if collect_extra else None   # sub-sampled; see roc_per_batch
-        roc_targets_list = [] if collect_extra else None   # targets paired with sub-sampled probas
-        vis_pairs        = [] if collect_extra else None   # small set of (pred_map, label_map) for visualization
+        targets_list = [] if collect_extra else None
+        probas_list = [] if collect_extra else None
+        roc_targets_list = [] if collect_extra else None
+        vis_pairs = [] if collect_extra else None
 
-        # Default loader selection: val for epoch eval, test only for final
-        if loader is None:
-            eval_loader = self.val_loader if self.val_loader else self.test_loader
-        else:
-            eval_loader = loader
+        eval_loader = self.val_loader if loader is None and self.val_loader else (loader or self.test_loader)
         recon_state = self._init_reconstruction_state(eval_loader) if collect_extra else None
-        # ROC sub-sampling budget: keep ≤2M pixels total (~1350 per batch for typical test set).
-        # ROC AUC is statistically stable with ≥1M samples; this avoids the 14 GB y_onehot
-        # allocation and the 4.4B-iteration Python loop in _save_all_plots.
         roc_per_batch = max(256, 2_000_000 // max(len(eval_loader), 1)) if collect_extra else 0
         max_vis_samples = self.config.common.vis_samples
-        pbar = tqdm(eval_loader, desc='Evaluating', leave=False)
 
-        with torch.no_grad():
+        with self._batch_stream_manager(eval_loader) as batch_iter:
+            pbar = tqdm(batch_iter, total=len(eval_loader), desc='Evaluating', leave=False)
             for batch_data in pbar:
                 hsi, labels = self._unpack_batch(batch_data)
-                hsi    = hsi.to(self.device, non_blocking=True)
-                labels = labels.to(self.device, non_blocking=True)
+                if hsi.device.type != self.device.type:
+                    hsi = hsi.to(self.device, non_blocking=True)
+                if labels.device.type != self.device.type:
+                    labels = labels.to(self.device, non_blocking=True)
 
-                # [B, H, W, C] -> [B, C, H, W]
                 if hsi.dim() == 4 and hsi.shape[-1] <= 16:
                     hsi = hsi.permute(0, 3, 1, 2)
 
                 if self.use_amp:
                     with autocast():
                         outputs = self.model(hsi)
-                        loss = self.criterion(outputs, labels)
+                        fused_logits, _, _ = self._parse_model_outputs(outputs)
+                        loss, bgfg_loss, fg_class_loss = self.criterion.decompose(outputs, labels)
                 else:
                     outputs = self.model(hsi)
-                    loss = self.criterion(outputs, labels)
-                total_loss += loss.item()
-                logits, predicted = torch.max(outputs, 1)
-                
-                # filter padding/background (ignore_index = 255)
-                valid_mask  = (labels != 255)
-                pred_valid  = predicted[valid_mask]   # shape: (n_valid,)
-                tgt_valid   = labels[valid_mask]      # shape: (n_valid,)
-        
-                # linearise (true_cls, pred_cls) -> flat index and accumulate
-                # cm_gpu[t, p] += 1  equivalent, without any Python loop
+                    fused_logits, _, _ = self._parse_model_outputs(outputs)
+                    loss, bgfg_loss, fg_class_loss = self.criterion.decompose(outputs, labels)
+
+                total_loss += float(loss.item())
+                total_bgfg_loss += float(bgfg_loss.item())
+                total_fg_class_loss += float(fg_class_loss.item())
+                _, predicted = torch.max(fused_logits, 1)
+
+                valid_mask = (labels != 255)
+                pred_valid = predicted[valid_mask]
+                tgt_valid = labels[valid_mask]
+
                 linear_idx = tgt_valid * num_classes + pred_valid
                 cm_gpu.view(-1).scatter_add_(
                     0, linear_idx,
-                    torch.ones_like(linear_idx, dtype=torch.long))
+                    torch.ones_like(linear_idx, dtype=torch.long)
+                )
 
-                # collect full arrays only for final-eval plots / ROC
                 if collect_extra:
-                    predictions_list.append(pred_valid)   # stays on GPU
-                    targets_list.append(tgt_valid)        # stays on GPU
+                    predictions_list.append(pred_valid)
+                    targets_list.append(tgt_valid)
                     self._accumulate_reconstruction_batch(recon_state, predicted, labels)
 
-                    # Cache a few full-size map pairs for final comparison figure.
                     if len(vis_pairs) < max_vis_samples and predicted.dim() == 3 and labels.dim() == 3:
                         remaining = max_vis_samples - len(vis_pairs)
                         take_n = min(predicted.shape[0], remaining)
@@ -899,10 +1184,8 @@ class hsTrainer(BaseEstimator):
                                 labels[b_idx].detach().cpu().numpy(),
                             ))
 
-                    # Sub-sample probas: keep at most roc_per_batch valid pixels per batch.
-                    # Avoids storing all 4.4B×8-class float32 (~14 GB) in host RAM.
-                    proba = outputs.softmax(dim=1)                       # [B, K, H, W]
-                    proba_valid = proba.permute(0, 2, 3, 1)[valid_mask]  # [n_v, K]
+                    proba = fused_logits.softmax(dim=1)
+                    proba_valid = proba.permute(0, 2, 3, 1)[valid_mask]
                     n_v = proba_valid.shape[0]
                     if n_v > roc_per_batch:
                         sel = torch.randperm(n_v, device=self.device)[:roc_per_batch]
@@ -912,49 +1195,38 @@ class hsTrainer(BaseEstimator):
                         probas_list.append(proba_valid.cpu().numpy())
                         roc_targets_list.append(tgt_valid.cpu().numpy())
 
-        cm_np    = cm_gpu.cpu().numpy().astype(np.int64)   # shape (C, C)
-        row_sums = cm_np.sum(axis=1)                       # actual count per class
-        col_sums = cm_np.sum(axis=0)                       # predicted count per class
-        diag     = np.diag(cm_np)
-        total    = int(cm_np.sum())
+        cm_np = cm_gpu.cpu().numpy().astype(np.int64)
+        total = int(cm_np.sum())
+        oa = float(np.diag(cm_np).sum()) / max(total, 1) * 100
 
-        # overall Accuracy
-        oa = float(diag.sum()) / total * 100 if total > 0 else 0.0
+        ba_all, kappa_all, miou_all = self._metrics_from_confusion(cm_np, metric_labels_all)
+        ba_fg, kappa_fg, miou_fg = self._metrics_from_confusion(cm_np, metric_labels_fg)
 
-        # balanced Accuracy: average recall over non-bg
-        valid_cls = row_sums > 0
-        eval_valid = np.zeros_like(valid_cls, dtype=bool)
-        eval_valid[np.array(metric_labels, dtype=np.int64)] = True
-        eval_valid = eval_valid & valid_cls
-        per_cls_recall = np.where(valid_cls, diag / np.maximum(row_sums, 1), 0.0)
-        acc = float(per_cls_recall[eval_valid].mean()) * 100 if eval_valid.any() else 0.0
+        if self.early_stop_metric == 'fg':
+            acc = ba_fg
+            kappa = kappa_fg
+            miou = miou_fg
+        elif self.early_stop_metric == 'all':
+            acc = ba_all
+            kappa = kappa_all
+            miou = miou_all
+        else:
+            acc = self.metric_weight_fg * ba_fg + self.metric_weight_all * ba_all
+            kappa = self.metric_weight_fg * kappa_fg + self.metric_weight_all * kappa_all
+            miou = self.metric_weight_fg * miou_fg + self.metric_weight_all * miou_all
 
-        # Cohen's Kappa on metric classes, bg excluded
-        cm_eval = cm_np[np.ix_(metric_labels, metric_labels)]
-        eval_row_sums = cm_eval.sum(axis=1)
-        eval_col_sums = cm_eval.sum(axis=0)
-        eval_diag = np.diag(cm_eval)
-        eval_total = int(cm_eval.sum())
-        expected = eval_row_sums.astype(np.float64) * eval_col_sums.astype(np.float64) / max(eval_total, 1)
-        p_o = float(eval_diag.sum()) / max(eval_total, 1)
-        p_e = float(expected.sum()) / max(eval_total, 1)
-        kappa = ((p_o - p_e) / max(1.0 - p_e, 1e-8)) * 100
-
-        # mIoU (tp / (tp + fp + fn) per class, from confusion matrix columns/rows)
-        miou_vals = []
-        for c in metric_labels:
-            tp    = int(cm_np[c, c])
-            fp    = int(col_sums[c]) - tp
-            fn    = int(row_sums[c]) - tp
-            denom = tp + fp + fn
-            if denom > 0:
-                miou_vals.append(tp / denom)
-        miou = float(np.mean(miou_vals)) * 100 if miou_vals else 0.0
-
-        loss = total_loss / len(eval_loader)
-        self._last_oa   = oa
+        loss = total_loss / max(len(eval_loader), 1)
+        self._last_eval_bgfg_loss = total_bgfg_loss / max(len(eval_loader), 1)
+        self._last_eval_fg_class_loss = total_fg_class_loss / max(len(eval_loader), 1)
+        self._last_oa = oa
+        self._last_ba_all = ba_all
+        self._last_ba_fg = ba_fg
+        self._last_kappa_all = kappa_all
+        self._last_kappa_fg = kappa_fg
+        self._last_miou_all = miou_all
+        self._last_miou_fg = miou_fg
         self._last_miou = miou
-        self._metric_labels_used = metric_labels
+        self._metric_labels_used = metric_labels_fg
 
         # final-eval: full arrays for plots / ROC (single GPU -> CPU transfer)
         if collect_extra:
@@ -981,6 +1253,39 @@ class hsTrainer(BaseEstimator):
             self.ema.swap(self.model)
 
         return loss, acc, kappa, predictions, targets
+
+    def _flush_epoch_metrics(self) -> None:
+        """Persist epoch-level metrics to JSON and CSV for downstream analysis."""
+        if not self.epoch_metrics:
+            return
+
+        json_path = os.path.join(self.output, 'epoch_metrics.json')
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(self.epoch_metrics, f, indent=2)
+
+        csv_path = os.path.join(self.output, 'epoch_metrics.csv')
+        fieldnames = [
+            'epoch',
+            'train_loss',
+            'train_bgfg_loss',
+            'train_fg_class_loss',
+            'train_acc',
+            'eval_loss',
+            'eval_bgfg_loss',
+            'eval_fg_class_loss',
+            'eval_score',
+            'eval_ba_all',
+            'eval_ba_fg',
+            'eval_kappa_all',
+            'eval_kappa_fg',
+            'eval_miou_all',
+            'eval_miou_fg',
+        ]
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in self.epoch_metrics:
+                writer.writerow(row)
     
     def train(self, _cv_mode: bool = False) -> Dict[str, float]:
         """
@@ -999,65 +1304,116 @@ class hsTrainer(BaseEstimator):
         print(f"Training ({self.model_name})")
         print("\n")
         
-        tic = time.perf_counter()
-        
-        for epoch in range(self.epochs):
-            # training
-            epoch_tic = time.perf_counter()
-            train_loss, train_acc = self.train_epoch(epoch)
-            self.epoch_times.append(time.perf_counter() - epoch_tic)
-            self.train_losses.append(train_loss)
-            self.train_accs.append(train_acc)
-            
-            # validating
-            should_eval = ((epoch + 1) % self.eval_interval == 0) or (epoch + 1 == self.epochs)
-            
-            if should_eval or self.debug_mode:
-                # Evaluate on val set for early stopping (not test set)
-                eval_loss, eval_acc, kappa, pred, target = self.evaluate(use_ema=True)
-                self.eval_losses.append(eval_loss)
-                self.eval_accs.append(eval_acc)
-                
-                miou_str = ''
-                if hasattr(self, '_last_miou'):
-                    miou_str = f' mIoU: {self._last_miou:6.2f}%'
-                
-                oa_str = f' OA: {self._last_oa:6.2f}%' if hasattr(self, '_last_oa') else ''
-                eval_set_name = 'Val' if self.val_loader else 'Test'
-                tprint(f"\n[Epoch {epoch+1:3d}] "
-                      f"Train Loss: {train_loss:.4f} Acc: {train_acc:6.2f}% | "
-                      f"{eval_set_name} Loss: {eval_loss:.4f} BA: {eval_acc:6.2f}%{oa_str} "
-                      f"Kappa: {kappa:6.2f}%{miou_str}")
-                
-                # save the best model
-                if eval_acc > self.best_acc:
-                    self.best_acc = eval_acc
-                    self.best_epoch = epoch
-                    self.best_model_state = {
-                        'epoch': epoch,
-                        'model_state': self.ema.state_dict(),
-                        'acc': eval_acc,
-                        'kappa': kappa
-                    }
-                    self._save_model()
-                    tprint(f"  Best model saved (BA: {eval_acc:.2f}%) at {os.path.join(self.output, 'models', f'{self.model_name}_best.onnx')}")
+        with self._training_manager():
+            tic = time.perf_counter()
+
+            for epoch in range(self.epochs):
+                # training
+                epoch_tic = time.perf_counter()
+                train_loss, train_acc, train_bgfg_loss, train_fg_class_loss = self.train_epoch(epoch)
+                self.epoch_times.append(time.perf_counter() - epoch_tic)
+                self.train_losses.append(train_loss)
+                self.train_accs.append(train_acc)
+                self.train_bgfg_losses.append(train_bgfg_loss)
+                self.train_fg_class_losses.append(train_fg_class_loss)
+
+                # validating
+                should_eval = ((epoch + 1) % self.eval_interval == 0) or (epoch + 1 == self.epochs)
+
+                if should_eval or self.debug_mode:
+                    # Evaluate on val set for early stopping (not test set)
+                    eval_loss, eval_acc, kappa, pred, target = self.evaluate(use_ema=True)
+                    self.eval_losses.append(eval_loss)
+                    self.eval_accs.append(eval_acc)
+                    self.eval_bgfg_losses.append(float(getattr(self, '_last_eval_bgfg_loss', 0.0)))
+                    self.eval_fg_class_losses.append(float(getattr(self, '_last_eval_fg_class_loss', 0.0)))
+                    eval_score = self._select_early_stop_score()
+
+                    self.epoch_metrics.append({
+                        'epoch': epoch + 1,
+                        'train_loss': float(train_loss),
+                        'train_bgfg_loss': float(train_bgfg_loss),
+                        'train_fg_class_loss': float(train_fg_class_loss),
+                        'train_acc': float(train_acc),
+                        'eval_loss': float(eval_loss),
+                        'eval_bgfg_loss': float(getattr(self, '_last_eval_bgfg_loss', 0.0)),
+                        'eval_fg_class_loss': float(getattr(self, '_last_eval_fg_class_loss', 0.0)),
+                        'eval_score': float(eval_score),
+                        'eval_ba_all': float(getattr(self, '_last_ba_all', eval_acc)),
+                        'eval_ba_fg': float(getattr(self, '_last_ba_fg', eval_acc)),
+                        'eval_kappa_all': float(getattr(self, '_last_kappa_all', kappa)),
+                        'eval_kappa_fg': float(getattr(self, '_last_kappa_fg', kappa)),
+                        'eval_miou_all': float(getattr(self, '_last_miou_all', 0.0)),
+                        'eval_miou_fg': float(getattr(self, '_last_miou_fg', 0.0)),
+                    })
+
+                    miou_str = ''
+                    if hasattr(self, '_last_miou'):
+                        miou_str = (
+                            f" mIoU(all/fg): "
+                            f"{getattr(self, '_last_miou_all', self._last_miou):6.2f}%/"
+                            f"{getattr(self, '_last_miou_fg', self._last_miou):6.2f}%"
+                        )
+
+                    oa_str = f' OA: {self._last_oa:6.2f}%' if hasattr(self, '_last_oa') else ''
+                    eval_set_name = 'Val' if self.val_loader else 'Test'
+                    tprint(f"\n[Epoch {epoch+1:3d}] "
+                          f"Train(bgfg/fg_cls): {train_bgfg_loss:.4f}/{train_fg_class_loss:.4f} Acc: {train_acc:6.2f}% | "
+                          f"{eval_set_name}(bgfg/fg_cls): {getattr(self, '_last_eval_bgfg_loss', 0.0):.4f}/{getattr(self, '_last_eval_fg_class_loss', 0.0):.4f} "
+                          f"BA(all/fg): {getattr(self, '_last_ba_all', eval_acc):6.2f}%/"
+                          f"{getattr(self, '_last_ba_fg', eval_acc):6.2f}%{oa_str} "
+                          f"Kappa(all/fg): {getattr(self, '_last_kappa_all', kappa):6.2f}%/"
+                          f"{getattr(self, '_last_kappa_fg', kappa):6.2f}% "
+                          f"Score: {eval_score:6.2f}%{miou_str}")
+
+                    # save the best model
+                    if eval_score > self.best_acc:
+                        self.best_acc = eval_score
+                        self.best_epoch = epoch
+                        self.best_model_state = {
+                            'epoch': epoch,
+                            'model_state': self.ema.state_dict(),
+                            'acc': eval_score,
+                            'kappa': kappa
+                        }
+                        self._save_model()
+                        tprint(f"  Best model saved (score: {eval_score:.2f}%) at {os.path.join(self.output, 'models', f'{self.model_name}_best.onnx')}")
+                    else:
+                        # early stopping check
+                        if epoch - self.best_epoch > self.patience:
+                            tprint(f"\n  Early stopping: {epoch - self.best_epoch} epochs without improvement")
+                            break
                 else:
-                    # early stopping check
-                    if epoch - self.best_epoch > self.patience:
-                        tprint(f"\n  Early stopping: {epoch - self.best_epoch} epochs without improvement")
-                        break
-            else:
-                tprint(f"[Epoch {epoch+1:3d}] Train Loss: {train_loss:.4f} Acc: {train_acc:6.2f}%", end='')
-            
-            # Generate visualizations
-            if self.debug_mode:
-                try:
-                    self._generate_cam(epoch)
-                except Exception as e:
-                    tprint(f"  CAM error: {e}")
-        
-        toc = time.perf_counter()
-        training_time = toc - tic
+                    tprint(f"[Epoch {epoch+1:3d}] Train(bgfg/fg_cls): {train_bgfg_loss:.4f}/{train_fg_class_loss:.4f} Acc: {train_acc:6.2f}%", end='')
+                    self.epoch_metrics.append({
+                        'epoch': epoch + 1,
+                        'train_loss': float(train_loss),
+                        'train_bgfg_loss': float(train_bgfg_loss),
+                        'train_fg_class_loss': float(train_fg_class_loss),
+                        'train_acc': float(train_acc),
+                        'eval_loss': None,
+                        'eval_bgfg_loss': None,
+                        'eval_fg_class_loss': None,
+                        'eval_score': None,
+                        'eval_ba_all': None,
+                        'eval_ba_fg': None,
+                        'eval_kappa_all': None,
+                        'eval_kappa_fg': None,
+                        'eval_miou_all': None,
+                        'eval_miou_fg': None,
+                    })
+
+                self._flush_epoch_metrics()
+
+                # Generate visualizations
+                if self.debug_mode:
+                    try:
+                        self._generate_cam(epoch)
+                    except Exception as e:
+                        tprint(f"  CAM error: {e}")
+
+            toc = time.perf_counter()
+            training_time = toc - tic
         
         print("\n")
         tprint(f"Training completed with:")
@@ -1095,6 +1451,12 @@ class hsTrainer(BaseEstimator):
             'training_time': training_time,
             'model_path': os.path.join(self.output, 'models', f'{self.model_name}_best.onnx')
         }
+        results['final_accuracy_all'] = float(getattr(self, '_last_ba_all', final_acc))
+        results['final_accuracy_fg'] = float(getattr(self, '_last_ba_fg', final_acc))
+        results['final_kappa_all'] = float(getattr(self, '_last_kappa_all', final_kappa))
+        results['final_kappa_fg'] = float(getattr(self, '_last_kappa_fg', final_kappa))
+        results['final_miou_all'] = float(getattr(self, '_last_miou_all', 0.0))
+        results['final_miou_fg'] = float(getattr(self, '_last_miou_fg', 0.0))
         # Always include mIoU
         if hasattr(self, '_last_miou'):
             results['final_miou'] = self._last_miou
@@ -1984,6 +2346,8 @@ class hsTrainer(BaseEstimator):
         tasks = [
             (_worker_plot_training_curves,
              (list(self.train_losses), list(self.eval_losses),
+              list(self.train_bgfg_losses), list(self.train_fg_class_losses),
+              list(self.eval_bgfg_losses), list(self.eval_fg_class_losses),
               list(self.train_accs), list(self.eval_accs),
               self.eval_interval, self.debug_mode,
               self.best_acc, self.model_name, self.output)),
@@ -2045,7 +2409,8 @@ class hsTrainer(BaseEstimator):
             
             with torch.no_grad():
                 outputs = self.model(hsi[:num_samples])
-                preds = torch.argmax(outputs, dim=1)
+                fused_logits, _, _ = self._parse_model_outputs(outputs)
+                preds = torch.argmax(fused_logits, dim=1)
             
             for i in range(num_samples):
                 # pseudo-RGB visualization
@@ -2158,8 +2523,22 @@ class hsTrainer(BaseEstimator):
 
         raw_model.eval()
         try:
+            class _FusedOnlyWrapper(nn.Module):
+                def __init__(self, model):
+                    super().__init__()
+                    self.model = model
+
+                def forward(self, x):
+                    out = self.model(x)
+                    if isinstance(out, dict):
+                        return out['fused_logits']
+                    if isinstance(out, (tuple, list)):
+                        return out[0]
+                    return out
+
+            export_model = _FusedOnlyWrapper(raw_model)
             torch.onnx.export(
-                raw_model,
+                export_model,
                 dummy_input,
                 onnx_path,
                 export_params=True,
@@ -2216,11 +2595,12 @@ class hsTrainer(BaseEstimator):
             # Forward pass through the ORIGINAL self.model (may be DataParallel)
             self.model.zero_grad()
             output = self.model(x)
+            fused_logits, _, _ = self._parse_model_outputs(output)
             # For segmentation output [B, K, H, W], sum spatial dims to get scalar
-            if output.dim() == 4:
-                loss = output[0, class_idx].sum()
+            if fused_logits.dim() == 4:
+                loss = fused_logits[0, class_idx].sum()
             else:
-                loss = output[0, class_idx]
+                loss = fused_logits[0, class_idx]
             loss.backward(retain_graph=False)
             
             # Compute CAM

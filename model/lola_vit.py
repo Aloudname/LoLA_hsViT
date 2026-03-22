@@ -548,7 +548,8 @@ class LoLA_hsViT(nn.Module):
     """
     def __init__(self, in_channels=None, num_classes=None, patch_size=None, dim=96, depths=[3, 4, 5],
                  num_heads=[4, 8, 16], window_size=[7, 7, 7], mlp_ratio=4.,
-                 drop_path_rate=0.2, r=16, lora_alpha=32):
+                 drop_path_rate=0.2, r=16, lora_alpha=32,
+                 hierarchical_head=True):
         """
         Args:
             ``in_channels``: Number of input channels (spectral bands).
@@ -568,6 +569,7 @@ class LoLA_hsViT(nn.Module):
         self.in_channels = in_channels
         self.num_classes = num_classes
         self.mode = 'segmentation'  # pixel-level only
+        self.hierarchical_head = True
         print(f"Model initialized with {in_channels} input channels and {depths} depths.")
         
         # Block1: Spectral processing.
@@ -659,8 +661,15 @@ class LoLA_hsViT(nn.Module):
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
         )
-        # 1x1 conv for per-pixel class scores
-        self.seg_head = nn.Conv2d(128, num_classes, kernel_size=1)
+        # Hierarchical segmentation heads:
+        # 1) fg_bg_head predicts BG/FG logits (2 channels)
+        # 2) fg_class_head predicts foreground subclass logits (num_classes - 1)
+        # Fused output remains [B, num_classes, H, W] for trainer compatibility.
+        if self.num_classes <= 1:
+            raise ValueError("LoLA_hsViT requires num_classes > 1 for two-stage segmentation supervision")
+        self.fg_bg_head = nn.Conv2d(128, 2, kernel_size=1)
+        self.fg_class_head = nn.Conv2d(128, num_classes - 1, kernel_size=1)
+        self.seg_head = None
         
         # Initialize weights
         self.apply(self._init_weights)
@@ -716,8 +725,15 @@ class LoLA_hsViT(nn.Module):
         # Always keep segmentation decoder & head trainable
         for p in self.seg_decoder.parameters():
             p.requires_grad_(True)
-        for p in self.seg_head.parameters():
-            p.requires_grad_(True)
+        if self.seg_head is not None:
+            for p in self.seg_head.parameters():
+                p.requires_grad_(True)
+        if self.fg_bg_head is not None:
+            for p in self.fg_bg_head.parameters():
+                p.requires_grad_(True)
+        if self.fg_class_head is not None:
+            for p in self.fg_class_head.parameters():
+                p.requires_grad_(True)
 
     def generate_cam(self, class_idx=None):
         """
@@ -830,12 +846,24 @@ class LoLA_hsViT(nn.Module):
         # Decode & upsample to original spatial resolution
         x = self.seg_decoder(x)
         x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
-        output = self.seg_head(x)  # [B, num_classes, H, W]
+        fg_bg_logits = self.fg_bg_head(x)          # [B, 2, H, W], [bg, fg]
+        fg_class_logits = self.fg_class_head(x)    # [B, C-1, H, W], foreground subclasses
+
+        # Use foreground logit as a shared gate for all foreground subclasses.
+        bg_logit = fg_bg_logits[:, 0:1, :, :]
+        fg_gate = fg_bg_logits[:, 1:2, :, :]
+        fg_logits = fg_class_logits + fg_gate
+        output = torch.cat([bg_logit, fg_logits], dim=1)
+        staged_output = {
+            'fused_logits': output,
+            'fg_bg_logits': fg_bg_logits,
+            'fg_class_logits': fg_class_logits,
+        }
 
         if return_cam:
             cam = self.generate_cam()
-            return output, cam
-        return output
+            return staged_output, cam
+        return staged_output
 
 class LoLA_hsViT_reduced(LoLA_hsViT):
     """Reduced LoLA_hsViT: dim=64, depths=[2,3,3]."""

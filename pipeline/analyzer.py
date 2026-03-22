@@ -302,6 +302,32 @@ class DatasetAnalyzer:
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
+    def _foreground_meta(self) -> Tuple[List[str], int]:
+        """Return foreground-only class names and class count (exclude label 0/BG)."""
+        class_names = list(self.dataset.targets)
+        if class_names and str(class_names[0]).strip().upper() == "BG":
+            class_names = class_names[1:]
+        num_classes = len(class_names)
+        return class_names, num_classes
+
+    @staticmethod
+    def _to_foreground_labels(labels: np.ndarray) -> np.ndarray:
+        """Filter out background label 0 and remap foreground labels to 0-based."""
+        labels = np.asarray(labels)
+        fg = labels[labels > 0]
+        return (fg - 1).astype(np.int64)
+
+    @staticmethod
+    def _to_foreground_labels_with_groups(
+        labels: np.ndarray,
+        groups: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Filter BG and keep aligned patient groups for foreground-only analysis."""
+        labels = np.asarray(labels)
+        groups = np.asarray(groups)
+        mask = labels > 0
+        return (labels[mask] - 1).astype(np.int64), groups[mask]
+
     def _split_indices(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         total_indices = np.arange(len(self.dataset.patch_indices))
         sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=350234)
@@ -341,10 +367,11 @@ class DatasetAnalyzer:
         return between / within
 
     def analyze_labels(self) -> Dict:
-        labels = self.dataset.patch_labels
-        groups = self.dataset.patch_patient_groups
-        class_names = list(self.dataset.targets)
-        num_classes = self.dataset.num
+        labels, groups = self._to_foreground_labels_with_groups(
+            self.dataset.patch_labels,
+            self.dataset.patch_patient_groups,
+        )
+        class_names, num_classes = self._foreground_meta()
 
         dist = compute_class_distribution(labels, class_names, num_classes)
 
@@ -386,15 +413,14 @@ class DatasetAnalyzer:
 
     def analyze_splits(self) -> Dict:
         train_idx, val_idx, test_idx = self._split_indices()
-        class_names = list(self.dataset.targets)
-        num_classes = self.dataset.num
+        class_names, num_classes = self._foreground_meta()
 
         rng = np.random.RandomState(350234)
 
         # raw labels per split
-        train_raw = self.dataset.patch_labels[train_idx]
-        val_raw = self.dataset.patch_labels[val_idx]
-        test_raw = self.dataset.patch_labels[test_idx]
+        train_raw = self._to_foreground_labels(self.dataset.patch_labels[train_idx])
+        val_raw = self._to_foreground_labels(self.dataset.patch_labels[val_idx])
+        test_raw = self._to_foreground_labels(self.dataset.patch_labels[test_idx])
 
         # simulate balanced re-sampling used by WeightedRandomSampler (weights=1/class_counts)
         raw_counts = np.bincount(train_raw, minlength=num_classes)
@@ -525,7 +551,7 @@ class DatasetAnalyzer:
         if self.dataset.pca_components is None or self.dataset.pca_explained_variance is None:
             return {}
 
-        num_classes = self.dataset.num
+        _, num_classes = self._foreground_meta()
         n_components, n_bands = self.dataset.pca_components.shape
         class_sum = np.zeros((num_classes, n_components), dtype=np.float64)
         class_sumsq = np.zeros_like(class_sum)
@@ -540,10 +566,13 @@ class DatasetAnalyzer:
         for idx in sample_indices:
             patch = self.dataset._get_patch_(idx)
             label = int(self.dataset.patch_labels[idx])
+            if label <= 0:
+                continue
             center = patch[margin, margin, :]
-            class_sum[label] += center
-            class_sumsq[label] += center ** 2
-            class_count[label] += 1
+            cls = label - 1
+            class_sum[cls] += center
+            class_sumsq[cls] += center ** 2
+            class_count[cls] += 1
 
         fisher_pc = self._fisher_score(class_sum, class_sumsq, class_count)
 

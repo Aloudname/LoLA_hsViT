@@ -2,7 +2,8 @@
 # todo:
 # - Implement class distribution analysis and visualization methods.
 # - Try various seeds for a balanced label distribution in line 542 create_dataloader.
-import os, re, torch, numpy as np, warnings
+import os, re, time, torch, numpy as np, warnings
+from contextlib import contextmanager
 
 from munch import Munch
 from pipeline.monitor import tprint
@@ -486,7 +487,26 @@ class NpyHSDataset(AbstractHSDataset):
         self.patch_pg_tg_boundary: Optional[np.ndarray] = None
 
         # per-patient pipeline (_load_data + _preprocess_data + _create_patches)
-        self._per_patient_pipeline()
+        with self._dataset_build_manager():
+            self._per_patient_pipeline()
+
+    @contextmanager
+    def _dataset_build_manager(self):
+        """Context manager for dataset build lifecycle.
+
+        Encapsulates one-shot dataset construction and reports build timing,
+        enabling cleaner orchestration from callers and easier future extension
+        for streaming/chunked preprocessing.
+        """
+        tic = time.perf_counter()
+        tprint("[dataset_build_manager] start building dataset")
+        try:
+            yield
+        finally:
+            toc = time.perf_counter()
+            n_patches = len(getattr(self, 'patch_indices', []))
+            tprint(f"[dataset_build_manager] done in {toc - tic:.2f}s, "
+                   f"patches: {n_patches:,}")
     
     @staticmethod
     def _extract_patient_id(filepath: str) -> str:
@@ -502,6 +522,173 @@ class NpyHSDataset(AbstractHSDataset):
             return match.group(1).lower()
         # Fallback: use basename without extension
         return os.path.splitext(basename)[0].lower()
+
+    def _build_label_remap(self) -> np.ndarray:
+        """Build label remap table from config, defaulting to identity mapping.
+
+        Supported config forms under clsf.label_remap:
+        - list form: [0, 1, 2, 3] where index is raw label and value is mapped label
+        - dict form: {0: 0, 1: 1, 2: 2, 3: 3}
+
+        If unset, defaults to identity for labels [0, clsf.num - 1].
+        """
+        remap_cfg = getattr(self.config.clsf, 'label_remap', None)
+
+        if remap_cfg is None:
+            return np.arange(max(int(self.num), 1), dtype=np.int32)
+
+        if isinstance(remap_cfg, (dict, Munch)):
+            remap_items = dict(remap_cfg)
+            if not remap_items:
+                raise ValueError("clsf.label_remap cannot be an empty dict")
+
+            normalized: Dict[int, int] = {}
+            for raw_k, mapped_v in remap_items.items():
+                try:
+                    k = int(raw_k)
+                    v = int(mapped_v)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"clsf.label_remap dict must be int->int, got {raw_k}:{mapped_v}"
+                    ) from None
+                if k < 0 or v < 0:
+                    raise ValueError(
+                        f"clsf.label_remap entries must be non-negative, got {k}->{v}"
+                    )
+                normalized[k] = v
+
+            max_key = max(normalized.keys())
+            remap = np.zeros(max_key + 1, dtype=np.int32)
+            remap[0] = 0
+            for k, v in normalized.items():
+                remap[k] = v
+        else:
+            try:
+                remap = np.asarray(remap_cfg, dtype=np.int32).reshape(-1)
+            except Exception as exc:
+                raise ValueError(
+                    "clsf.label_remap must be a 1D list/array or a dict"
+                ) from exc
+
+            if remap.size == 0:
+                raise ValueError("clsf.label_remap cannot be empty")
+            if np.any(remap < 0):
+                raise ValueError("clsf.label_remap values must be non-negative")
+
+            remap = remap.astype(np.int32, copy=False)
+
+        if np.max(remap) >= self.num:
+            raise ValueError(
+                f"clsf.label_remap contains mapped label >= clsf.num ({self.num}): "
+                f"max mapped is {int(np.max(remap))}"
+            )
+
+        return remap
+
+    def _apply_label_remap(self, labels_raw: np.ndarray,
+                           remap: np.ndarray,
+                           label_file: str) -> np.ndarray:
+        """Apply configurable label remap with strict/soft unknown handling."""
+        if labels_raw.ndim != 2:
+            raise ValueError(
+                f"label map must be 2D, got shape {labels_raw.shape} from {label_file}"
+            )
+
+        strict_remap = bool(getattr(self.config.clsf, 'strict_label_remap', True))
+        unknown_policy = str(
+            getattr(self.config.clsf, 'unknown_label_policy', 'error')
+        ).strip().lower()
+        if unknown_policy not in {'error', 'map_to_bg'}:
+            raise ValueError(
+                "clsf.unknown_label_policy must be 'error' or 'map_to_bg'"
+            )
+
+        min_raw = int(labels_raw.min())
+        max_raw = int(labels_raw.max())
+        if min_raw < 0:
+            raise ValueError(
+                f"{os.path.basename(label_file)} has negative label {min_raw}"
+            )
+
+        unknown_mask = labels_raw >= len(remap)
+        unknown_count = int(unknown_mask.sum())
+        if unknown_count > 0:
+            unknown_values = np.unique(labels_raw[unknown_mask])
+            preview = unknown_values[:10].tolist()
+            suffix = "" if len(unknown_values) <= 10 else " ..."
+            msg = (
+                f"{os.path.basename(label_file)} contains {unknown_count:,} unknown label pixel(s), "
+                f"values={preview}{suffix}, remap_max={len(remap)-1}"
+            )
+            if strict_remap or unknown_policy == 'error':
+                raise ValueError(msg)
+            print(f"\t\tWARNING: {msg}; mapping unknown labels to BG(0)")
+
+        labels_clipped = np.clip(labels_raw, 0, len(remap) - 1)
+        labels = remap[labels_clipped]
+
+        if unknown_count > 0 and unknown_policy == 'map_to_bg':
+            labels[unknown_mask] = 0
+
+        if max_raw >= len(remap) and not (unknown_count > 0 and unknown_policy == 'map_to_bg'):
+            print(f"\t\tWARNING: {os.path.basename(label_file)} has max raw label {max_raw} "
+                  f"over remap max {len(remap)-1}")
+
+        return labels.astype(np.int32, copy=False)
+
+    def _collect_pixels_for_preprocessor(self,
+                                         data: np.ndarray,
+                                         labels: np.ndarray,
+                                         rng: np.random.RandomState) -> np.ndarray:
+        """Collect pixels for norm/PCA fitting with configurable FG/BG mix."""
+        flat_data = data.reshape(-1, data.shape[2])
+        flat_labels = labels.reshape(-1)
+
+        fg_pixels = flat_data[flat_labels > 0]
+        fit_on_non_bg_only = bool(getattr(self.config.preprocess, 'fit_on_non_bg_only', True))
+        if fit_on_non_bg_only:
+            return fg_pixels
+
+        bg_pixels = flat_data[flat_labels == 0]
+        if len(bg_pixels) == 0:
+            return fg_pixels
+        if len(fg_pixels) == 0:
+            return bg_pixels
+
+        bg_ratio = float(getattr(self.config.preprocess, 'bg_sample_ratio', 1.0))
+        if bg_ratio <= 0:
+            return fg_pixels
+
+        max_bg = int(max(1, round(len(fg_pixels) * bg_ratio)))
+        n_bg = min(len(bg_pixels), max_bg)
+        if n_bg < len(bg_pixels):
+            sel = rng.choice(len(bg_pixels), size=n_bg, replace=False)
+            bg_pixels = bg_pixels[sel]
+
+        return np.concatenate([fg_pixels, bg_pixels], axis=0)
+
+    def _resolve_boundary_class_pair(self) -> Optional[Tuple[int, int]]:
+        """Resolve boundary-pair class ids from class names in config."""
+        pair_cfg = getattr(self.config.split, 'boundary_pair', ['PG', 'TG'])
+        if not isinstance(pair_cfg, (list, tuple)) or len(pair_cfg) != 2:
+            tprint("WARNING: split.boundary_pair must be a list of two class names; boundary boost disabled")
+            return None
+
+        targets = list(self.targets)
+        a_name = str(pair_cfg[0]).strip()
+        b_name = str(pair_cfg[1]).strip()
+        if a_name not in targets or b_name not in targets:
+            tprint(f"WARNING: boundary_pair {pair_cfg} not found in targets {targets}; boundary boost disabled")
+            return None
+
+        a_idx = int(targets.index(a_name))
+        b_idx = int(targets.index(b_name))
+        if a_idx == b_idx:
+            tprint("WARNING: boundary_pair contains duplicate classes; boundary boost disabled")
+            return None
+
+        tprint(f"  boundary hard-mining pair: {a_name}({a_idx}) <-> {b_name}({b_idx})")
+        return (a_idx, b_idx)
     
     def _per_patient_pipeline(self) -> None:
         """
@@ -529,26 +716,16 @@ class NpyHSDataset(AbstractHSDataset):
         if not pairs:
             raise RuntimeError("no data/label pairs found in " + self.data_path)
 
-        # raw:    0=bg, 1=PG, 2=FAT, 3=TG, 4=LN, 5=MS, 6=Blood, 7=Tra, 8=ES
-        # mapped: identity — all 8 tissue classes kept separate
-        # LN and Blood are spectrally distinct; merging them caused AUC<0.5
-        _label_remap = np.array([
-            0,  # 0: background -> background
-            1,  # 1: PG         -> PG    (1)
-            0,  # 2: FAT        -> FAT   (2)
-            2,  # 3: TG         -> TG    (3)
-            0,  # 4: LN         -> LN    (4)
-            0,  # 5: MS         -> MS    (5)
-            0,  # 6: Blood      -> Blood (6)
-            0,  # 7: Tra        -> Tra   (7)
-            0,  # 8: ES         -> ES    (8)
-        ], dtype=np.int32)
+        # label remapping from config (soft-coded), defaulting to identity.
+        _label_remap = self._build_label_remap()
         self._label_remap = _label_remap
 
         tprint("loading patients...")
         patient_records = []
         all_real_pixels = []
         _patient_id_map = {}
+        rng_fit = np.random.RandomState(350236)
+        boundary_pair = self._resolve_boundary_class_pair()
 
         for idx, (data_file, label_file) in enumerate(pairs):
             data = np.load(data_file).astype(np.float32)    # shape: (h_i, w_i, c)
@@ -562,21 +739,7 @@ class NpyHSDataset(AbstractHSDataset):
             if not np.isfinite(data).all():
                 raise ValueError(f"non-finite values in {data_file}")
 
-            # apply label remap — validate range then clip
-            # raw labels are 1-based: 0=bg, 1-8=classes
-            # clip to _label_remap's valid index range (0 to len-1), NOT to config.clsf.num
-            min_raw = int(labels_raw.min())
-            max_raw = int(labels_raw.max())
-            if min_raw < 0:
-                print(f"\t\tWARNING: {os.path.basename(label_file)} has negative "
-                       f"label {min_raw}, will be clipped to 0")
-            if max_raw >= len(_label_remap):
-                print(f"\t\tWARNING: {os.path.basename(label_file)} has label value "
-                       f"{max_raw} exceeding remap table max "
-                       f"{len(_label_remap)-1}, will be clipped")
-            # clipping to 7 would map ES(8) -> _label_remap[7]=Tra, silently corrupting ES labels.
-            labels_clipped = np.clip(labels_raw, 0, len(_label_remap) - 1)
-            labels = _label_remap[labels_clipped]  # shape: (h_i, w_i), now 1-based merged
+            labels = self._apply_label_remap(labels_raw, _label_remap, label_file)
 
             patient_id = self._extract_patient_id(data_file)
             if patient_id not in _patient_id_map:
@@ -585,15 +748,15 @@ class NpyHSDataset(AbstractHSDataset):
 
             patient_records.append((data, labels, pid_idx))
 
-            # collect non-bg pixels for global stats (labels > 0)
+            # collect pixels for global stats; strategy can be FG-only or FG+sampled-BG
+            fit_pixels = self._collect_pixels_for_preprocessor(data, labels, rng_fit)
+            all_real_pixels.append(fit_pixels)
             mask = labels.reshape(-1) > 0
-            real_px = data.reshape(-1, data.shape[2])[mask]
-            all_real_pixels.append(real_px)
 
             tprint(f"  loaded {idx+1}/{len(pairs)}: "
                    f"{os.path.basename(data_file)} ({patient_id}), "
                    f"shape {data.shape}, non-bg pixels: {mask.sum():,}, "
-                   f"possesses non_bg labels: {np.unique(labels)}, "
+                   f"possesses labels: {np.unique(labels)}, "
                    f"max label {labels.max()}, min label {labels.min()}"
                    )
 
@@ -661,17 +824,18 @@ class NpyHSDataset(AbstractHSDataset):
             self._patient_padded_data.append(padded_data)
             self._patient_padded_labels.append(padded_lbl)
 
-            # pre-compute PG<->TG boundary map for center-pixel hard-example mining
-            # labels are 1-based here: 1=PG, 2=TG, 3=Tra, 0=bg
-            pg_mask = (labels == 1)
-            tg_mask = (labels == 2)
+            # pre-compute boundary map for configurable class pair hard-example mining
             boundary_map = np.zeros_like(labels, dtype=bool)
-            for dr, dc in [(-1, -1), (-1, 0), (-1, 1),
-                           (0, -1),           (0, 1),
-                           (1, -1),  (1, 0),  (1, 1)]:
-                pg_nb = np.roll(pg_mask, shift=(dr, dc), axis=(0, 1))
-                tg_nb = np.roll(tg_mask, shift=(dr, dc), axis=(0, 1))
-                boundary_map |= (pg_mask & tg_nb) | (tg_mask & pg_nb)
+            if boundary_pair is not None:
+                cls_a, cls_b = boundary_pair
+                a_mask = (labels == cls_a)
+                b_mask = (labels == cls_b)
+                for dr, dc in [(-1, -1), (-1, 0), (-1, 1),
+                               (0, -1),           (0, 1),
+                               (1, -1),  (1, 0),  (1, 1)]:
+                    a_nb = np.roll(a_mask, shift=(dr, dc), axis=(0, 1))
+                    b_nb = np.roll(b_mask, shift=(dr, dc), axis=(0, 1))
+                    boundary_map |= (a_mask & b_nb) | (b_mask & a_nb)
 
             # remove wrapped edges introduced by np.roll
             boundary_map[0, :] = False

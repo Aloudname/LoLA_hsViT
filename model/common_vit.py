@@ -137,7 +137,8 @@ class CommonViT(nn.Module):
     
     def __init__(self, in_channels=None, num_classes=None, patch_size=None, dim=96, depths=[3, 4, 5],
                  num_heads=[4, 8, 16], mlp_ratio=4., drop_path_rate=0.2,
-                 window_size=None, r=None, lora_alpha=None):
+                 window_size=None, r=None, lora_alpha=None,
+                 hierarchical_head=True):
         """
         Standard, common ViT for hyperspectral image pixel-level segmentation.
         in_channel num_classes and patch_size are necessary.
@@ -164,6 +165,7 @@ class CommonViT(nn.Module):
         self.num_heads = num_heads
         self.patch_size = patch_size
         self.mode = 'segmentation'  # pixel-level only
+        self.hierarchical_head = True
         
         print(f"StandardHSITransformer initialized with {in_channels} input channels, "
               f"{num_classes} classes, depths {depths}, {patch_size} patch_size.")
@@ -258,7 +260,15 @@ class CommonViT(nn.Module):
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
         )
-        self.seg_head = nn.Conv2d(128, num_classes, kernel_size=1)
+        # Hierarchical segmentation heads:
+        # 1) fg_bg_head predicts BG/FG logits (2 channels)
+        # 2) fg_class_head predicts foreground subclass logits (num_classes - 1)
+        # Fused output remains [B, num_classes, H, W] for trainer compatibility.
+        if self.num_classes <= 1:
+            raise ValueError("CommonViT requires num_classes > 1 for two-stage segmentation supervision")
+        self.fg_bg_head = nn.Conv2d(128, 2, kernel_size=1)
+        self.fg_class_head = nn.Conv2d(128, num_classes - 1, kernel_size=1)
+        self.seg_head = None
         
         self.apply(self._init_weights)
         trunc_normal_(self.pos_embed, std=.02)
@@ -390,13 +400,25 @@ class CommonViT(nn.Module):
         x = x.permute(0, 2, 1).contiguous().view(B, -1, H_feat, W_feat)
         x = self.seg_decoder(x)
         x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
-        output = self.seg_head(x)  # [B, num_classes, H, W]
+        fg_bg_logits = self.fg_bg_head(x)          # [B, 2, H, W], [bg, fg]
+        fg_class_logits = self.fg_class_head(x)    # [B, C-1, H, W], foreground subclasses
+
+        # Use foreground logit as a shared gate for all foreground subclasses.
+        bg_logit = fg_bg_logits[:, 0:1, :, :]
+        fg_gate = fg_bg_logits[:, 1:2, :, :]
+        fg_logits = fg_class_logits + fg_gate
+        output = torch.cat([bg_logit, fg_logits], dim=1)
+        staged_output = {
+            'fused_logits': output,
+            'fg_bg_logits': fg_bg_logits,
+            'fg_class_logits': fg_class_logits,
+        }
         
         if return_cam:
             cam = self.generate_cam()
-            return output, cam
+            return staged_output, cam
         
-        return output
+        return staged_output
 
 
 class CommonViT_reduced(CommonViT):
