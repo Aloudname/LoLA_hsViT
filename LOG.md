@@ -290,6 +290,7 @@ q_c = (1 - \varepsilon) \cdot \mathbf{1}_{c=y} + \frac{\varepsilon}{C}
 $$
 
 此时损失为：
+
 $$
 \mathcal{L}_{\text{FL}}^{\text{smooth}} = - (1 - p_t)^\gamma \sum_{c=1}^C q_c \log(p_c)
 $$
@@ -310,7 +311,7 @@ $$
 
 模型输出有两个分支：
 - $\mathbf{z}_{\text{bg}}$：二分类 logits，形状为 `(N*H*W, 2)`
-- $\mathbf{z}_{\text{fg}}$：前景子类 logits，形状为 `(N*H*W, C_{\text{total}}-1)`
+- $\mathbf{z}_{\text{fg}}$：前景子类 logits，形状为 `(N*H*W, C-1)`
 
 对应于两个分支，模型输出包含两部分的损失如下。
 
