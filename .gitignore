@@ -3,6 +3,13 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Output Directory
+output/
+
+# test file
+test.ipynb
+src/quick_subset_smoke.py
+
 # C extensions
 *.so
 

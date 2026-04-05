@@ -1,5 +1,10 @@
 # 工作日志
+
+项目代码在(LoLA_hsViT)[https://github.com/Aloudname/LoLA_hsViT.git]
+以及(StreamCat)[https://github.com/Aloudname/StreamCat.git]
+
 ## 2025.12
+
 ### 12.20
 
 - 确定技术路线：
@@ -209,10 +214,12 @@ https://github.com/Aloudname/StreamCat.git
 启动效果：
 ![frontend](src/frontend.png)
 
+
 ### 3.17
 
 - 采用新标记的数据集，有五例样本的数据标签和图像尺寸不匹配，忽略处理。
-- 去除不匹配的数据后，用于构建数据集的样本共135例，来自96位受试者。
+![mismatch](src/mismatch.png)
+- 去除不匹配的数据后，用于构建数据集的样本共**135例**，来自**96位**受试者。
 - 每例样本格式为`Name_YYMMDD_Direction_Merged.mat`，储存在`bishe/mat`，含键值：
   - `img`: 原始光谱数据，`(C, H, W)` = `(276, 700, 700)`；
   - `gt_label`: 对应标签数据，`(H, W)` = `(700, 700)`。
@@ -227,6 +234,9 @@ https://github.com/Aloudname/StreamCat.git
 
 - 分别采用fisher指标统计（剩余96）、直接PCA截取（剩余48、31、15）两种手段降维，分别生成`bishe/fisher`、`bishe/pca_48`、`bishe/mat_31`、`bishe/mat_15`目录。保存格式均为numpy数组，保存名称为`Name_YYMMDD_Direction.npy`（数据文件）以及对应的`Name_YYMMDD_Direction_gt.npy`（标签文件）。
 - 另外有RGB图像`(C, H, W)` = `(3, 700, 700)`，用于对照确认图像质量。其目录为`bishe/rgb`，命名格式为`Name_YYMMDD_Direction_Merged_rgb.png`。
+- 购置RGB摄像头，用于本地测试。
+![cam1](src/purchase_cam.jpg)
+
 
 ### 3.20
 
@@ -377,3 +387,27 @@ $$
 ### 3.23
 
 - 稍微修改程序，追加对两个子损失$\mathcal{L}_{\text{bin}}$和$\mathcal{L}_{\text{cls}}$的记录和损失曲线可视化。
+
+### 3.29
+
+- 训练20轮，结果如下：
+![alt text](src/cm_329.png)
+![alt text](src/curve_329.png)
+
+```yaml
+loss:
+  Train(bgfg/fg_cls): 0.8085 / 0.0988
+  Val(bgfg/fg_cls): 0.7480 / 0.9175
+BA:
+  BA(all/fg): 25.00% / 0.00%
+split:
+  mIoU(all/fg): 21.69% / 0.00%
+  Kappa(all/fg): 0.00% / 0.00% 
+  FG(P/R/D): 0.00% / 0.00% / 0.00% 
+  FGDiag(pred/gt/prob): 0.00% / 13.24%/ 31.08% 
+total:
+  Score: 12.50%
+```
+
+分析：
+前景概率被分摊到多个子类，argmax 后大量掉到 BG；少量通过的前景像素再被子类头塌缩到 TG，几乎全预测 BG + 少量 TG。

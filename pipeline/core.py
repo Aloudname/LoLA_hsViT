@@ -201,6 +201,12 @@ class ModelFactory:
                 'r': config.lora.lora_rank,
                 'lora_alpha': config.lora.lora_alpha,
             })
+
+        # Hierarchical fusion eval gate: negative disables hard gate.
+        if name_lower.startswith('lola') or name_lower.startswith('common'):
+            base_kwargs.update({
+                'eval_fg_gate_threshold': float(getattr(config.common, 'eval_fg_gate_threshold', -1.0)),
+            })
         
         # apply overrides
         base_kwargs.update(override_kwargs)
@@ -236,8 +242,9 @@ class ModelFactory:
             'common_tiny': CommonViT_tiny,
             'common_mini': CommonViT_mini,
             'common_2layer': CommonViT_2layer,
-            'unet': Unet,
         }
+        if Unet is not None:
+            cls._registry['unet'] = Unet
 
 class TrainPipeline(BaseEstimator):
     """
@@ -319,6 +326,15 @@ class TrainPipeline(BaseEstimator):
         
         self._trainer.fit()
         raw_result = self._trainer.results_
+
+        model_path = raw_result.get('model_path', '')
+        run_output_dir = self._output_dir
+        if model_path:
+            models_dir = os.path.dirname(model_path)
+            candidate = os.path.dirname(models_dir)
+            if candidate:
+                run_output_dir = candidate
+        os.makedirs(run_output_dir, exist_ok=True)
         
         # wrap raw result into TrainResult dataclass
         self.result_ = TrainResult(
@@ -329,15 +345,15 @@ class TrainPipeline(BaseEstimator):
             best_epoch=raw_result.get('best_epoch', 0),
             training_time=raw_result.get('training_time', 0.0),
             total_epochs=epochs,
-            model_path=raw_result.get('model_path', ''),
-            output_dir=self._output_dir,
+            model_path=model_path,
+            output_dir=run_output_dir,
             train_losses=self._trainer.train_losses,
             eval_losses=self._trainer.eval_losses,
             train_accs=self._trainer.train_accs,
             eval_accs=self._trainer.eval_accs,
         )
         
-        self.result_.save(os.path.join(self._output_dir, 'result.json'))
+        self.result_.save(os.path.join(run_output_dir, 'result.json'))
         
         tprint(f"Training completed: {self.result_.summary()}")
         return self

@@ -46,12 +46,48 @@ def check_form(config: Munch = None) -> bool:
         if bg_ratio < 0:
             raise ValueError(f"preprocess.bg_sample_ratio must be >= 0, got {bg_ratio}")
 
-    if hasattr(config.split, 'boundary_pair'):
-        pair = config.split.boundary_pair
-        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-            raise ValueError(
-                f"split.boundary_pair must be a list/tuple of 2 class names, got {pair}"
-            )
+    # New split-first cache pipeline checks
+    if hasattr(config.split, 'train_ratio') and hasattr(config.split, 'val_ratio') and hasattr(config.split, 'test_ratio'):
+        tr = float(config.split.train_ratio)
+        vr = float(config.split.val_ratio)
+        ter = float(config.split.test_ratio)
+        if tr <= 0 or vr < 0 or ter < 0:
+            raise ValueError("split train/val/test ratios must satisfy train>0 and val/test>=0")
+        if tr + vr + ter <= 0:
+            raise ValueError("split train/val/test ratio sum must be > 0")
+
+    if hasattr(config.split, 'samples_per_step'):
+        sps = int(config.split.samples_per_step)
+        if sps <= 0:
+            raise ValueError("split.samples_per_step must be > 0")
+
+    if hasattr(config.split, 'max_patches_per_sample_chunk'):
+        mpsc = int(config.split.max_patches_per_sample_chunk)
+        if mpsc < 0:
+            raise ValueError("split.max_patches_per_sample_chunk must be >= 0")
+
+    if hasattr(config.split, 'target_patches_per_step'):
+        tpps = int(config.split.target_patches_per_step)
+        if tpps <= 0:
+            raise ValueError("split.target_patches_per_step must be > 0")
+
+    if hasattr(config.memory, 'cached_loader_num_workers'):
+        cwn = int(config.memory.cached_loader_num_workers)
+        if cwn < 0:
+            raise ValueError("memory.cached_loader_num_workers must be >= 0")
+
+    if hasattr(config.memory, 'cached_loader_prefetch_factor'):
+        cpf = int(config.memory.cached_loader_prefetch_factor)
+        if cpf <= 0:
+            raise ValueError("memory.cached_loader_prefetch_factor must be > 0")
+
+    if hasattr(config.memory, 'cached_loader_patch_budget_mb'):
+        cpb = int(config.memory.cached_loader_patch_budget_mb)
+        if cpb < 64:
+            raise ValueError("memory.cached_loader_patch_budget_mb must be >= 64")
+
+    if hasattr(config.preprocess, 'enable_split_cache_pipeline'):
+        _ = bool(config.preprocess.enable_split_cache_pipeline)
 
     if hasattr(config.common, 'early_stop_metric'):
         metric = str(config.common.early_stop_metric).lower()

@@ -1,4 +1,7 @@
-from model.u_net import Unet
+try:
+    from model.u_net import Unet
+except Exception:
+    Unet = None
 from model.lola_vit import (LoLA_hsViT, 
                             LoLA_hsViT_reduced, 
                             LoLA_hsViT_tiny,

@@ -3,7 +3,7 @@ common:
   dataset_name: 'placeholder'
   lr: 0.00005             # Reduced from 1e-4 to slow down early convergence
   weight_decay: 0.15      # Increased from 0.10 for stronger L2 regularization
-  eval_interval: 2        # Evaluate every x epoch
+  eval_interval: 1        # Evaluate every x epoch
   focal_gamma: 2.0        # Focal Loss focusing parameter (0 = CE, higher = more focus on hard samples)
   patience: 25            # Slightly more patience to let slower LR explore
   use_amp: true           # Enable mixed precision (will auto-disable on CPU)
@@ -16,13 +16,64 @@ common:
   grad_clip: 0.5          # mixed precision settings
   gradient_accumulation_steps: 2
   cv_folds: 1             # Default number of folds for cross-validation (0 = disabled)
-  vis_samples: 8         # Number of samples to visualize in fin eval
+  vis_samples: 8         # Number of samples to visualize in final eval
   use_hierarchical_loss: true
-  fg_loss_weight: 1.0
-  bgfg_loss_weight: 0.5
+  fg_loss_weight: 0.6
+  bgfg_loss_weight: 1.2
+  bgfg_pos_weight: 1.0
+  bgfg_hard_neg_weight: 3.0
+  bgfg_boundary_weight: 1.0
+  eval_fg_gate_threshold: -1.0  # <0 disables eval hard FG gating; >=0 applies threshold on P(FG)
+  eval_decode_fg_threshold: 0.65  # stricter FG gate to suppress massive false positives.
+  auto_calibrate_fg_threshold: false
+  calibrate_threshold_stage_c_only: true
+  fg_threshold_metric: ba_bgfg  # ba_bgfg | fg_dice
+  eval_fg_class_min_conf: 0.45  # stronger FG subclass confidence rejection.
   early_stop_metric: composite  # composite | fg | all
   metric_weight_fg: 0.5
   metric_weight_all: 0.5
+  max_train_batches_per_epoch: 320  # 0 -> full batch in a epoch
+  save_topk_models: 3
+
+  # Stage schedule and rescue policy.
+  stage_start: A
+  stage_a_min_epochs: 4
+  stage_b_min_epochs: 3
+  stage_c_min_epochs: 3
+  stage_transition_patience: 2
+  stage_metric_ema_alpha: 0.6
+  stage_eval_uncapped: true
+  stage_a_target_ba_bgfg: 60.0
+  stage_b_target_ba_fg: 70.0
+  stage_b_keep_bgfg_head: false
+  stage_b_extra_patterns:
+    - seg_decoder
+    - transformer_levels
+    - downsample_
+    - patch_embed
+    - spectral_conv
+  stage_a_ratio: 0.15
+  stage_b_ratio: 0.35
+  stage_rescue_ba_bgfg_threshold: 40.0
+  stage_rescue_epoch_limit: 3
+  bgfgsplit_num_samples: 6
+  bgfgsplit_use_ema: true
+  bgfgsplit_collect_from_eval: true
+  bgfgsplit_allow_fallback_forward: false
+  bgfgsplit_max_batches: 32  # used only when fallback_forward=true
+  bgfgsplit_collect_uncapped: false  # true -> reconstruction uses full val loader (slow but complete)
+  bgfgsplit_min_cover_ratio: 0.15
+
+  # Foreground subclass loss variants and regularizers.
+  fg_loss_type: cb_focal  # focal | cb_focal | logit_adjust
+  cb_beta: 0.999
+  logit_adjust_tau: 1.0
+  bg_suppress_weight: 0.05
+  bg_suppress_threshold: 0.2
+  boundary_loss_weight: 0.3
+  class_weight_max_sample_patches: 10000   # 0 -> counts all train patches
+  class_weight_max_sample_pixels: 5000000  # 0 -> no sampling inside patches
+  class_weight_sample_seed: 350234
 lora:
   lora_dropout: 0.2
   lora_rank: 16
@@ -30,25 +81,54 @@ lora:
   merge_lora_for_inference: false
 split:
   split_seed: 350234  # Patient-level split random seed; vary it for robust multi-seed evaluation.
-  test_rate: 0.1 # Test set ratio (held out completely from training)
-  val_rate: 0.1 # Validation set ratio (from train+val pool, used for early stopping)
+  # Split ratios for patient-level split-first pipeline.
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  # Legacy compatibility (analyzer/cv helper still reads these keys).
+  test_rate: 0.1
+  val_rate: 0.1
   n_folds: 5  # Number of folds for cross-validation (0 = disabled, use hold-out)
   batch_size: 256  # This refers to the size on a single GPU.
+  samples_per_step: 2  # Number of samples stacked per iteration; each sample contributes all its patches.
+  target_patches_per_step: 1024  # Total patch target per optimization step (global across GPUs in cached mode).
+  max_patches_per_sample_chunk: 0  # 0 => auto derive from target_patches_per_step and memory budget.
   patch_size: 31  # Pixel size of image patches.
   eval_batch_size: 256  # Smaller eval batch size for CPU training
-  pg_center_boost: 1.4  # >1 increases sampling frequency of PG-centered patches.
-  pg_tg_boundary_boost: 1.8  # >1 emphasizes PG<->TG boundary hard examples.
-  boundary_pair: ['PG', 'TG']  # Dynamic boundary hard-mining pair by class names.
+  sampler_mode: adaptive  # fixed | adaptive
+  sampler_ratio_fg: 0.16
+  sampler_ratio_boundary: 0.05
+  sampler_target_fg_ratio: 0.16
+  sampler_target_boundary_ratio: 0.05
+  sampler_adapt_momentum: 0.9
+  sampler_min_fg_ratio: 0.08
+  sampler_max_fg_ratio: 0.22
+  min_boundary_centers_per_patient: 256
+  min_fg_centers_per_patient: 3000
+  boundary_sampling_dilation: 2
 preprocess:
+  # Cache/split pipeline controls
+  enable_split_cache_pipeline: true
+  force_rebuild_split_cache: false
+  train_patch_augment: true
+  split_preprocess_workers: 4
+
+  # Train-only fitting controls
   pca_components: 48  # Number of PCA components to retain.
   fit_on_non_bg_only: false  # false => fit normalization/PCA on FG + sampled BG for better BG/FG separation.
   bg_sample_ratio: 1.0  # When fit_on_non_bg_only=false, BG samples ~= fg_count * ratio.
+  max_fit_samples: 2000000
+  max_pca_samples: 500000
 memory:
   pin_memory: true  # true is faster but may cause memoleak in distant server.
   num_workers: 4  # Workers on single GPU. More memory usage to accelerate data loading.
   parallel_gpu: 4  # Number of parallel GPU device. This influence many worker params.
   prefetch_factor: 4  # Prefetch batches to speed up training.
-  benchmark: false  # Enable DataLoader benchmark mode for fixed-size inputs.
+  cached_loader_num_workers: 4
+  cached_loader_prefetch_factor: 2
+  cached_loader_persistent_workers: true
+  cached_loader_patch_budget_mb: 512
+  benchmark: false  # Fixed input shape; enabling cuDNN benchmark improves kernel selection.
 path:
   data: /data/chenhaoran/bishe/fisher
   label: /data/chenhaoran/bishe/fisher

@@ -5,7 +5,28 @@ Standard ViT.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from timm.layers import trunc_normal_, DropPath
+from torch.nn.init import trunc_normal_
+
+
+def drop_path(x, drop_prob: float = 0.0, training: bool = False):
+    """Drop paths (Stochastic Depth) per sample."""
+    if drop_prob == 0.0 or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()
+    return x.div(keep_prob) * random_tensor
+
+
+class DropPath(nn.Module):
+    """DropPath layer compatible with timm.layers.DropPath API."""
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
 
 
 class AdaptiveSqueezeExcitation(nn.Module):
@@ -138,7 +159,8 @@ class CommonViT(nn.Module):
     def __init__(self, in_channels=None, num_classes=None, patch_size=None, dim=96, depths=[3, 4, 5],
                  num_heads=[4, 8, 16], mlp_ratio=4., drop_path_rate=0.2,
                  window_size=None, r=None, lora_alpha=None,
-                 hierarchical_head=True):
+                 hierarchical_head=True,
+                 eval_fg_gate_threshold: float = -1.0):
         """
         Standard, common ViT for hyperspectral image pixel-level segmentation.
         in_channel num_classes and patch_size are necessary.
@@ -166,6 +188,7 @@ class CommonViT(nn.Module):
         self.patch_size = patch_size
         self.mode = 'segmentation'  # pixel-level only
         self.hierarchical_head = True
+        self.eval_fg_gate_threshold = float(eval_fg_gate_threshold)
         
         print(f"StandardHSITransformer initialized with {in_channels} input channels, "
               f"{num_classes} classes, depths {depths}, {patch_size} patch_size.")
@@ -260,14 +283,19 @@ class CommonViT(nn.Module):
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
         )
-        # Hierarchical segmentation heads:
+        # 2-stage segmentation heads:
         # 1) fg_bg_head predicts BG/FG logits (2 channels)
         # 2) fg_class_head predicts foreground subclass logits (num_classes - 1)
-        # Fused output remains [B, num_classes, H, W] for trainer compatibility.
+        # Fused output remains [B, num_classes, H, W].
         if self.num_classes <= 1:
             raise ValueError("CommonViT requires num_classes > 1 for two-stage segmentation supervision")
+        
+        # 2-stage fg/bg -> cls heads.
         self.fg_bg_head = nn.Conv2d(128, 2, kernel_size=1)
         self.fg_class_head = nn.Conv2d(128, num_classes - 1, kernel_size=1)
+        self.boundary_head = nn.Conv2d(128, 1, kernel_size=1)
+        self.aux_fg_bg_head = nn.Conv2d(self.dims[-1], 2, kernel_size=1)
+        self.aux_fg_class_head = nn.Conv2d(self.dims[-1], num_classes - 1, kernel_size=1)
         self.seg_head = None
         
         self.apply(self._init_weights)
@@ -398,20 +426,33 @@ class CommonViT(nn.Module):
         H_feat, W_feat = self.final_feature_map.shape[2], self.final_feature_map.shape[3]
         # .contiguous() required to avoid CUDA misaligned address under AMP + DataParallel
         x = x.permute(0, 2, 1).contiguous().view(B, -1, H_feat, W_feat)
+        aux_fg_bg_logits = self.aux_fg_bg_head(x)
+        aux_fg_class_logits = self.aux_fg_class_head(x)
+
         x = self.seg_decoder(x)
         x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
         fg_bg_logits = self.fg_bg_head(x)          # [B, 2, H, W], [bg, fg]
         fg_class_logits = self.fg_class_head(x)    # [B, C-1, H, W], foreground subclasses
+        boundary_logits = self.boundary_head(x)    # [B, 1, H, W]
 
-        # Use foreground logit as a shared gate for all foreground subclasses.
-        bg_logit = fg_bg_logits[:, 0:1, :, :]
-        fg_gate = fg_bg_logits[:, 1:2, :, :]
-        fg_logits = fg_class_logits + fg_gate
-        output = torch.cat([bg_logit, fg_logits], dim=1)
+        # Conditional fusion: P(class)=P(FG)*P(class|FG), P(BG)=1-P(FG).
+        p_bgfg = F.softmax(fg_bg_logits, dim=1)
+        p_bg = p_bgfg[:, 0:1, :, :]
+        p_fg = p_bgfg[:, 1:2, :, :]
+        p_fg_cond = F.softmax(fg_class_logits, dim=1)
+        if (not self.training) and (self.eval_fg_gate_threshold >= 0.0):
+            fg_mask = (p_fg >= self.eval_fg_gate_threshold).float()
+            p_fg = p_fg * fg_mask
+        p_fg_cls = p_fg_cond * p_fg
+        probs = torch.cat([p_bg, p_fg_cls], dim=1)
+        output = torch.log(probs + 1e-8)
         staged_output = {
             'fused_logits': output,
             'fg_bg_logits': fg_bg_logits,
             'fg_class_logits': fg_class_logits,
+            'boundary_logits': boundary_logits,
+            'aux_fg_bg_logits': aux_fg_bg_logits,
+            'aux_fg_class_logits': aux_fg_class_logits,
         }
         
         if return_cam:

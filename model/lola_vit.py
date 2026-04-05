@@ -2,7 +2,28 @@
 import math, torch
 import torch.nn as nn
 import torch.nn.functional as F
-from timm.layers import trunc_normal_, DropPath
+from torch.nn.init import trunc_normal_
+
+
+def drop_path(x, drop_prob: float = 0.0, training: bool = False):
+    """Drop paths (Stochastic Depth) per sample."""
+    if drop_prob == 0.0 or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()
+    return x.div(keep_prob) * random_tensor
+
+
+class DropPath(nn.Module):
+    """DropPath layer compatible with timm.layers.DropPath API."""
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
 
 
 class Swish(nn.Module):
@@ -549,7 +570,8 @@ class LoLA_hsViT(nn.Module):
     def __init__(self, in_channels=None, num_classes=None, patch_size=None, dim=96, depths=[3, 4, 5],
                  num_heads=[4, 8, 16], window_size=[7, 7, 7], mlp_ratio=4.,
                  drop_path_rate=0.2, r=16, lora_alpha=32,
-                 hierarchical_head=True):
+                 hierarchical_head=True,
+                 eval_fg_gate_threshold: float = -1.0):
         """
         Args:
             ``in_channels``: Number of input channels (spectral bands).
@@ -570,6 +592,7 @@ class LoLA_hsViT(nn.Module):
         self.num_classes = num_classes
         self.mode = 'segmentation'  # pixel-level only
         self.hierarchical_head = True
+        self.eval_fg_gate_threshold = float(eval_fg_gate_threshold)
         print(f"Model initialized with {in_channels} input channels and {depths} depths.")
         
         # Block1: Spectral processing.
@@ -669,6 +692,9 @@ class LoLA_hsViT(nn.Module):
             raise ValueError("LoLA_hsViT requires num_classes > 1 for two-stage segmentation supervision")
         self.fg_bg_head = nn.Conv2d(128, 2, kernel_size=1)
         self.fg_class_head = nn.Conv2d(128, num_classes - 1, kernel_size=1)
+        self.boundary_head = nn.Conv2d(128, 1, kernel_size=1)
+        self.aux_fg_bg_head = nn.Conv2d(self.dims[-1], 2, kernel_size=1)
+        self.aux_fg_class_head = nn.Conv2d(self.dims[-1], num_classes - 1, kernel_size=1)
         self.seg_head = None
         
         # Initialize weights
@@ -844,20 +870,33 @@ class LoLA_hsViT(nn.Module):
         x = x.permute(0, 2, 1).contiguous().view(B, -1, H_feat, W_feat)
         
         # Decode & upsample to original spatial resolution
+        aux_fg_bg_logits = self.aux_fg_bg_head(x)
+        aux_fg_class_logits = self.aux_fg_class_head(x)
+
         x = self.seg_decoder(x)
         x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
         fg_bg_logits = self.fg_bg_head(x)          # [B, 2, H, W], [bg, fg]
         fg_class_logits = self.fg_class_head(x)    # [B, C-1, H, W], foreground subclasses
+        boundary_logits = self.boundary_head(x)    # [B, 1, H, W]
 
-        # Use foreground logit as a shared gate for all foreground subclasses.
-        bg_logit = fg_bg_logits[:, 0:1, :, :]
-        fg_gate = fg_bg_logits[:, 1:2, :, :]
-        fg_logits = fg_class_logits + fg_gate
-        output = torch.cat([bg_logit, fg_logits], dim=1)
+        # Conditional fusion: P(class)=P(FG)*P(class|FG), P(BG)=1-P(FG).
+        p_bgfg = F.softmax(fg_bg_logits, dim=1)
+        p_bg = p_bgfg[:, 0:1, :, :]
+        p_fg = p_bgfg[:, 1:2, :, :]
+        p_fg_cond = F.softmax(fg_class_logits, dim=1)
+        if (not self.training) and (self.eval_fg_gate_threshold >= 0.0):
+            fg_mask = (p_fg >= self.eval_fg_gate_threshold).float()
+            p_fg = p_fg * fg_mask
+        p_fg_cls = p_fg_cond * p_fg
+        probs = torch.cat([p_bg, p_fg_cls], dim=1)
+        output = torch.log(probs + 1e-8)
         staged_output = {
             'fused_logits': output,
             'fg_bg_logits': fg_bg_logits,
             'fg_class_logits': fg_class_logits,
+            'boundary_logits': boundary_logits,
+            'aux_fg_bg_logits': aux_fg_bg_logits,
+            'aux_fg_class_logits': aux_fg_class_logits,
         }
 
         if return_cam:
