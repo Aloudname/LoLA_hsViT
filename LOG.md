@@ -387,27 +387,3 @@ $$
 ### 3.23
 
 - 稍微修改程序，追加对两个子损失$\mathcal{L}_{\text{bin}}$和$\mathcal{L}_{\text{cls}}$的记录和损失曲线可视化。
-
-### 3.29
-
-- 训练20轮，结果如下：
-![alt text](src/cm_329.png)
-![alt text](src/curve_329.png)
-
-```yaml
-loss:
-  Train(bgfg/fg_cls): 0.8085 / 0.0988
-  Val(bgfg/fg_cls): 0.7480 / 0.9175
-BA:
-  BA(all/fg): 25.00% / 0.00%
-split:
-  mIoU(all/fg): 21.69% / 0.00%
-  Kappa(all/fg): 0.00% / 0.00% 
-  FG(P/R/D): 0.00% / 0.00% / 0.00% 
-  FGDiag(pred/gt/prob): 0.00% / 13.24%/ 31.08% 
-total:
-  Score: 12.50%
-```
-
-分析：
-前景概率被分摊到多个子类，argmax 后大量掉到 BG；少量通过的前景像素再被子类头塌缩到 TG，几乎全预测 BG + 少量 TG。
