@@ -91,9 +91,9 @@ def check_form(config: Munch = None) -> bool:
 
     if hasattr(config.common, 'early_stop_metric'):
         metric = str(config.common.early_stop_metric).lower()
-        if metric not in ['composite', 'fg', 'all']:
+        if metric not in ['hybrid', 'composite', 'fg', 'all']:
             raise ValueError(
-                f"common.early_stop_metric must be one of composite/fg/all, got {metric}"
+                f"common.early_stop_metric must be one of hybrid/composite/fg/all, got {metric}"
             )
 
     if hasattr(config.common, 'metric_weight_fg') and hasattr(config.common, 'metric_weight_all'):

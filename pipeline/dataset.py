@@ -1014,6 +1014,23 @@ class NpyHSDataset(AbstractHSDataset):
             boundary_map[:, 0] = False
             boundary_map[:, -1] = False
 
+            include_fg_edge_fallback = bool(
+                getattr(self.config.split, 'boundary_include_fg_edges', True)
+            )
+            if include_fg_edge_fallback:
+                fg_mask = (labels > 0)
+                fg_edge = np.zeros_like(labels, dtype=bool)
+                for dr, dc in [(-1, -1), (-1, 0), (-1, 1),
+                               (0, -1),           (0, 1),
+                               (1, -1),  (1, 0),  (1, 1)]:
+                    fg_nb = np.roll(fg_mask, shift=(dr, dc), axis=(0, 1))
+                    fg_edge |= (fg_mask != fg_nb)
+                fg_edge[0, :] = False
+                fg_edge[-1, :] = False
+                fg_edge[:, 0] = False
+                fg_edge[:, -1] = False
+                boundary_map |= fg_edge
+
             boundary_dilate = int(max(0, getattr(self.config.split, 'boundary_sampling_dilation', 0)))
             if boundary_dilate > 0 and boundary_map.any():
                 boundary_map = binary_dilation(boundary_map, iterations=boundary_dilate)
@@ -1316,6 +1333,8 @@ class NpyHSDataset(AbstractHSDataset):
             min_fg_ratio=float(getattr(self.config.split, 'sampler_min_fg_ratio', 0.12)),
             max_fg_ratio=float(getattr(self.config.split, 'sampler_max_fg_ratio', 0.28)),
             empirical_fg_ratio=empirical_fg_ratio,
+            fg_inverse_pow=float(getattr(self.config.split, 'sampler_fg_inverse_pow', 1.0)),
+            fg_min_per_class=int(getattr(self.config.split, 'sampler_fg_min_per_class', 0)),
             steps_per_epoch=steps_per_epoch,
             seed=split_seed,
         )
@@ -2456,6 +2475,8 @@ class _FixedRatioBatchSampler(Sampler[List[int]]):
                  min_fg_ratio: float = 0.12,
                  max_fg_ratio: float = 0.28,
                  empirical_fg_ratio: float = 0.18,
+                 fg_inverse_pow: float = 1.0,
+                 fg_min_per_class: int = 0,
                  steps_per_epoch: Optional[int] = None,
                  seed: int = 350234):
         self.fg_positions = np.asarray(fg_positions, dtype=np.int64)
@@ -2475,6 +2496,8 @@ class _FixedRatioBatchSampler(Sampler[List[int]]):
         self.min_fg_ratio = float(np.clip(min_fg_ratio, 0.0, 1.0))
         self.max_fg_ratio = float(np.clip(max_fg_ratio, self.min_fg_ratio, 1.0))
         self.empirical_fg_ratio = float(np.clip(empirical_fg_ratio, 0.0, 1.0))
+        self.fg_inverse_pow = float(max(0.0, fg_inverse_pow))
+        self.fg_min_per_class = int(max(0, fg_min_per_class))
         self._epoch = 0
 
         ratio_fg = float(np.clip(ratio_fg, 0.0, 1.0))
@@ -2541,13 +2564,18 @@ class _FixedRatioBatchSampler(Sampler[List[int]]):
         if not pools:
             return self._draw(self.fg_positions, n, rng)
 
-        # Rare classes get higher sampling probability with inverse-sqrt frequency.
+        # Rare classes get higher sampling probability with configurable inverse-frequency power.
         freqs = np.asarray([max(1, p.size) for p in pools], dtype=np.float64)
-        probs = 1.0 / np.sqrt(freqs)
+        probs = 1.0 / np.power(freqs, max(self.fg_inverse_pow, 1e-8))
         probs = probs / max(probs.sum(), 1e-8)
 
-        quotas = np.floor(probs * n).astype(np.int64)
-        rem = int(n - quotas.sum())
+        quotas = np.zeros(len(pools), dtype=np.int64)
+        if self.fg_min_per_class > 0:
+            base = int(min(self.fg_min_per_class, n // len(pools)))
+            if base > 0:
+                quotas += base
+
+        rem = int(max(0, n - quotas.sum()))
         if rem > 0:
             extra_ids = rng.choice(len(quotas), size=rem, replace=True, p=probs)
             for i in extra_ids:

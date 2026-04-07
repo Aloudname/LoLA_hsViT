@@ -130,6 +130,12 @@ class HierarchicalSegLoss(nn.Module):
                  logit_adjust_tau: float = 1.0,
                  bg_suppress_weight: float = 0.0,
                  bg_suppress_threshold: float = 0.2,
+                 stage_b_bgfg_anchor_weight: float = 0.0,
+                 stage_b_weak_cls_focus: float = 0.0,
+                 stage_b_weak_cls_boost_max: float = 1.8,
+                 stage_b_weak_cls_boost_momentum: float = 0.6,
+                 stage_c_boundary_boost_max: float = 2.0,
+                 stage_c_boundary_boost_min: float = 0.75,
                  gamma: float = 2.0,
                  ignore_index: int = 255,
                  label_smoothing: float = 0.0):
@@ -151,6 +157,12 @@ class HierarchicalSegLoss(nn.Module):
         self.logit_adjust_tau = float(max(0.0, logit_adjust_tau))
         self.bg_suppress_weight = float(max(0.0, bg_suppress_weight))
         self.bg_suppress_threshold = float(np.clip(bg_suppress_threshold, 0.0, 1.0))
+        self.stage_b_bgfg_anchor_weight = float(max(0.0, stage_b_bgfg_anchor_weight))
+        self.stage_b_weak_cls_focus = float(np.clip(stage_b_weak_cls_focus, 0.0, 1.0))
+        self.stage_b_weak_cls_boost_max = float(max(1.0, stage_b_weak_cls_boost_max))
+        self.stage_b_weak_cls_boost_momentum = float(np.clip(stage_b_weak_cls_boost_momentum, 0.0, 0.99))
+        self.stage_c_boundary_boost_max = float(max(1.0, stage_c_boundary_boost_max))
+        self.stage_c_boundary_boost_min = float(np.clip(stage_c_boundary_boost_min, 0.1, 1.0))
         self.ignore_index = int(ignore_index)
 
         # Foreground subclass targets are remapped from [1..C-1] -> [0..C-2].
@@ -196,12 +208,44 @@ class HierarchicalSegLoss(nn.Module):
         )
         self._eps = 1e-8
         self.active_stage = 'C'
+        self._fg_class_dynamic_boost = torch.ones(max(1, self.num_classes - 1), dtype=torch.float32)
+        self._boundary_dynamic_scale = 1.0
 
     def set_active_stage(self, stage: str) -> None:
         stage = str(stage).upper()
         if stage not in {'A', 'B', 'C'}:
             stage = 'C'
         self.active_stage = stage
+
+    def set_fg_class_recall_feedback(self, fg_class_recalls: Optional[np.ndarray],
+                                     target_min_recall: float) -> None:
+        """Update per-class weak boost based on latest foreground class recalls."""
+        if fg_class_recalls is None:
+            return
+        recalls = np.asarray(fg_class_recalls, dtype=np.float32).reshape(-1)
+        if recalls.size != max(1, self.num_classes - 1):
+            return
+        recalls = np.nan_to_num(recalls, nan=0.0, posinf=100.0, neginf=0.0)
+        target = float(max(1e-6, target_min_recall))
+        deficits = np.clip((target - recalls) / target, 0.0, 1.0)
+        raw_boost = 1.0 + deficits * (self.stage_b_weak_cls_boost_max - 1.0)
+        old = self._fg_class_dynamic_boost.detach().cpu().numpy()
+        m = self.stage_b_weak_cls_boost_momentum
+        smoothed = m * old + (1.0 - m) * raw_boost
+        self._fg_class_dynamic_boost = torch.as_tensor(smoothed, dtype=torch.float32)
+
+    def set_boundary_feedback(self, boundary_ba: float, target_ba: float) -> None:
+        """Adapt boundary loss scale for stage C according to boundary-band BA."""
+        ba = float(boundary_ba)
+        if not np.isfinite(ba):
+            return
+        target = float(max(1e-6, target_ba))
+        gap = (target - ba) / target
+        if gap >= 0.0:
+            scale = 1.0 + gap * (self.stage_c_boundary_boost_max - 1.0)
+        else:
+            scale = 1.0 + gap * (1.0 - self.stage_c_boundary_boost_min)
+        self._boundary_dynamic_scale = float(np.clip(scale, self.stage_c_boundary_boost_min, self.stage_c_boundary_boost_max))
 
     @staticmethod
     def _soft_dice_binary(prob: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -283,7 +327,27 @@ class HierarchicalSegLoss(nn.Module):
         fg_targets[valid_fg] = fg_targets[valid_fg] - 1
         fg_targets[(fg_targets == 0) & (~valid_fg)] = self.ignore_index
         fg_class_logits_adj = self._prepare_fg_logits(fg_class_logits)
+        stage = str(getattr(self, 'active_stage', 'C')).upper()
         fg_loss = self.multi_cls_loss(fg_class_logits_adj, fg_targets)
+
+        if stage == 'B' and self.stage_b_weak_cls_focus > 0.0:
+            valid_fg_mask = (fg_targets != self.ignore_index)
+            if valid_fg_mask.any():
+                ce_fg_map = F.cross_entropy(
+                    fg_class_logits_adj,
+                    fg_targets,
+                    ignore_index=self.ignore_index,
+                    reduction='none',
+                )
+                boost = self._fg_class_dynamic_boost.to(ce_fg_map.device, dtype=ce_fg_map.dtype)
+                weight_map = torch.ones_like(ce_fg_map)
+                for c in range(min(boost.numel(), max(1, self.num_classes - 1))):
+                    bc = float(boost[c].item())
+                    if bc > 1.0 + 1e-6:
+                        weight_map = torch.where(fg_targets == c, weight_map * bc, weight_map)
+                weak_ce = (ce_fg_map[valid_fg_mask] * weight_map[valid_fg_mask]).mean()
+                alpha = self.stage_b_weak_cls_focus
+                fg_loss = (1.0 - alpha) * fg_loss + alpha * weak_ce
 
         # Binary BG/FG loss with Dice + CE and hard-negative emphasis.
         bin_targets = targets.clone()
@@ -367,7 +431,10 @@ class HierarchicalSegLoss(nn.Module):
                 suppress = F.relu(bg_prob_max - self.bg_suppress_threshold)
                 bg_suppress_loss = (suppress[bg_valid] ** 2).mean()
 
-        stage = str(getattr(self, 'active_stage', 'C')).upper()
+        boundary_weight = self.boundary_weight
+        if stage == 'C':
+            boundary_weight = boundary_weight * float(self._boundary_dynamic_scale)
+
         if stage == 'A':
             total = self.bgfg_weight * bin_loss + self.aux_weight * aux_bg_loss
         elif stage == 'B':
@@ -376,13 +443,14 @@ class HierarchicalSegLoss(nn.Module):
                 + self.boundary_weight * boundary_loss
                 + self.aux_weight * aux_fg_loss
                 + self.bg_suppress_weight * bg_suppress_loss
+                + self.stage_b_bgfg_anchor_weight * bin_loss
             )
         else:
             aux_loss = 0.5 * aux_bg_loss + 0.5 * aux_fg_loss
             total = (
                 self.fg_weight * fg_loss
                 + self.bgfg_weight * bin_loss
-                + self.boundary_weight * boundary_loss
+                + boundary_weight * boundary_loss
                 + self.aux_weight * aux_loss
                 + self.bg_suppress_weight * bg_suppress_loss
             )
@@ -847,6 +915,8 @@ class hsTrainer(BaseEstimator):
                   f"test: {len(test_loader)} batches)")
         else:
             self._load_data()
+        self.stage_a_max_epochs = int(max(0, getattr(self.config.common, 'stage_a_max_epochs', 0)))
+        self.stage_b_max_epochs = int(max(0, getattr(self.config.common, 'stage_b_max_epochs', 0)))
         self._create_model()
         self._setup_multi_gpu()
         self._setup_training()
@@ -1103,6 +1173,20 @@ class hsTrainer(BaseEstimator):
     def _select_early_stop_score(self) -> float:
         """Choose scalar score for early stopping according to config."""
         metric = getattr(self, 'early_stop_metric', 'composite')
+        if metric == 'hybrid':
+            ba_bgfg = float(getattr(self, '_last_ba_bgfg', 0.0))
+            ba_fg = float(getattr(self, '_last_ba_fg', 0.0))
+            fg_min_recall = float(getattr(self, '_last_fg_min_recall', 0.0))
+            score = (
+                self.metric_weight_bgfg * ba_bgfg
+                + self.metric_weight_fg * ba_fg
+                + self.metric_weight_fg_min_recall * fg_min_recall
+            )
+            if ba_bgfg < self.hybrid_min_ba_bgfg:
+                score -= self.hybrid_low_metric_penalty
+            if fg_min_recall < self.hybrid_min_fg_recall:
+                score -= self.hybrid_low_metric_penalty
+            return float(score)
         if metric == 'fg':
             return float(getattr(self, '_last_ba_fg', 0.0))
         if metric == 'all':
@@ -1114,9 +1198,15 @@ class hsTrainer(BaseEstimator):
     def _current_stage_metric(self, stage: Optional[str] = None) -> float:
         stage = str(stage or getattr(self, 'current_stage', 'C')).upper()
         if stage == 'A':
-            return float(getattr(self, '_last_ba_bgfg', 0.0))
+            ba_bgfg = float(getattr(self, '_last_ba_bgfg', 0.0))
+            ba_boundary = float(getattr(self, '_last_ba_bgfg_boundary', ba_bgfg))
+            w = float(np.clip(getattr(self, 'stage_a_boundary_metric_weight', 0.0), 0.0, 1.0))
+            return (1.0 - w) * ba_bgfg + w * ba_boundary
         if stage == 'B':
-            return float(getattr(self, '_last_ba_fg', 0.0))
+            ba_fg = float(getattr(self, '_last_ba_fg', 0.0))
+            fg_min_recall = float(getattr(self, '_last_fg_min_recall', ba_fg))
+            w = float(np.clip(getattr(self, 'stage_b_min_recall_metric_weight', 0.0), 0.0, 1.0))
+            return (1.0 - w) * ba_fg + w * fg_min_recall
         return float(self._select_early_stop_score())
 
     def _record_stage_metric(self, metric: float) -> None:
@@ -1164,27 +1254,62 @@ class hsTrainer(BaseEstimator):
         elapsed = int(epoch + 1 - self.stage_start_epoch)
 
         if stage == 'A':
+            a_boundary = float(getattr(self, '_last_ba_bgfg_boundary', 0.0))
             cond_min_epoch = elapsed >= self.stage_a_min_epochs
-            cond_target = metric >= self.stage_a_target_ba_bgfg
-            cond_plateau = self._stage_bad_epochs >= self.stage_transition_patience
+            cond_target = (
+                metric >= self.stage_a_target_ba_bgfg
+                and a_boundary >= self.stage_a_target_ba_bgfg_boundary
+            )
+            cond_plateau = (
+                self._stage_bad_epochs >= self.stage_transition_patience
+                and a_boundary >= self.stage_a_min_boundary_ba_for_transition
+            )
             if cond_min_epoch and (cond_target or cond_plateau):
                 reason = 'reach_target' if cond_target else 'plateau'
                 self._transition_stage('B', epoch, metric, reason)
                 return
 
+            if self.stage_a_max_epochs > 0 and elapsed >= self.stage_a_max_epochs:
+                self._transition_stage('B', epoch, metric, 'max_stage_a_epochs')
+                return
+
         if stage == 'B':
+            fg_min_recall = float(getattr(self, '_last_fg_min_recall', 0.0))
             cond_min_epoch = elapsed >= self.stage_b_min_epochs
-            cond_target = metric >= self.stage_b_target_ba_fg
-            cond_plateau = self._stage_bad_epochs >= self.stage_transition_patience
+            cond_target = (
+                metric >= self.stage_b_target_ba_fg
+                and fg_min_recall >= self.stage_b_target_fg_min_recall
+            )
+            cond_plateau = (
+                self._stage_bad_epochs >= self.stage_transition_patience
+                and fg_min_recall >= self.stage_b_min_fg_recall_for_c
+            )
             if cond_min_epoch and (cond_target or cond_plateau):
                 reason = 'reach_target' if cond_target else 'plateau'
                 self._transition_stage('C', epoch, metric, reason)
                 return
 
-        if stage in {'A', 'B'}:
-            remaining_epochs = int(self.epochs - (epoch + 1))
+            remaining_epochs_b = int(self.epochs - (epoch + 1))
+            if (
+                self.stage_b_max_epochs > 0
+                and elapsed >= self.stage_b_max_epochs
+                and remaining_epochs_b >= self.stage_c_min_epochs
+            ):
+                self._transition_stage('C', epoch, metric, 'max_stage_b_epochs')
+                return
+
+        remaining_epochs = int(self.epochs - (epoch + 1))
+        if stage == 'A':
+            # Keep strict A->B->C semantics: never jump from A directly to C.
+            if remaining_epochs <= (self.stage_b_min_epochs + self.stage_c_min_epochs):
+                self._transition_stage('B', epoch, metric, 'force_stage_b_before_joint')
+                return
+
+        if stage == 'B':
             if remaining_epochs <= self.stage_c_min_epochs:
-                self._transition_stage('C', epoch, metric, 'force_joint_finetune')
+                fg_min_recall = float(getattr(self, '_last_fg_min_recall', 0.0))
+                if (fg_min_recall >= self.stage_b_force_c_min_fg_recall) or (remaining_epochs <= 1):
+                    self._transition_stage('C', epoch, metric, 'force_joint_finetune')
 
     def _parse_model_outputs(self, outputs):
         """Parse model outputs and return (fused_logits, fg_bg_logits, fg_class_logits)."""
@@ -1207,7 +1332,9 @@ class hsTrainer(BaseEstimator):
     def _decode_two_stage_predictions(fg_bg_logits: torch.Tensor,
                                       fg_class_logits: torch.Tensor,
                                       fg_threshold: float = -1.0,
-                                      fg_class_min_conf: float = -1.0) -> torch.Tensor:
+                                      fg_class_min_conf: float = -1.0,
+                                      fg_class_logit_bias: Optional[torch.Tensor] = None,
+                                      fg_class_min_conf_per_class: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Decode final class labels via two-step decision.
 
         Step 1: FG/BG from ``fg_bg_logits`` (argmax over 2 channels).
@@ -1216,9 +1343,16 @@ class hsTrainer(BaseEstimator):
         fg_bg_logits = torch.nan_to_num(fg_bg_logits, nan=0.0, posinf=50.0, neginf=-50.0)
         fg_class_logits = torch.nan_to_num(fg_class_logits, nan=0.0, posinf=50.0, neginf=-50.0)
 
+        decode_fg_logits = fg_class_logits.float()
+        if fg_class_logit_bias is not None:
+            bias = fg_class_logit_bias.to(decode_fg_logits.device, dtype=decode_fg_logits.dtype).view(1, -1, 1, 1)
+            if bias.shape[1] == decode_fg_logits.shape[1]:
+                decode_fg_logits = decode_fg_logits + bias
+
         fg_bg_pred = torch.argmax(fg_bg_logits, dim=1)
-        fg_cls_pred = torch.argmax(fg_class_logits, dim=1) + 1
-        fg_cls_conf = F.softmax(fg_class_logits.float(), dim=1).max(dim=1).values
+        fg_cls_pred = torch.argmax(decode_fg_logits, dim=1) + 1
+        fg_cls_probs = F.softmax(decode_fg_logits, dim=1)
+        fg_cls_conf = fg_cls_probs.max(dim=1).values
 
         if float(fg_threshold) >= 0.0:
             # Use FP32 softmax for stable thresholding under AMP/FP16.
@@ -1230,6 +1364,11 @@ class hsTrainer(BaseEstimator):
         pred = torch.zeros_like(fg_bg_pred, dtype=torch.long)
         if float(fg_class_min_conf) >= 0.0:
             fg_mask = fg_mask & (fg_cls_conf >= float(fg_class_min_conf))
+        if fg_class_min_conf_per_class is not None and fg_class_min_conf_per_class.numel() == fg_cls_probs.shape[1]:
+            per_class_thr = fg_class_min_conf_per_class.to(fg_cls_probs.device, dtype=fg_cls_probs.dtype)
+            pred_fg_idx = (fg_cls_pred - 1).clamp(min=0)
+            pred_fg_thr = per_class_thr[pred_fg_idx]
+            fg_mask = fg_mask & (fg_cls_conf >= pred_fg_thr)
         pred[fg_mask] = fg_cls_pred[fg_mask]
         return pred
     
@@ -1580,6 +1719,11 @@ class hsTrainer(BaseEstimator):
         self.early_stop_metric = str(getattr(self.config.common, 'early_stop_metric', 'composite')).lower()
         self.metric_weight_fg = float(getattr(self.config.common, 'metric_weight_fg', 0.5))
         self.metric_weight_all = float(getattr(self.config.common, 'metric_weight_all', 0.5))
+        self.metric_weight_bgfg = float(getattr(self.config.common, 'metric_weight_bgfg', 0.4))
+        self.metric_weight_fg_min_recall = float(getattr(self.config.common, 'metric_weight_fg_min_recall', 0.2))
+        self.hybrid_min_ba_bgfg = float(getattr(self.config.common, 'hybrid_min_ba_bgfg', 52.0))
+        self.hybrid_min_fg_recall = float(getattr(self.config.common, 'hybrid_min_fg_recall', 10.0))
+        self.hybrid_low_metric_penalty = float(getattr(self.config.common, 'hybrid_low_metric_penalty', 8.0))
         self.save_topk = int(max(1, getattr(self.config.common, 'save_topk_models', 3)))
         self.topk_models = []
 
@@ -1607,6 +1751,12 @@ class hsTrainer(BaseEstimator):
             logit_adjust_tau=float(getattr(self.config.common, 'logit_adjust_tau', 1.0)),
             bg_suppress_weight=float(getattr(self.config.common, 'bg_suppress_weight', 0.05)),
             bg_suppress_threshold=float(getattr(self.config.common, 'bg_suppress_threshold', 0.2)),
+            stage_b_bgfg_anchor_weight=float(getattr(self.config.common, 'stage_b_bgfg_anchor_weight', 0.0)),
+            stage_b_weak_cls_focus=float(getattr(self.config.common, 'stage_b_weak_cls_focus', 0.0)),
+            stage_b_weak_cls_boost_max=float(getattr(self.config.common, 'stage_b_weak_cls_boost_max', 1.8)),
+            stage_b_weak_cls_boost_momentum=float(getattr(self.config.common, 'stage_b_weak_cls_boost_momentum', 0.6)),
+            stage_c_boundary_boost_max=float(getattr(self.config.common, 'stage_c_boundary_boost_max', 2.0)),
+            stage_c_boundary_boost_min=float(getattr(self.config.common, 'stage_c_boundary_boost_min', 0.75)),
             gamma=focal_gamma,
             ignore_index=255,
             label_smoothing=getattr(self.config.common, 'label_smoothing', 0.0),
@@ -1635,6 +1785,17 @@ class hsTrainer(BaseEstimator):
         self.fg_threshold_metric = str(getattr(self.config.common, 'fg_threshold_metric', 'ba_bgfg')).lower()
         self.best_fg_threshold = 0.55 if self.eval_decode_fg_threshold < 0.0 else self.eval_decode_fg_threshold
         self.eval_fg_class_min_conf = float(getattr(self.config.common, 'eval_fg_class_min_conf', -1.0))
+        fg_bias_cfg = list(getattr(self.config.common, 'eval_fg_class_logit_bias', []))
+        fg_dim = max(0, int(self.config.clsf.num) - 1)
+        if len(fg_bias_cfg) == fg_dim and fg_dim > 0:
+            self.eval_fg_class_logit_bias = torch.as_tensor(fg_bias_cfg, dtype=torch.float32)
+        else:
+            self.eval_fg_class_logit_bias = torch.zeros(fg_dim, dtype=torch.float32)
+        fg_min_conf_pc_cfg = list(getattr(self.config.common, 'eval_fg_class_min_conf_per_class', []))
+        if len(fg_min_conf_pc_cfg) == fg_dim and fg_dim > 0:
+            self.eval_fg_class_min_conf_per_class = torch.as_tensor(fg_min_conf_pc_cfg, dtype=torch.float32)
+        else:
+            self.eval_fg_class_min_conf_per_class = torch.full((fg_dim,), -1.0, dtype=torch.float32)
         self._last_threshold_scan = []
         self.threshold_scan_history = []
         self._last_selected_fg_threshold = float(self.best_fg_threshold)
@@ -1647,6 +1808,34 @@ class hsTrainer(BaseEstimator):
         self.stage_c_min_epochs = int(getattr(self.config.common, 'stage_c_min_epochs', 3))
         self.stage_a_target_ba_bgfg = float(getattr(self.config.common, 'stage_a_target_ba_bgfg', 80.0))
         self.stage_b_target_ba_fg = float(getattr(self.config.common, 'stage_b_target_ba_fg', 70.0))
+        self.stage_a_target_ba_bgfg_boundary = float(
+            getattr(self.config.common, 'stage_a_target_ba_bgfg_boundary', 55.0)
+        )
+        self.stage_a_min_boundary_ba_for_transition = float(
+            getattr(self.config.common, 'stage_a_min_boundary_ba_for_transition', 50.0)
+        )
+        self.stage_a_boundary_metric_weight = float(
+            np.clip(getattr(self.config.common, 'stage_a_boundary_metric_weight', 0.45), 0.0, 1.0)
+        )
+        self.stage_b_target_fg_min_recall = float(
+            getattr(self.config.common, 'stage_b_target_fg_min_recall', 20.0)
+        )
+        self.stage_b_weak_cls_target_recall = float(
+            getattr(self.config.common, 'stage_b_weak_cls_target_recall', self.stage_b_target_fg_min_recall)
+        )
+        self.stage_b_min_fg_recall_for_c = float(
+            getattr(self.config.common, 'stage_b_min_fg_recall_for_c', 12.0)
+        )
+        self.stage_b_force_c_min_fg_recall = float(
+            getattr(self.config.common, 'stage_b_force_c_min_fg_recall', self.stage_b_min_fg_recall_for_c)
+        )
+        self.stage_b_min_recall_metric_weight = float(
+            np.clip(getattr(self.config.common, 'stage_b_min_recall_metric_weight', 0.35), 0.0, 1.0)
+        )
+        self.eval_boundary_band_dilation = int(max(0, getattr(self.config.common, 'eval_boundary_band_dilation', 2)))
+        self.stage_c_boundary_target_ba = float(
+            getattr(self.config.common, 'stage_c_boundary_target_ba', self.stage_a_target_ba_bgfg_boundary)
+        )
         self.stage_eval_uncapped = bool(getattr(self.config.common, 'stage_eval_uncapped', True))
         self.calibrate_threshold_stage_c_only = bool(getattr(self.config.common, 'calibrate_threshold_stage_c_only', True))
         self.stage_metric_ema_alpha = float(np.clip(getattr(self.config.common, 'stage_metric_ema_alpha', 0.6), 0.0, 0.99))
@@ -1683,6 +1872,7 @@ class hsTrainer(BaseEstimator):
         self.stage_a_epochs = self.stage_a_min_epochs
         self.stage_b_epochs = self.stage_b_min_epochs
         self.stage_c_start = min(self.epochs - 1, self.stage_a_epochs + self.stage_b_epochs)
+        self._last_fg_class_recalls = np.zeros(max(1, int(self.config.clsf.num) - 1), dtype=np.float32)
     
     def train_epoch(self, epoch: int) -> Tuple[float, float, float, float]:
         """
@@ -1904,6 +2094,10 @@ class hsTrainer(BaseEstimator):
         thr_fp = np.zeros_like(thr_grid, dtype=np.float64)
         thr_tn = np.zeros_like(thr_grid, dtype=np.float64)
         thr_fn = np.zeros_like(thr_grid, dtype=np.float64)
+        boundary_tp = 0.0
+        boundary_fp = 0.0
+        boundary_tn = 0.0
+        boundary_fn = 0.0
 
         using_val_loader = (loader is None and self.val_loader is not None) or (loader is self.val_loader)
         decode_threshold = float(self.best_fg_threshold)
@@ -1977,7 +2171,9 @@ class hsTrainer(BaseEstimator):
                 predicted = self._decode_two_stage_predictions(
                     fg_bg_logits, fg_class_logits,
                     fg_threshold=decode_threshold,
-                    fg_class_min_conf=self.eval_fg_class_min_conf)
+                    fg_class_min_conf=self.eval_fg_class_min_conf,
+                    fg_class_logit_bias=self.eval_fg_class_logit_bias,
+                    fg_class_min_conf_per_class=self.eval_fg_class_min_conf_per_class)
 
                 valid_mask = (labels != 255)
                 pred_valid = predicted[valid_mask]
@@ -1987,6 +2183,25 @@ class hsTrainer(BaseEstimator):
                     valid_pixels += v_count
                     pred_fg_pixels += int((pred_valid > 0).sum().item())
                     gt_fg_pixels += int((tgt_valid > 0).sum().item())
+
+                    # Boundary-band FG/BG quality: evaluate on a dilated GT boundary mask.
+                    boundary_mask = (HierarchicalSegLoss._build_boundary_target(labels, 255) > 0.5)
+                    if self.eval_boundary_band_dilation > 0:
+                        k = 2 * self.eval_boundary_band_dilation + 1
+                        boundary_mask = F.max_pool2d(
+                            boundary_mask.float().unsqueeze(1),
+                            kernel_size=k,
+                            stride=1,
+                            padding=self.eval_boundary_band_dilation,
+                        ).squeeze(1) > 0.5
+                    boundary_valid = boundary_mask & valid_mask
+                    if boundary_valid.any():
+                        pred_fg_b = (predicted > 0)[boundary_valid]
+                        tgt_fg_b = (labels > 0)[boundary_valid]
+                        boundary_tp += float((pred_fg_b & tgt_fg_b).sum().item())
+                        boundary_fp += float((pred_fg_b & (~tgt_fg_b)).sum().item())
+                        boundary_fn += float(((~pred_fg_b) & tgt_fg_b).sum().item())
+                        boundary_tn += float(((~pred_fg_b) & (~tgt_fg_b)).sum().item())
 
                     # Aggregate FG probabilities in FP32 to avoid FP16 overflow.
                     p_bgfg = F.softmax(fg_bg_logits.float(), dim=1)
@@ -2112,6 +2327,33 @@ class hsTrainer(BaseEstimator):
             tp_fg / max(tp_fg + fn_fg, 1.0) +
             float(cm_np[0, 0]) / max(float(cm_np[0, :].sum()), 1.0)
         ) if cm_np.shape[0] > 1 else 0.0
+        if (boundary_tp + boundary_fp + boundary_fn + boundary_tn) > 0:
+            self._last_ba_bgfg_boundary = 50.0 * (
+                boundary_tp / max(boundary_tp + boundary_fn, 1.0)
+                + boundary_tn / max(boundary_tn + boundary_fp, 1.0)
+            )
+        else:
+            self._last_ba_bgfg_boundary = float(self._last_ba_bgfg)
+
+        if cm_np.shape[0] > 1:
+            fg_rows = cm_np[1:, :]
+            fg_row_sums = fg_rows.sum(axis=1).astype(np.float64)
+            fg_diag = np.diag(cm_np)[1:].astype(np.float64)
+            fg_valid_cls = fg_row_sums > 0
+            if fg_valid_cls.any():
+                fg_recalls = np.zeros_like(fg_row_sums, dtype=np.float64)
+                fg_recalls[fg_valid_cls] = fg_diag[fg_valid_cls] / np.maximum(fg_row_sums[fg_valid_cls], 1.0)
+                self._last_fg_min_recall = float(np.min(fg_recalls[fg_valid_cls]) * 100.0)
+                self._last_fg_mean_recall = float(np.mean(fg_recalls[fg_valid_cls]) * 100.0)
+                self._last_fg_class_recalls = (fg_recalls * 100.0).astype(np.float32)
+            else:
+                self._last_fg_min_recall = 0.0
+                self._last_fg_mean_recall = 0.0
+                self._last_fg_class_recalls = np.zeros_like(fg_row_sums, dtype=np.float32)
+        else:
+            self._last_fg_min_recall = 0.0
+            self._last_fg_mean_recall = 0.0
+            self._last_fg_class_recalls = np.zeros(max(1, int(self.config.clsf.num) - 1), dtype=np.float32)
         mean_fg_prob = (100.0 * sum_fg_prob / max(valid_pixels, 1))
         if not np.isfinite(mean_fg_prob):
             tprint(f"  WARNING: non-finite mean FG prob detected ({mean_fg_prob}); clamped to 0.0")
@@ -2215,6 +2457,9 @@ class hsTrainer(BaseEstimator):
             'eval_fg_recall',
             'eval_fg_dice',
             'eval_ba_bgfg',
+            'eval_ba_bgfg_boundary',
+            'eval_fg_min_recall',
+            'eval_fg_mean_recall',
             'eval_pred_fg_ratio',
             'eval_gt_fg_ratio',
             'eval_mean_fg_prob',
@@ -2363,6 +2608,16 @@ class hsTrainer(BaseEstimator):
                             float(getattr(self, '_last_pred_fg_ratio', 0.0)),
                             float(getattr(self, '_last_gt_fg_ratio', 0.0)),
                         )
+                    if hasattr(self.criterion, 'set_fg_class_recall_feedback'):
+                        self.criterion.set_fg_class_recall_feedback(
+                            getattr(self, '_last_fg_class_recalls', None),
+                            float(getattr(self, 'stage_b_weak_cls_target_recall', self.stage_b_target_fg_min_recall)),
+                        )
+                    if hasattr(self.criterion, 'set_boundary_feedback'):
+                        self.criterion.set_boundary_feedback(
+                            float(getattr(self, '_last_ba_bgfg_boundary', 0.0)),
+                            float(getattr(self, 'stage_c_boundary_target_ba', self.stage_a_target_ba_bgfg_boundary)),
+                        )
 
                     if (epoch + 1) <= max(1, self.stage_rescue_epoch_limit):
                         ba_bgfg = float(getattr(self, '_last_ba_bgfg', 0.0))
@@ -2391,6 +2646,9 @@ class hsTrainer(BaseEstimator):
                         'eval_fg_recall': float(getattr(self, '_last_fg_recall', 0.0)),
                         'eval_fg_dice': float(getattr(self, '_last_fg_dice', 0.0)),
                         'eval_ba_bgfg': float(getattr(self, '_last_ba_bgfg', 0.0)),
+                        'eval_ba_bgfg_boundary': float(getattr(self, '_last_ba_bgfg_boundary', 0.0)),
+                        'eval_fg_min_recall': float(getattr(self, '_last_fg_min_recall', 0.0)),
+                        'eval_fg_mean_recall': float(getattr(self, '_last_fg_mean_recall', 0.0)),
                         'eval_pred_fg_ratio': float(getattr(self, '_last_pred_fg_ratio', 0.0)),
                         'eval_gt_fg_ratio': float(getattr(self, '_last_gt_fg_ratio', 0.0)),
                         'eval_mean_fg_prob': float(getattr(self, '_last_mean_fg_prob', 0.0)),
@@ -2425,6 +2683,8 @@ class hsTrainer(BaseEstimator):
                           f"{getattr(self, '_last_fg_recall', 0.0):6.2f}%/"
                           f"{getattr(self, '_last_fg_dice', 0.0):6.2f}% "
                           f"BA(bgfg): {getattr(self, '_last_ba_bgfg', 0.0):6.2f}% "
+                          f"BA(boundary): {getattr(self, '_last_ba_bgfg_boundary', 0.0):6.2f}% "
+                          f"FGminR: {getattr(self, '_last_fg_min_recall', 0.0):6.2f}% "
                           f"FGDiag(pred/gt/prob): {getattr(self, '_last_pred_fg_ratio', 0.0):6.2f}%/"
                           f"{getattr(self, '_last_gt_fg_ratio', 0.0):6.2f}%/"
                           f"{getattr(self, '_last_mean_fg_prob', 0.0):6.2f}% "
@@ -2474,6 +2734,9 @@ class hsTrainer(BaseEstimator):
                         'eval_fg_recall': None,
                         'eval_fg_dice': None,
                         'eval_ba_bgfg': None,
+                        'eval_ba_bgfg_boundary': None,
+                        'eval_fg_min_recall': None,
+                        'eval_fg_mean_recall': None,
                         'eval_pred_fg_ratio': None,
                         'eval_gt_fg_ratio': None,
                         'eval_mean_fg_prob': None,
