@@ -9,6 +9,7 @@ output/
 # test file
 test.ipynb
 src/quick_subset_smoke.py
+src/eval_decode_grid_v19.py
 
 # C extensions
 *.so

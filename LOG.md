@@ -390,36 +390,51 @@ $$
 
 ### 3.29
 
-- 训练20轮，结果如下：
-![alt text](src/cm_329.png)
-![alt text](src/curve_329.png)
-
-```yaml
-loss:
-  Train(bgfg/fg_cls): 0.8085 / 0.0988
-  Val(bgfg/fg_cls): 0.7480 / 0.9175
-BA:
-  BA(all/fg): 25.00% / 0.00%
-split:
-  mIoU(all/fg): 21.69% / 0.00%
-  Kappa(all/fg): 0.00% / 0.00% 
-  FG(P/R/D): 0.00% / 0.00% / 0.00% 
-  FGDiag(pred/gt/prob): 0.00% / 13.24%/ 31.08% 
-total:
-  Score: 12.50%
-```
-
-分析：
-
+问题：
 - 前景概率被分摊到多个子类，argmax 后大量掉到 BG；少量通过的前景像素再被子类头塌缩到 TG，几乎全预测 BG + 少量 TG。
 - 学到了一些粗先验（哪里大概率是前景/背景）；
 - 没学到稳定的边界可分特征（尤其是 BG-FG 接壤区域）。
 
 ### 4.4
 
-尝试从多个方面进行改进：
+修改：
 
 - 将两阶段优化任务彻底分开，由BG/FG分类基础上再进行互分；
-- 整个训练流程分为三个阶段：
-![stagesABC](src/stages.png)
-![curves](src/ABCcurves.png)
+- 整个训练流程分为三个阶段。
+- 训练20轮，结果如下：
+
+![alt text](src/cm_329.png)
+![alt text](src/roc_329.png)
+![alt text](src/curve_329.png)
+
+```yaml
+    epochs: 14,
+    train:
+      loss:
+        "train_loss": 0.7416311695568287,
+        "train_bgfg_loss": 0.4556088080844404,
+        "train_fg_class_loss": 0.06288923298783392,
+    acc:
+      "train_acc": 78.88414466084215,
+    eval:
+      loss:
+        "eval_loss": 1.5649140810562392,
+        "eval_bgfg_loss": 0.7640661486124588,
+        "eval_fg_class_loss": 0.5860716228262853,
+      "eval_score": 19.328789044322043,
+    split:
+      BA:
+        "eval_ba_all": 27.680634154556426,
+        "eval_ba_fg": 6.147195198818941,
+      Kappa:
+        "eval_kappa_all": 6.943275090252492,
+        "eval_kappa_fg": 6.943275090252492,
+      mIoU:
+        "eval_miou_all": 19.64750871318614,
+        "eval_miou_fg": 4.243431483121236,
+      Dice:
+        "eval_fg_dice": 22.65812596601559,
+        "eval_ba_bgfg": 53.57514224788484,
+```
+
+### 4.7
