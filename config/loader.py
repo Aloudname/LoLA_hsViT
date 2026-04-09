@@ -17,7 +17,7 @@ def load_config(yaml_file='config/config.yaml'):
 def check_form(config: Munch = None) -> bool:
     # Add any necessary checks for the config here
     for key in config.keys():
-        if key not in ['dataset_name', 'common', 'lora', 'split', 'preprocess', 'memory', 'path', 'key', 'clsf']:
+        if key not in ['dataset_name', 'common', 'lora', 'split', 'preprocess', 'memory', 'path', 'key', 'clsf', 'rgb']:
             raise ValueError(f"Unexpected key '{key}' found in config")
         
     for key in config.keys():
@@ -101,6 +101,25 @@ def check_form(config: Munch = None) -> bool:
         w_all = float(config.common.metric_weight_all)
         if w_fg < 0 or w_all < 0:
             raise ValueError("common.metric_weight_fg and metric_weight_all must be >= 0")
+
+    if hasattr(config, 'rgb') and config.rgb is not None:
+        rgb = config.rgb
+        if hasattr(rgb, 'split'):
+            rgb_split = rgb.split
+            if hasattr(rgb_split, 'patch_size'):
+                if int(rgb_split.patch_size) % 2 == 0:
+                    raise ValueError(f"rgb.split.patch_size must be odd, got {rgb_split.patch_size}")
+            for key in ['train_ratio', 'val_ratio', 'test_ratio']:
+                if hasattr(rgb_split, key) and float(getattr(rgb_split, key)) < 0:
+                    raise ValueError(f"rgb.split.{key} must be >= 0")
+
+        if hasattr(rgb, 'preprocess') and hasattr(rgb.preprocess, 'in_channels'):
+            if int(rgb.preprocess.in_channels) <= 0:
+                raise ValueError("rgb.preprocess.in_channels must be > 0")
+
+        if hasattr(rgb, 'path'):
+            if not hasattr(rgb.path, 'data') or not hasattr(rgb.path, 'label'):
+                raise ValueError("rgb.path must define both data and label")
     return True
     # Add more checks as needed
 

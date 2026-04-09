@@ -161,6 +161,25 @@ path:
   data: /data/chenhaoran/bishe/fisher
   label: /data/chenhaoran/bishe/fisher
   output: /home/chenhaoran/LoLA_hsViT/output
+
+rgb:
+  path:
+    data: /data/chenhaoran/bishe/rgb
+    label: /data/chenhaoran/bishe/fisher
+  preprocess:
+    in_channels: 3
+  split:
+    split_seed: 350234
+    train_ratio: 0.8
+    val_ratio: 0.1
+    test_ratio: 0.1
+    test_rate: 0.1
+    val_rate: 0.1
+    n_folds: 5
+    patch_size: 31
+    batch_size: 256
+    eval_batch_size: 256
+    boundary_sampling_dilation: 1
 # hereby only declares front targets, except BG.
 clsf:
   num: 3

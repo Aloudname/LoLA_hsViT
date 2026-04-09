@@ -4254,10 +4254,12 @@ class hsTrainer(BaseEstimator):
 
         # Save as ONNX
         onnx_path = os.path.join(self.output, 'models', f'{self.model_name}_best.onnx')
+        input_channels = int(getattr(raw_model, 'in_channels', self.config.preprocess.pca_components))
+        input_patch = int(getattr(raw_model, 'patch_size', self.config.split.patch_size))
         dummy_input = torch.randn(
-            1, self.config.preprocess.pca_components,
-            self.config.split.patch_size,
-            self.config.split.patch_size
+            1, input_channels,
+            input_patch,
+            input_patch
         ).to(self.device)
 
         raw_model.eval()

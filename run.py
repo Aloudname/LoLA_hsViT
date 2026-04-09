@@ -37,7 +37,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import load_config
-from pipeline import (NpyHSDataset, TrainPipeline, ModelFactory,
+from pipeline import (NpyHSDataset, RGBDataset, TrainPipeline, ModelFactory,
                        TrainResult, CVResult, tprint, analyze_dataset)
 
 
@@ -48,7 +48,7 @@ def parse_args():
         epilog=__doc__)
 
     parser.add_argument('--model', '-m', nargs='+', type=str, default=['lola'],
-                        help='Model family: lola, common, unet. '
+                        help='Model family: lola, common, rgb, unet. '
                              'Multiple values run sequentially.')
     parser.add_argument('--tag', '-t', nargs='+', type=str, default=['full'],
                         help='Architecture variant tag: full, reduced, tiny, mini, 2layer. '
@@ -93,6 +93,38 @@ def _build_run_queue(models, tags):
             display_name = registry_key
             queue.append((registry_key, display_name))
     return queue
+
+
+def _is_rgb_model_name(name: str) -> bool:
+    n = str(name).strip().lower()
+    return n == 'rgb' or n.startswith('rgb_')
+
+
+def _apply_rgb_profile(config):
+    """Map rgb sub-config into shared keys consumed by trainer/model factory."""
+    if not hasattr(config, 'rgb') or config.rgb is None:
+        raise ValueError("config.yaml missing 'rgb' section required for -m rgb")
+
+    run_cfg = copy.deepcopy(config)
+    rgb_cfg = run_cfg.rgb
+
+    if hasattr(rgb_cfg, 'path'):
+        run_cfg.path.data = rgb_cfg.path.data
+        run_cfg.path.label = rgb_cfg.path.label
+
+    if hasattr(rgb_cfg, 'split'):
+        for k, v in rgb_cfg.split.items():
+            run_cfg.split[k] = v
+
+    if hasattr(rgb_cfg, 'preprocess') and hasattr(rgb_cfg.preprocess, 'in_channels'):
+        run_cfg.preprocess.pca_components = int(rgb_cfg.preprocess.in_channels)
+
+    # Cached split pipeline is specific to hyperspectral npy flow.
+    run_cfg.preprocess.enable_split_cache_pipeline = False
+    run_cfg.preprocess.force_rebuild_split_cache = False
+    run_cfg.common.dataset_name = 'rgb'
+
+    return run_cfg
 
 
 def train_single_model(config, dataset, model_name: str,
@@ -149,8 +181,19 @@ def main():
     tprint("Loading configuration...")
     config = load_config()
 
-    tprint("Loading dataset...")
-    dataset = NpyHSDataset(config)
+    model_flags = [str(m).strip().lower() for m in args.model]
+    has_rgb = any(_is_rgb_model_name(m) for m in model_flags)
+    has_non_rgb = any(not _is_rgb_model_name(m) for m in model_flags)
+    if has_rgb and has_non_rgb:
+        raise ValueError("Do not mix RGB and hyperspectral models in one run. Use separate commands.")
+
+    if has_rgb:
+        config = _apply_rgb_profile(config)
+        tprint("Loading RGB dataset...")
+        dataset = RGBDataset(config)
+    else:
+        tprint("Loading hyperspectral dataset...")
+        dataset = NpyHSDataset(config)
     tprint(f"Dataset loaded: {len(dataset)} patches")
 
     # dataset analysis mode

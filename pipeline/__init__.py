@@ -1,5 +1,5 @@
 from pipeline.dataset import (AbstractHSDataset,
-                              MatHSDataset, NpyHSDataset,
+                              MatHSDataset, NpyHSDataset, RGBDataset,
                               HSPreprocessor)
 from pipeline.trainer import hsTrainer
 from pipeline.monitor import (monitor, tprint, _managed_pool)
@@ -19,6 +19,7 @@ __all__ = [
     'AbstractHSDataset',
     'MatHSDataset', 
     'NpyHSDataset',
+    'RGBDataset',
     'HSPreprocessor',
     
     'hsTrainer',

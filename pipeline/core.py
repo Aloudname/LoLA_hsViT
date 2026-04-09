@@ -187,13 +187,23 @@ class ModelFactory:
                            f"Available: {available}")
         
         model_class = cls._registry[name_lower]
-        
-        # default params from config
-        base_kwargs = {
-            'in_channels': config.preprocess.pca_components,
-            'num_classes': config.clsf.num,
-            'patch_size': config.split.patch_size,
-        }
+
+        # Default params from config.
+        if name_lower.startswith('rgb'):
+            rgb_cfg = getattr(config, 'rgb', Munch())
+            rgb_pre = getattr(rgb_cfg, 'preprocess', Munch())
+            rgb_split = getattr(rgb_cfg, 'split', Munch())
+            base_kwargs = {
+                'in_channels': int(getattr(rgb_pre, 'in_channels', 3)),
+                'num_classes': config.clsf.num,
+                'patch_size': int(getattr(rgb_split, 'patch_size', config.split.patch_size)),
+            }
+        else:
+            base_kwargs = {
+                'in_channels': config.preprocess.pca_components,
+                'num_classes': config.clsf.num,
+                'patch_size': config.split.patch_size,
+            }
         
         # LoRA params for lola variants
         if name_lower.startswith('lola'):
@@ -203,7 +213,7 @@ class ModelFactory:
             })
 
         # Hierarchical fusion eval gate: negative disables hard gate.
-        if name_lower.startswith('lola') or name_lower.startswith('common'):
+        if name_lower.startswith('lola') or name_lower.startswith('common') or name_lower.startswith('rgb'):
             base_kwargs.update({
                 'eval_fg_gate_threshold': float(getattr(config.common, 'eval_fg_gate_threshold', -1.0)),
             })
@@ -230,7 +240,9 @@ class ModelFactory:
                            LoLA_hsViT_reduced, LoLA_hsViT_tiny,
                            LoLA_hsViT_mini, LoLA_hsViT_2layer,
                            CommonViT_reduced, CommonViT_tiny,
-                           CommonViT_mini, CommonViT_2layer)
+                           CommonViT_mini, CommonViT_2layer,
+                           RGBViT, RGBViT_reduced, RGBViT_tiny,
+                           RGBViT_mini, RGBViT_2layer)
         cls._registry = {
             'lola': LoLA_hsViT,
             'lola_reduced': LoLA_hsViT_reduced,
@@ -242,6 +254,11 @@ class ModelFactory:
             'common_tiny': CommonViT_tiny,
             'common_mini': CommonViT_mini,
             'common_2layer': CommonViT_2layer,
+            'rgb': RGBViT,
+            'rgb_reduced': RGBViT_reduced,
+            'rgb_tiny': RGBViT_tiny,
+            'rgb_mini': RGBViT_mini,
+            'rgb_2layer': RGBViT_2layer,
         }
         if Unet is not None:
             cls._registry['unet'] = Unet

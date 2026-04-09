@@ -2,7 +2,7 @@
 # todo:
 # - Implement class distribution analysis and visualization methods.
 # - Try various seeds for a balanced label distribution in line 542 create_dataloader.
-import os, re, time, json, hashlib, torch, numpy as np, warnings
+import os, re, time, json, hashlib, cv2, torch, numpy as np, warnings
 from contextlib import contextmanager
 from scipy.ndimage import binary_dilation
 from concurrent.futures import ThreadPoolExecutor
@@ -2283,6 +2283,476 @@ def _concat_sample_patch_batches(batch):
     labels = [x[1] for x in batch]
     chunk_meta = [x[2] for x in batch]
     return torch.cat(patches, dim=0).float(), torch.cat(labels, dim=0).long(), chunk_meta
+
+
+class RGBDataset(AbstractHSDataset):
+    """Patch-wise RGB segmentation dataset compatible with current training pipeline."""
+
+    def __init__(self,
+                 config: Munch = None,
+                 transform: Optional[Any] = None,
+                 limit_pairs: Optional[int] = None,
+                 max_patches_per_patient: Optional[int] = None,
+                 **kwargs: Any) -> None:
+        Dataset.__init__(self)
+
+        _ensure_background_class(config)
+        self.config = config
+        self.data_path = config.path.data
+        self.label_path = config.path.label
+        self.num = config.clsf.num
+        self.targets = config.clsf.targets
+        self.patch_size = config.split.patch_size
+        self.margin = (self.patch_size - 1) // 2
+        self.transform = transform
+        self.kwargs = kwargs
+        self.test_rate = config.split.test_rate
+
+        self.limit_pairs = limit_pairs
+        self.max_patches_per_patient = max_patches_per_patient
+        self._label_remap: Optional[np.ndarray] = None
+
+        self._num_patients = 0
+        self._patient_names: Dict[int, str] = {}
+        self.patch_pg_tg_boundary: Optional[np.ndarray] = None
+        self.patch_fg_roi_mask: Optional[np.ndarray] = None
+
+        self._build_rgb_pipeline()
+
+    @staticmethod
+    def _extract_patient_id(filepath: str) -> str:
+        basename = os.path.basename(filepath)
+        match = re.match(r'^(.+?)_(\d{8})_', basename)
+        if match:
+            return match.group(1).lower()
+        return os.path.splitext(basename)[0].lower()
+
+    @staticmethod
+    def _base_name_from_rgb_file(filename: str) -> str:
+        if filename.endswith('_Merged_rgb.png'):
+            return filename[:-len('_Merged_rgb.png')]
+        stem = os.path.splitext(filename)[0]
+        if stem.endswith('_rgb'):
+            return stem[:-len('_rgb')]
+        return stem
+
+    def _pair_data_and_labels_(self) -> List[Tuple[str, str]]:
+        data_files = sorted([f for f in os.listdir(self.data_path) if f.lower().endswith('.png')])
+        label_files = sorted([f for f in os.listdir(self.label_path) if f.lower().endswith('_gt.npy')])
+        label_set = set(label_files)
+
+        pairs: List[Tuple[str, str]] = []
+        for data_file in data_files:
+            base = self._base_name_from_rgb_file(data_file)
+            label_file = f"{base}_gt.npy"
+            if label_file in label_set:
+                pairs.append((
+                    os.path.join(self.data_path, data_file),
+                    os.path.join(self.label_path, label_file),
+                ))
+        return pairs
+
+    def _build_label_remap(self) -> np.ndarray:
+        remap_cfg = getattr(self.config.clsf, 'label_remap', None)
+        if remap_cfg is None:
+            return np.arange(max(int(self.num), 1), dtype=np.int32)
+
+        if isinstance(remap_cfg, (dict, Munch)):
+            remap_items = dict(remap_cfg)
+            if not remap_items:
+                raise ValueError('clsf.label_remap cannot be an empty dict')
+            normalized: Dict[int, int] = {}
+            for raw_k, mapped_v in remap_items.items():
+                normalized[int(raw_k)] = int(mapped_v)
+            max_key = max(normalized.keys())
+            remap = np.zeros(max_key + 1, dtype=np.int32)
+            for k, v in normalized.items():
+                if k < 0 or v < 0:
+                    raise ValueError(f'Invalid label remap entry: {k}->{v}')
+                remap[k] = v
+        else:
+            remap = np.asarray(remap_cfg, dtype=np.int32).reshape(-1)
+            if remap.size == 0:
+                raise ValueError('clsf.label_remap cannot be empty')
+            if np.any(remap < 0):
+                raise ValueError('clsf.label_remap values must be non-negative')
+
+        if np.max(remap) >= self.num:
+            raise ValueError(f"clsf.label_remap contains mapped label >= clsf.num ({self.num})")
+        return remap.astype(np.int32, copy=False)
+
+    def _apply_label_remap(self, labels_raw: np.ndarray,
+                           remap: np.ndarray,
+                           label_file: str) -> np.ndarray:
+        if labels_raw.ndim == 3 and labels_raw.shape[-1] == 1:
+            labels_raw = labels_raw[..., 0]
+        if labels_raw.ndim != 2:
+            raise ValueError(f'label map must be 2D, got {labels_raw.shape} from {label_file}')
+
+        strict_remap = bool(getattr(self.config.clsf, 'strict_label_remap', True))
+        unknown_policy = str(getattr(self.config.clsf, 'unknown_label_policy', 'error')).strip().lower()
+        if unknown_policy not in {'error', 'map_to_bg'}:
+            raise ValueError("clsf.unknown_label_policy must be 'error' or 'map_to_bg'")
+
+        if int(labels_raw.min()) < 0:
+            raise ValueError(f"{os.path.basename(label_file)} has negative labels")
+
+        unknown_mask = labels_raw >= len(remap)
+        unknown_count = int(unknown_mask.sum())
+        if unknown_count > 0 and (strict_remap or unknown_policy == 'error'):
+            unknown_values = np.unique(labels_raw[unknown_mask])[:10].tolist()
+            raise ValueError(
+                f"{os.path.basename(label_file)} has unknown labels {unknown_values}, remap_max={len(remap)-1}"
+            )
+
+        labels_clipped = np.clip(labels_raw, 0, len(remap) - 1)
+        labels = remap[labels_clipped]
+        if unknown_count > 0 and unknown_policy == 'map_to_bg':
+            labels[unknown_mask] = 0
+        return labels.astype(np.int32, copy=False)
+
+    @staticmethod
+    def _build_boundary_map(labels: np.ndarray) -> np.ndarray:
+        edge = np.zeros_like(labels, dtype=np.bool_)
+        edge[:, 1:] |= (labels[:, 1:] != labels[:, :-1])
+        edge[1:, :] |= (labels[1:, :] != labels[:-1, :])
+        return edge
+
+    def _cap_patient_centers(self,
+                             rows: np.ndarray,
+                             cols: np.ndarray,
+                             rng: np.random.RandomState) -> Tuple[np.ndarray, np.ndarray]:
+        if self.max_patches_per_patient is None:
+            return rows, cols
+        cap = int(self.max_patches_per_patient)
+        n = int(rows.size)
+        if cap <= 0 or n <= cap:
+            return rows, cols
+        sel = rng.choice(n, size=cap, replace=False)
+        return rows[sel], cols[sel]
+
+    def _build_rgb_pipeline(self) -> None:
+        pairs = self._pair_data_and_labels_()
+        if self.limit_pairs is not None:
+            pairs = pairs[: self.limit_pairs]
+        if not pairs:
+            raise RuntimeError(
+                f'No RGB/mask pairs found. data={self.data_path}, label={self.label_path}'
+            )
+
+        self._label_remap = self._build_label_remap()
+
+        rng = np.random.RandomState(int(getattr(self.config.split, 'split_seed', 350234)))
+        self._patient_padded_data = []
+        self._patient_padded_labels = []
+        patient_map: Dict[str, int] = {}
+
+        all_patch_indices = []
+        all_patch_labels = []
+        all_patient_groups = []
+        all_boundary_flags = []
+        all_fg_roi_flags = []
+
+        for data_file, label_file in pairs:
+            img_bgr = cv2.imread(data_file, cv2.IMREAD_COLOR)
+            if img_bgr is None:
+                raise ValueError(f'Cannot read RGB image: {data_file}')
+            img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+
+            labels_raw = np.load(label_file).astype(np.int32)
+            labels = self._apply_label_remap(labels_raw, self._label_remap, label_file)
+            if img.shape[:2] != labels.shape[:2]:
+                raise ValueError(
+                    f'Spatial mismatch for {os.path.basename(data_file)}: '
+                    f'img={img.shape[:2]} vs label={labels.shape[:2]}'
+                )
+
+            patient_id = self._extract_patient_id(data_file)
+            if patient_id not in patient_map:
+                patient_map[patient_id] = len(patient_map)
+            pid = patient_map[patient_id]
+
+            padded_data = self._pad_with_zeros(img, self.margin)
+            padded_labels = np.full(
+                (labels.shape[0] + 2 * self.margin, labels.shape[1] + 2 * self.margin),
+                fill_value=255,
+                dtype=np.int32,
+            )
+            padded_labels[
+                self.margin:self.margin + labels.shape[0],
+                self.margin:self.margin + labels.shape[1],
+            ] = labels
+
+            self._patient_padded_data.append(padded_data)
+            self._patient_padded_labels.append(padded_labels)
+
+            rows, cols = np.indices(labels.shape)
+            rows = rows.reshape(-1)
+            cols = cols.reshape(-1)
+            rows, cols = self._cap_patient_centers(rows, cols, rng)
+
+            boundary_map = self._build_boundary_map(labels)
+            fg_map = labels > 0
+            dilation = int(max(0, getattr(self.config.split, 'boundary_sampling_dilation', 1)))
+            fg_roi = binary_dilation(fg_map, iterations=dilation) if dilation > 0 else fg_map
+
+            centers = np.stack([rows + self.margin, cols + self.margin], axis=1).astype(np.int32)
+            patch_indices = np.concatenate([
+                np.full((centers.shape[0], 1), pid, dtype=np.int32),
+                centers,
+            ], axis=1)
+
+            all_patch_indices.append(patch_indices)
+            all_patch_labels.append(labels[rows, cols].astype(np.int32))
+            all_patient_groups.append(np.full(rows.shape[0], pid, dtype=np.int32))
+            all_boundary_flags.append(boundary_map[rows, cols].astype(np.bool_))
+            all_fg_roi_flags.append(fg_roi[rows, cols].astype(np.bool_))
+
+        self.patch_indices = np.concatenate(all_patch_indices, axis=0)
+        self.patch_labels = np.concatenate(all_patch_labels, axis=0)
+        self.patch_patient_groups = np.concatenate(all_patient_groups, axis=0)
+        self.patch_pg_tg_boundary = np.concatenate(all_boundary_flags, axis=0)
+        self.patch_fg_roi_mask = np.concatenate(all_fg_roi_flags, axis=0)
+
+        self._patient_names = {v: k for k, v in patient_map.items()}
+        self._num_patients = len(self._patient_names)
+        tprint(
+            f"RGBDataset loaded {len(pairs)} pairs, {self._num_patients} patients, "
+            f"{len(self.patch_indices):,} patches"
+        )
+
+    def _get_patch_(self, idx: int) -> np.ndarray:
+        p, r, c = self.patch_indices[idx]
+        padded = self._patient_padded_data[p]
+        return padded[
+            r - self.margin:r + self.margin + 1,
+            c - self.margin:c + self.margin + 1,
+            :
+        ].copy()
+
+    def _get_label_patch_(self, idx: int) -> np.ndarray:
+        p, r, c = self.patch_indices[idx]
+        padded = self._patient_padded_labels[p]
+        return padded[
+            r - self.margin:r + self.margin + 1,
+            c - self.margin:c + self.margin + 1,
+        ].copy()
+
+    def _load_data(self) -> None:
+        pass
+
+    def _preprocess_data(self) -> None:
+        pass
+
+    def _patient_level_split(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        total_indices = np.arange(len(self.patch_indices), dtype=np.int64)
+        patient_ids = np.unique(self.patch_patient_groups)
+        split_seed = int(getattr(self.config.split, 'split_seed', 350234))
+
+        if patient_ids.size < 3:
+            train_idx, test_idx = train_test_split(
+                total_indices,
+                test_size=float(getattr(self.config.split, 'test_rate', 0.1)),
+                random_state=split_seed,
+                stratify=self.patch_labels,
+            )
+            train_idx, val_idx = train_test_split(
+                train_idx,
+                test_size=float(getattr(self.config.split, 'val_rate', 0.1)),
+                random_state=split_seed,
+                stratify=self.patch_labels[train_idx],
+            )
+            return train_idx, val_idx, test_idx
+
+        train_ratio = float(getattr(self.config.split, 'train_ratio', 0.8))
+        val_ratio = float(getattr(self.config.split, 'val_ratio', 0.1))
+        test_ratio = float(getattr(self.config.split, 'test_ratio', 0.1))
+        ratio_sum = max(train_ratio + val_ratio + test_ratio, 1e-8)
+        train_ratio /= ratio_sum
+        val_ratio /= ratio_sum
+        test_ratio /= ratio_sum
+
+        fg_ratio = []
+        for pid in patient_ids:
+            m = self.patch_patient_groups == pid
+            fg_ratio.append(float((self.patch_labels[m] > 0).mean()))
+        fg_ratio = np.asarray(fg_ratio, dtype=np.float64)
+
+        strata = None
+        if patient_ids.size >= 6:
+            bins = np.quantile(fg_ratio, [0.33, 0.66])
+            if np.unique(bins).size > 0:
+                strata = np.digitize(fg_ratio, bins, right=False)
+
+        try:
+            trainval_patients, test_patients = train_test_split(
+                patient_ids,
+                test_size=test_ratio,
+                random_state=split_seed,
+                stratify=strata,
+            )
+        except Exception:
+            trainval_patients, test_patients = train_test_split(
+                patient_ids,
+                test_size=test_ratio,
+                random_state=split_seed,
+                stratify=None,
+            )
+
+        if len(trainval_patients) < 2:
+            trainval_patients = patient_ids
+            test_patients = np.asarray([], dtype=patient_ids.dtype)
+
+        val_rel = val_ratio / max(train_ratio + val_ratio, 1e-8)
+        val_rel = float(np.clip(val_rel, 0.05, 0.5))
+        try:
+            train_patients, val_patients = train_test_split(
+                trainval_patients,
+                test_size=val_rel,
+                random_state=split_seed,
+                stratify=None,
+            )
+        except Exception:
+            train_patients = trainval_patients
+            val_patients = np.asarray([], dtype=patient_ids.dtype)
+
+        train_idx = total_indices[np.isin(self.patch_patient_groups, train_patients)]
+        val_idx = total_indices[np.isin(self.patch_patient_groups, val_patients)]
+        test_idx = total_indices[np.isin(self.patch_patient_groups, test_patients)]
+
+        if val_idx.size == 0 and train_idx.size > 2:
+            train_idx, val_idx = train_test_split(
+                train_idx,
+                test_size=min(0.15, max(0.05, val_ratio)),
+                random_state=split_seed,
+                stratify=self.patch_labels[train_idx],
+            )
+        if test_idx.size == 0 and train_idx.size > 2:
+            train_idx, test_idx = train_test_split(
+                train_idx,
+                test_size=min(0.15, max(0.05, test_ratio)),
+                random_state=split_seed,
+                stratify=self.patch_labels[train_idx],
+            )
+
+        return train_idx, val_idx, test_idx
+
+    def _create_data_loader_(self, num_workers=4, batch_size=None, pin_memory=True,
+                             prefetch_factor=2, persistent_workers=False):
+        train_idx, val_idx, test_idx = self._patient_level_split()
+
+        train_subset = _AugmentedSubset(
+            self,
+            train_idx,
+            noise_std=0.01,
+            band_drop_rate=0.0,
+            cutout_ratio=0.10,
+            minority_blend_prob=0.10,
+        )
+        val_subset = _IndexedSubset(self, val_idx)
+        test_subset = _IndexedSubset(self, test_idx)
+
+        if batch_size is None:
+            batch_size = int(getattr(self.config.split, 'batch_size', 64))
+        actual_pin_memory = pin_memory and torch.cuda.is_available()
+
+        train_loader = torch.utils.data.DataLoader(
+            train_subset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=actual_pin_memory,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=persistent_workers and (num_workers > 0),
+            drop_last=True,
+        )
+        val_loader = torch.utils.data.DataLoader(
+            val_subset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=actual_pin_memory,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=persistent_workers and (num_workers > 0),
+            drop_last=False,
+        )
+        test_loader = torch.utils.data.DataLoader(
+            test_subset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=actual_pin_memory,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=persistent_workers and (num_workers > 0),
+            drop_last=False,
+        )
+
+        print(f"RGB train/val/test samples: {len(train_idx)}/{len(val_idx)}/{len(test_idx)}")
+        print(f"RGB class distribution(train): {np.bincount(self.patch_labels[train_idx], minlength=self.num)}")
+        return train_loader, val_loader, test_loader
+
+    def _create_cv_data_loaders_(self, n_folds=5, num_workers=4, batch_size=None,
+                                 pin_memory=True, prefetch_factor=2,
+                                 persistent_workers=False):
+        total_indices = np.arange(len(self.patch_indices))
+        split_seed = int(getattr(self.config.split, 'split_seed', 350234))
+        sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=split_seed)
+
+        if batch_size is None:
+            batch_size = int(getattr(self.config.split, 'batch_size', 64))
+        actual_pin_memory = pin_memory and torch.cuda.is_available()
+
+        fold_loaders = []
+        for train_idx, test_idx in sgkf.split(total_indices, self.patch_labels, groups=self.patch_patient_groups):
+            train_subset = _AugmentedSubset(
+                self,
+                train_idx,
+                noise_std=0.01,
+                band_drop_rate=0.0,
+                cutout_ratio=0.10,
+                minority_blend_prob=0.10,
+            )
+            test_subset = _IndexedSubset(self, test_idx)
+
+            train_loader = torch.utils.data.DataLoader(
+                train_subset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=num_workers,
+                pin_memory=actual_pin_memory,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                persistent_workers=persistent_workers and (num_workers > 0),
+                drop_last=True,
+            )
+            test_loader = torch.utils.data.DataLoader(
+                test_subset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=actual_pin_memory,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                persistent_workers=persistent_workers and (num_workers > 0),
+                drop_last=False,
+            )
+            fold_loaders.append((train_loader, test_loader))
+
+        return fold_loaders
+
+    def get_loaders(self, *args, **kwargs):
+        return self._create_data_loader_(*args, **kwargs)
+
+    def get_cv_loaders(self, *args, **kwargs):
+        return self._create_cv_data_loaders_(*args, **kwargs)
+
+    def describe(self, top_k: int = 5) -> None:
+        cls_counts = np.bincount(self.patch_labels, minlength=self.num)
+        print('[RGBDataset Summary]')
+        print(f"  patients: {self._num_patients}, patches: {len(self.patch_indices)}")
+        print(f"  patch size: ({self.patch_size}, {self.patch_size}), num_classes: {self.num}")
+        print(f"  class counts: {cls_counts.tolist()}")
+        uniq, cnt = np.unique(self.patch_patient_groups, return_counts=True)
+        pairs = sorted(list(zip(uniq.tolist(), cnt.tolist())), key=lambda x: x[1], reverse=True)
+        print(f"  top-{top_k} patients by patches: {pairs[:top_k]}")
 
 class MatHSDataset(AbstractHSDataset):
     """
