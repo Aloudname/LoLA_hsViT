@@ -22,12 +22,13 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources
 
 
 def _ensure_background_class(config: Munch) -> None:
-    """Ensure config uses an explicit background class at index 0.
+    """
+    Ensure an explicit background class BG at index 0.
 
-    Existing label maps in this project use 0 for background. 
-    To train/evaluate segmentation with background included,
+    Existing label maps use 0 for BG. 
+    To train/eval segmentation with BG included,
     reserve class-0 for BG, and shift FG count to ``len(targets) + 1``
-    when BG is not explicitly set.
+    thus BG is not explicitly set for simplicity.
     """
     targets = list(getattr(config.clsf, 'targets', []))
     if targets and str(targets[0]).strip().upper() == 'BG':
@@ -41,25 +42,26 @@ def _ensure_background_class(config: Munch) -> None:
 
 class HSPreprocessor(BaseEstimator, TransformerMixin):
     """
-    Sklearn-compatible preprocessor for hyperspectral data.
+    Sklearn-API preprocessor for hyperspectral data.
 
-    Pipeline: Z-score normalization -> PCA dimensionality reduction.
-    Fits on non-background pixels, then transforms raw per-patient data.
+    Pipeline:
+    Z-score norm -> PCA dim reduction.
+    Fits on FG pixels, then transforms on raw data per patient.
 
-    Follows sklearn's ``fit`` / ``transform`` API::
+    Follows sklearn ``fit`` / ``transform`` API. Example::
 
         preprocessor = HSPreprocessor(pca_components=48)
-        preprocessor.fit(non_bg_pixels)             # compute stats + fit PCA
-        processed = preprocessor.transform(raw_data) # normalize + project
+        preprocessor.fit(non_bg_pixels)             # get stats + fit.
+        processed = preprocessor.transform(raw_data) # norm + transform.
 
-    Attributes (set after ``fit``):
+    Attributes (NOTE: set after use ``fit``):
         global_mean_                  : np.ndarray, shape (n_bands,)
         global_std_                   : np.ndarray, shape (n_bands,)
         pca_                          : sklearn PCA object or None
         pca_components_               : np.ndarray (n_components, n_bands) or None
         pca_mean_                     : np.ndarray (n_bands,) or None
         pca_explained_variance_ratio_ : np.ndarray or None
-        n_features_out_               : int, output channel count
+        n_features_out_               : int, output channels after PCA
     """
 
     def __init__(self, pca_components=48, max_fit_samples=2_000_000,
@@ -71,14 +73,14 @@ class HSPreprocessor(BaseEstimator, TransformerMixin):
 
     def fit(self, X, y=None):
         """
-        Fit normalization statistics and PCA on raw pixel data.
+        Fit norm and PCA stats based on raw data X.
 
         Args:
-            X : np.ndarray, shape (n_pixels, n_bands) -- non-background pixels.
+            X : np.ndarray, shape (n_pixels, n_bands) FG pixels.
             y : ignored (sklearn convention).
 
         Returns:
-            self
+            self : sklearn API requires an instance return.
         """
         from sklearn.decomposition import PCA
 
@@ -94,10 +96,11 @@ class HSPreprocessor(BaseEstimator, TransformerMixin):
 
         self.global_mean_ = fit_data.mean(axis=0).astype(np.float32)
         self.global_std_  = fit_data.std(axis=0).astype(np.float32) + 1e-8
-        tprint(f"  normalization fit on {len(fit_data):,} non-bg pixels")
+        tprint(f"  norm-fit on {len(fit_data):,} foreground(FG) pixels of {c} bands.")
 
-        # PCA fit on Z-score normalized pixels, capped at max_pca_samples
-        # O(n * p^2); 500K is sufficient for stable eigenvectors
+        # PCA fit on Z-score normed pixels, capped at max_pca_samples
+        # time complexity = O(n * C^2) where n = num_pixels and C = num_bands
+        # 500k is sufficient for stable eigenvectors.
         if self.pca_components and self.pca_components < c:
             normalized_fit = (fit_data - self.global_mean_) / self.global_std_
             del fit_data
@@ -115,12 +118,13 @@ class HSPreprocessor(BaseEstimator, TransformerMixin):
                             random_state=self.random_state)
             self.pca_.fit(pca_fit)
 
+            # explainable band ratio
             explained = sum(self.pca_.explained_variance_ratio_) * 100
             tprint(f"  pca: {c} -> {self.pca_components} channels, "
                    f"explained variance: {explained:.1f}%, "
                    f"fit on {len(pca_fit):,} pixels")
 
-            # Pre-compute float32 projection matrix for fast transform
+            # pre-compute fp32 projection matrix
             self.pca_components_ = self.pca_.components_.astype(np.float32)
             self.pca_mean_ = self.pca_.mean_.astype(np.float32)
             self.pca_explained_variance_ratio_ = \
@@ -142,8 +146,8 @@ class HSPreprocessor(BaseEstimator, TransformerMixin):
         """
         Apply fitted Z-score normalization + PCA projection.
 
-        OPTIMIZATION: manual float32 matmul avoids sklearn's internal
-        float64 upcast, halving memory bandwidth.
+        NOTE: manual fp32 matmul avoids sklearn's internal
+        fp64 upcast, halving memory bandwidth.
 
         Args:
             X : np.ndarray, shape (n_pixels, n_bands) or (H, W, n_bands).
@@ -158,10 +162,10 @@ class HSPreprocessor(BaseEstimator, TransformerMixin):
         else:
             flat = X
 
-        # Z-score normalization
+        # Z-score norm
         result = (flat - self.global_mean_) / self.global_std_
 
-        # PCA projection (float32 matmul, no upcast)
+        # PCA projection using fp matmul.
         if self.pca_components_ is not None:
             result = (result - self.pca_mean_) @ self.pca_components_.T
 
@@ -494,10 +498,12 @@ class NpyHSDataset(AbstractHSDataset):
             getattr(self.config.preprocess, 'enable_split_cache_pipeline', True)
         )
 
-        # default pipeline: patient split first, train-only fit, split-wise cached data.
+        # try load cached data if enabled
         if self._use_cached_split_pipeline:
             with self._dataset_build_manager():
                 self._build_or_load_split_cache()
+        
+        # otherwise, build from scratch
         else:
             # Legacy fallback pipeline
             with self._dataset_build_manager():  
@@ -505,11 +511,9 @@ class NpyHSDataset(AbstractHSDataset):
 
     @contextmanager
     def _dataset_build_manager(self):
-        """Context manager for dataset build lifecycle.
-
-        Encapsulates one-shot dataset construction and reports build timing,
-        enabling cleaner orchestration from callers and easier future extension
-        for streaming/chunked preprocessing.
+        """
+        Context manager for dataset build lifecycle.
+        Stream dataset processing and reports timing.
         """
         tic = time.perf_counter()
         tprint("[dataset_build_manager] start building dataset")
@@ -542,6 +546,7 @@ class NpyHSDataset(AbstractHSDataset):
         return data_root, label_root
 
     def _config_fingerprint(self) -> str:
+        """return a hash of current config.yaml for cache validation."""
         tracked = {
             'split_seed': int(getattr(self.config.split, 'split_seed', 350234)),
             'train_ratio': float(getattr(self.config.split, 'train_ratio', 0.8)),
@@ -573,9 +578,12 @@ class NpyHSDataset(AbstractHSDataset):
             'val': cache_root_data / 'val' / 'manifest.json',
             'test': cache_root_data / 'test' / 'manifest.json',
         }
+        
+        # _config_fingerprint() gets a hash from current config.yaml.
         cfg_hash = self._config_fingerprint()
 
         def _cache_ready() -> bool:
+            """Check if the cached data is ok for use."""
             if not signature_file.exists() or not stats_file.exists():
                 return False
             if not all(p.exists() for p in manifest_files.values()):
@@ -586,6 +594,9 @@ class NpyHSDataset(AbstractHSDataset):
             except Exception:
                 return False
 
+        # stream process per patient pipeline
+        # implement of the context manager at line 1668
+        # this manager includes patient split, preprocessor fit and apply.
         with _SplitPreprocessManager(self, cache_root_data, cache_root_label) as manager:
             if force_rebuild or (not _cache_ready()):
                 tprint('Building split cache: patient split -> train-only fit -> split-wise preprocess save')
@@ -595,8 +606,9 @@ class NpyHSDataset(AbstractHSDataset):
                     encoding='utf-8',
                 )
             else:
-                tprint('Using existing split cache under data root')
+                tprint('Using existing split cache under data root.')
 
+        # load dataset stats for downstream analysis
         stats = np.load(stats_file)
         self.global_mean = stats['global_mean'].astype(np.float32)
         self.global_std = stats['global_std'].astype(np.float32)
@@ -614,6 +626,7 @@ class NpyHSDataset(AbstractHSDataset):
         train_patches = 0
         self._num_patients = 0
 
+        # load split manifests to get class & patient stats for balanced sampling.
         for split_name, mfile in manifest_files.items():
             with open(mfile, 'r', encoding='utf-8') as f:
                 manifest = json.load(f)
@@ -634,7 +647,7 @@ class NpyHSDataset(AbstractHSDataset):
         self._cached_total_patches = int(total_patches)
         self._cached_train_patches = int(train_patches)
 
-        # Backward-compatible placeholders for trainer utility paths.
+        # placeholders for trainer utility paths.
         self.patch_indices = np.empty((0, 3), dtype=np.int32)
         self.patch_labels = np.empty((0,), dtype=np.int32)
         self.patch_patient_groups = np.empty((0,), dtype=np.int32)
@@ -787,7 +800,11 @@ class NpyHSDataset(AbstractHSDataset):
         return np.concatenate([fg_pixels, bg_pixels], axis=0)
 
     def _resolve_boundary_class_pair(self) -> Optional[Tuple[int, int]]:
-        """Resolve boundary-pair class ids from class names in config."""
+        """
+        Resolve boundary-pair class ids from class names in config.
+        This helps with distiguishing hard-classification targets,
+        which is defined in config.yaml: config.split.boundary_pair.
+        """
         pair_cfg = getattr(self.config.split, 'boundary_pair', ['PG', 'TG'])
         if not isinstance(pair_cfg, (list, tuple)) or len(pair_cfg) != 2:
             tprint("WARNING: split.boundary_pair must be a list of two class names; boundary boost disabled")
@@ -815,7 +832,10 @@ class NpyHSDataset(AbstractHSDataset):
                              labels: np.ndarray,
                              boundary_map: np.ndarray,
                              rng: np.random.RandomState) -> Tuple[np.ndarray, np.ndarray]:
-        """Cap per-patient centers while keeping minimum boundary/FG coverage."""
+        """
+        Cap per-patient centers,
+        while keeping minimum boundary/FG coverage.
+        """
         if self.max_patches_per_patient is None:
             return rows, cols
 
@@ -1156,21 +1176,21 @@ class NpyHSDataset(AbstractHSDataset):
     def _create_data_loader_(self, num_workers=4, batch_size=None, pin_memory=True, 
                            prefetch_factor=2, persistent_workers=False):
         """
-        Create PyTorch DataLoaders with optimized performance settings.
+        Create torch.utils.data.DataLoaders.
         
-        Uses StratifiedGroupKFold (single fold) for train/val+test split to preserve
-        class distribution across splits while preventing patient-level leakage.
+        Uses StratifiedGroupKFold (single fold) for train/val+test split,
+        to preserve distribution across splits while preventing patient-level leakage.
         Train set uses balanced sampling; val set for early stopping; test set held out.
         
         Args:
-            num_workers: Number of worker threads for parallel data loading.
-            batch_size: Batch size for each iteration. If None, uses config value or 32.
-            pin_memory: Whether to pin memory for GPU transfer.
+            num_workers: worker threads if parallel loading.
+            batch_size: batch size for each iteration.
+            pin_memory: whether to pin memory for GPU transfer.
             prefetch_factor: preload batches per worker.
-            persistent_workers: keep workers from frequent recreation.
+            persistent_workers: bool, if keep workers from frequent recreation.
         
         Returns:
-            Tuple of (train_loader, val_loader, test_loader)
+            Tuple of (`train_loader`, `val_loader`, `test_loader`).
         """
 
         if getattr(self, '_use_cached_split_pipeline', False):
@@ -1189,7 +1209,8 @@ class NpyHSDataset(AbstractHSDataset):
         test_rate = float(getattr(self.config.split, 'test_rate', 0.2))
         val_rate = float(getattr(self.config.split, 'val_rate', 0.1))
 
-        # Patient-level stratification using PG/TG ratio and FG ratio bins.
+        # Patient level split using stats.
+        # Same process as cached one.
         patient_ids = np.unique(self.patch_patient_groups)
         targets = list(getattr(self.config.clsf, 'targets', []))
         pg_idx = targets.index('PG') if 'PG' in targets else 1
@@ -1254,7 +1275,7 @@ class NpyHSDataset(AbstractHSDataset):
         train_idx = total_indices[np.isin(self.patch_patient_groups, train_patients)]
         val_idx = total_indices[np.isin(self.patch_patient_groups, val_patients)]
         
-        # verify no patient leakage
+        # verify no patient leakage.
         train_patients = set(self.patch_patient_groups[train_idx])
         val_patients = set(self.patch_patient_groups[val_idx])
         test_patients = set(self.patch_patient_groups[test_idx])
@@ -1684,6 +1705,7 @@ class _SplitPreprocessManager:
     def _discover_raw_pairs(self) -> List[Tuple[str, str]]:
         data_root = Path(self.dataset.data_path)
         label_root = Path(self.dataset.label_path)
+        
         data_files = sorted([p for p in data_root.glob('*.npy') if p.is_file() and not p.name.endswith('_gt.npy')])
         label_files = sorted([p for p in label_root.glob('*.npy') if p.is_file() and p.name.endswith('_gt.npy')])
         label_map = {p.name: p for p in label_files}
@@ -1695,14 +1717,21 @@ class _SplitPreprocessManager:
                 pairs.append((str(data_file), str(label_map[label_name])))
         return pairs
 
-    def _split_pairs(self, pairs: List[Tuple[str, str]], label_remap: np.ndarray) -> Dict[str, List[Tuple[str, str]]]:
+    def _split_pairs(self,
+                     pairs: List[Tuple[str, str]],
+                     label_remap: np.ndarray) -> Dict[str, List[Tuple[str, str]]]:
+        """
+        Counts label stats and split in patient level.
+        Returns dict of split name to list of (data_file, label_file) pairs.
+        """
+
         split_seed = int(getattr(self.dataset.config.split, 'split_seed', 350234))
         train_ratio = float(getattr(self.dataset.config.split, 'train_ratio', 0.8))
         val_ratio = float(getattr(self.dataset.config.split, 'val_ratio', 0.1))
         test_ratio = float(getattr(self.dataset.config.split, 'test_ratio', 0.1))
 
         if train_ratio <= 0 or val_ratio < 0 or test_ratio < 0:
-            raise ValueError('split ratios must be non-negative and train_ratio > 0')
+            raise ValueError('split ratios must be >= 0 and train_ratio be > 0')
         ratio_sum = train_ratio + val_ratio + test_ratio
         if ratio_sum <= 0:
             raise ValueError('split ratios sum must be > 0')
@@ -1718,7 +1747,7 @@ class _SplitPreprocessManager:
 
         patient_ids = np.asarray(sorted(patient_to_pairs.keys()))
         if patient_ids.size < 3:
-            raise RuntimeError('Need at least 3 patients for train/val/test split')
+            raise RuntimeError('Too few patients for train/val/test split')
 
         targets = list(getattr(self.dataset.config.clsf, 'targets', []))
         pg_idx = targets.index('PG') if 'PG' in targets else 1
@@ -1734,11 +1763,15 @@ class _SplitPreprocessManager:
             for data_file, label_file in patient_to_pairs[pid]:
                 labels_raw = np.load(label_file).astype(np.int32)
                 labels = self.dataset._apply_label_remap(labels_raw, label_remap, label_file)
+                
+                # counts FG vs BG, and PG vs TG for stratification
                 fg_cnt += int((labels > 0).sum())
                 total_cnt += int(labels.size)
                 pg_cnt += int((labels == pg_idx).sum())
                 tg_cnt += int((labels == tg_idx).sum())
 
+            # tracking total stats.
+            # add 1 to avoid ZeroDivisionError.
             fg_ratio = float(fg_cnt / max(total_cnt, 1))
             pg_tg_ratio = float((pg_cnt + 1.0) / (tg_cnt + 1.0))
             patient_fg_ratio.append(fg_ratio)
@@ -1747,12 +1780,18 @@ class _SplitPreprocessManager:
         patient_fg_ratio = np.asarray(patient_fg_ratio, dtype=np.float64)
         patient_pg_tg_ratio = np.asarray(patient_pg_tg_ratio, dtype=np.float64)
 
+        # bin patients into 3 groups based on FG and PG/TG ratio,
+        # total 9 strata in 3 splits for stratified splitting.
+        # this clusters samples with same distribution, splits different ones.
         fg_bins = np.digitize(patient_fg_ratio, np.quantile(patient_fg_ratio, [0.33, 0.66]), right=False)
         pgtg_bins = np.digitize(patient_pg_tg_ratio, np.quantile(patient_pg_tg_ratio, [0.33, 0.66]), right=False)
         patient_strata = fg_bins * 3 + pgtg_bins
 
         trainval_ratio = max(1e-8, train_ratio + val_ratio)
         test_size = float(np.clip(test_ratio, 1e-8, 0.9))
+        
+        # try patient level split.
+        # phase 1 split test from train + val.
         try:
             trainval_patients, test_patients = train_test_split(
                 patient_ids,
@@ -1768,6 +1807,7 @@ class _SplitPreprocessManager:
                 stratify=None,
             )
 
+        # phase 2 split train from val.
         patient_to_strata = {pid: int(s) for pid, s in zip(patient_ids.tolist(), patient_strata.tolist())}
         trainval_strata = np.array([patient_to_strata[str(pid)] for pid in trainval_patients], dtype=np.int64)
         val_share = float(np.clip(val_ratio / trainval_ratio, 1e-8, 0.9))
@@ -1790,6 +1830,7 @@ class _SplitPreprocessManager:
         val_p = set([str(x) for x in val_patients.tolist()])
         test_p = set([str(x) for x in test_patients.tolist()])
 
+        # fallback to random split if any split is empty
         if not train_p or not val_p or not test_p:
             rng = np.random.RandomState(split_seed)
             perm = patient_ids[rng.permutation(patient_ids.size)]
@@ -1803,6 +1844,7 @@ class _SplitPreprocessManager:
             val_p = set([str(x) for x in perm[n_train:n_train + n_val].tolist()])
             test_p = set([str(x) for x in perm[n_train + n_val:n_train + n_val + n_test].tolist()])
 
+        # finalize split lists.
         out = {'train': [], 'val': [], 'test': []}
         for pid, file_pairs in patient_to_pairs.items():
             if pid in train_p:
@@ -1814,13 +1856,26 @@ class _SplitPreprocessManager:
         return out
 
     def build(self) -> None:
+        """
+        Splitting the data into train + val + test.
+        
+        Pipeline:
+        1) Pair raw .npy data/label and patient level,
+        2) Cluster based on label stats, split patient level.
+        3) Fit a global preprocessor based on train, save stats to cache.
+        4) For each split, stream-process per sample with the preprocessor.
+        5) Build split manifests with sample metadata and class counts for further DataLoader.
+        """
+        
+        # pair + cluster + split
         pairs = list(self.raw_pairs)
         if not pairs:
-            raise RuntimeError('No raw npy pairs found for split cache build')
+            raise RuntimeError('No raw .npy pairs found for split cache build')
 
         label_remap = self.dataset._build_label_remap()
         split_pairs = self._split_pairs(pairs, label_remap)
 
+        # fit preprocessor based on train.
         rng_fit = np.random.RandomState(350236)
         fit_pixels: List[np.ndarray] = []
         for data_file, label_file in split_pairs['train']:
@@ -1832,15 +1887,23 @@ class _SplitPreprocessManager:
         if not fit_pixels:
             raise RuntimeError('No train pixels available to fit preprocessor')
 
+        # this preprocessor inherits from sklearn PCA and StandardScaler,
+        # with additional logic to handle large data and PCA dim reduction.
+        # use `fit` to compute global mean/std and PCA components,
+        # then use `transform` to apply the fit to all splits.
+        # implementation see line 42, Z-score norm + PCA.
+        # actual transform see line 165 + line 169.
         all_fit = np.concatenate(fit_pixels, axis=0)
+        
+        # init preprocessor and get the fit
         preprocessor = HSPreprocessor(
             pca_components=self.dataset.config.preprocess.pca_components,
             max_fit_samples=int(getattr(self.dataset.config.preprocess, 'max_fit_samples', 2_000_000)),
             max_pca_samples=int(getattr(self.dataset.config.preprocess, 'max_pca_samples', 500_000)),
-            random_state=350234,
-        )
+            random_state=350234)
         preprocessor.fit(all_fit)
 
+        # save preprocessor in .npz
         np.savez_compressed(
             self.cache_root_data / 'preprocess_stats.npz',
             global_mean=preprocessor.global_mean_,
@@ -1854,9 +1917,13 @@ class _SplitPreprocessManager:
         worker_count = int(getattr(self.dataset.config.preprocess, 'split_preprocess_workers', 1))
         worker_count = max(1, worker_count)
 
+        # resolve boundary class pair,
+        # which is used for especially distiguishing hard-classification pairs.
         boundary_pair = self.dataset._resolve_boundary_class_pair()
 
+        # process 3 splits and save to cache with metadata manifest.
         for split_name, pair_list in split_pairs.items():
+            # dirs like root_dir/{train,val,test}.
             split_data_dir = self.cache_root_data / split_name
             split_label_dir = self.cache_root_label / split_name
             split_data_dir.mkdir(parents=True, exist_ok=True)
@@ -1866,23 +1933,34 @@ class _SplitPreprocessManager:
             class_counts = np.zeros(self.dataset.num, dtype=np.int64)
 
             def _process_pair(data_file: str, label_file: str):
+                """
+                use `transform` per sample.
+                Save processed data along with stats.
+                """
                 data = np.load(data_file).astype(np.float32)
                 labels_raw = np.load(label_file).astype(np.int32)
                 labels = self.dataset._apply_label_remap(labels_raw, label_remap, label_file)
                 processed = preprocessor.transform(data).astype(np.float32)
 
                 boundary_ratio = 0.0
+                
+                # compute boundary map and ratio based on boundary pair defined.
                 if boundary_pair is not None:
                     cls_a, cls_b = boundary_pair
                     a_mask = (labels == cls_a)
                     b_mask = (labels == cls_b)
                     boundary_map = np.zeros_like(labels, dtype=bool)
+                    
+                    # consider 8-connected neighbors for boundary detection.
+                    # if a pixel of class A has a neighbor of class B,
+                    # it's counted as a boundary pixel.
                     for dr, dc in [(-1, -1), (-1, 0), (-1, 1),
                                    (0, -1),           (0, 1),
                                    (1, -1),  (1, 0),  (1, 1)]:
                         a_nb = np.roll(a_mask, shift=(dr, dc), axis=(0, 1))
                         b_nb = np.roll(b_mask, shift=(dr, dc), axis=(0, 1))
                         boundary_map |= (a_mask & b_nb) | (b_mask & a_nb)
+                        
                     boundary_map[0, :] = False
                     boundary_map[-1, :] = False
                     boundary_map[:, 0] = False
@@ -2069,7 +2147,8 @@ class _SampleChunkGroupSampler(Sampler[int]):
 
 
 class _CachedSplitRatioBatchSampler(Sampler[List[int]]):
-    """Ratio-aware batch sampler over cached sample chunks.
+    """
+    Ratio-aware batch sampler over cached sample chunks.
 
     It balances chunk selection by sample-level FG and boundary statistics
     while preserving chunk-wise cache locality.
