@@ -44,7 +44,9 @@ __all__ = [
 
 @dataclass
 class TrainResult:
-    """Wrapper for single training result"""
+    """
+    Wrapper for single training result.
+    """
     
     best_accuracy: float = 0.0
     final_accuracy: float = 0.0

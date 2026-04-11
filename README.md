@@ -1,9 +1,9 @@
-# LoLA-hsViT Model (local ver.)
+# hsViT Model (local ver.)
 ## 概览
 
-`HyperspectralTrainer` for highlighting the ~~superiority~~ of LoLA-hsViT over common ViT.
+`HyperspectralTrainer` for highlighting the ~~superiority~~ of hsViT over RGB-ViT.
 
-毕业设计用, LoLA-hsViT的本地训练部分
+毕业设计用, hsViT的本地训练部分
 
 run.py作程序入口, 支持消融实验
 
@@ -131,7 +131,7 @@ python run.py \
 
 #### 评估指标
 
-评估性能-参数量的复合指标定义为：
+人工评估性能-参数量的复合指标定义为：
 
 $$\text{score} = \text{Acc}_{\text{eval}} - 1.5 \cdot \max(0,\; \text{Gap} - \tau) - \mu \cdot \log_{10}(\text{Params})$$
 
@@ -140,6 +140,27 @@ $$\text{score} = \text{Acc}_{\text{eval}} - 1.5 \cdot \max(0,\; \text{Gap} - \ta
 - $\mu$：参数量惩罚权重(默认 2.0), 通过因子 $\log_{10}$ 平滑
 
 **说明**：准确率为正向收益, 过拟合间隙和参数量为惩罚项, score 最高的配置即为"性能恰好不溢出且参数量最小"的平衡点。
+
+#### Loss
+
+与 $\text{score}$ 不同，这是用于模型优化的指标。整个优化过程是二阶段任务，即前景背景分割和前景类内互分。因此定义复合损失：
+
+$$
+\mathcal{L}_{\text{total}} = w_{\text{bgfg}} \cdot \mathcal{L}_{\text{bin}} + w_{\text{fg}} \cdot \mathcal{L}_{\text{fg}}
+$$
+
+1）二分类损失使用 `Binary Focal Loss`：
+
+$$
+\mathcal{L}_{\text{bin}} = \text{FocalLoss}_{\text{bin}}(\mathbf{z}_{\text{bg}},\; y_{\text{bin}})
+$$
+
+2）前景互分的子类损失使用标准 `FocalLoss`：
+
+$$
+\mathcal{L}_{\text{fg}} = - w_y \cdot (1 - p_t)^\gamma \sum_{c=1}^C q_c \log(p_c)
+$$
+$$
 
 ## bugs & to-do
 ### bugs
@@ -154,7 +175,6 @@ RuntimeError: The size of tensor a: x (15) must match the size of tensor b:  pos
 - ~~config作为参数冗余传入多个层(LoLA-hsViT, MAThsDataLoader)~~
 - 
 ### to-do
-- Nvidia Clara API边缘部署支持(√：Nvidia Triton Server)
-- 外源数据的泛化测试
-- 多模态数据支持
-- 训练日志WandB
+- Nvidia Clara API边缘部署支持(√：Nvidia MONAI API)
+- RGB ViT
+

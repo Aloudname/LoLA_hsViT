@@ -1623,7 +1623,7 @@ class NpyHSDataset(AbstractHSDataset):
         tprint(f"  Created {n_folds} fold DataLoader pairs\n")
         return fold_loaders
 
-    # public interfaces.
+    # public interfaces
     def get_loaders(self, *args, **kwargs):
         return self._create_data_loader_(*args, **kwargs)
 
