@@ -224,6 +224,33 @@ class BandDropout(nn.Module):
         x = x * mask / (1 - self.drop_rate)
         return x
 
+
+class SpectralSpatialFusionPool(nn.Module):
+    """Learnable spectral pooling with spatial-aware band reweighting."""
+
+    def __init__(self):
+        super().__init__()
+        self.band_score = nn.Sequential(
+            nn.Conv1d(1, 8, kernel_size=3, padding=1, bias=False),
+            nn.GELU(),
+            nn.Conv1d(8, 1, kernel_size=3, padding=1, bias=False),
+        )
+        self.mix_logit = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 5:
+            raise ValueError(f"Expected [B, C, D, H, W], got shape={tuple(x.shape)}")
+
+        # Two complementary descriptors over spectral axis D.
+        spectral_desc = x.mean(dim=(1, 3, 4))
+        spatial_desc = x.abs().mean(dim=1).mean(dim=(2, 3))
+        mix = torch.sigmoid(self.mix_logit)
+        descriptor = (1.0 - mix) * spectral_desc + mix * spatial_desc
+
+        scores = self.band_score(descriptor.unsqueeze(1)).squeeze(1)
+        weights = torch.softmax(scores, dim=-1).view(x.shape[0], 1, x.shape[2], 1, 1)
+        return (x * weights).sum(dim=2)
+
 # Local(Window) Attention with LoRA-replace and relative position bias.
 class PEFTWindowAttention(nn.Module):
     r"""
@@ -610,6 +637,7 @@ class LoLA_hsViT(nn.Module):
         
         self.band_dropout = BandDropout(drop_rate=0.1)
         self.spectral_attention = AdaptiveSqueezeExcitation(dim)
+        self.spectral_pool = SpectralSpatialFusionPool()
         
 
         # Block2: Patch embedding.
@@ -684,18 +712,9 @@ class LoLA_hsViT(nn.Module):
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
         )
-        # Hierarchical segmentation heads:
-        # 1) fg_bg_head predicts BG/FG logits (2 channels)
-        # 2) fg_class_head predicts foreground subclass logits (num_classes - 1)
-        # Fused output remains [B, num_classes, H, W] for trainer compatibility.
         if self.num_classes <= 1:
-            raise ValueError("LoLA_hsViT requires num_classes > 1 for two-stage segmentation supervision")
-        self.fg_bg_head = nn.Conv2d(128, 2, kernel_size=1)
-        self.fg_class_head = nn.Conv2d(128, num_classes - 1, kernel_size=1)
-        self.boundary_head = nn.Conv2d(128, 1, kernel_size=1)
-        self.aux_fg_bg_head = nn.Conv2d(self.dims[-1], 2, kernel_size=1)
-        self.aux_fg_class_head = nn.Conv2d(self.dims[-1], num_classes - 1, kernel_size=1)
-        self.seg_head = None
+            raise ValueError("LoLA_hsViT requires num_classes > 1 for segmentation supervision")
+        self.seg_head = nn.Conv2d(128, num_classes, kernel_size=1)
         
         # Initialize weights
         self.apply(self._init_weights)
@@ -754,12 +773,6 @@ class LoLA_hsViT(nn.Module):
         if self.seg_head is not None:
             for p in self.seg_head.parameters():
                 p.requires_grad_(True)
-        if self.fg_bg_head is not None:
-            for p in self.fg_bg_head.parameters():
-                p.requires_grad_(True)
-        if self.fg_class_head is not None:
-            for p in self.fg_class_head.parameters():
-                p.requires_grad_(True)
 
     def generate_cam(self, class_idx=None):
         """
@@ -809,8 +822,8 @@ class LoLA_hsViT(nn.Module):
         x = self.band_dropout(x)
         x = self.spectral_attention(x)  # Now uses adaptive attention
         
-        # Average over spectral dimension -> [B, dim, H, W]
-        x = x.mean(dim=2)
+        # Learnable spectral-space fusion pooling -> [B, dim, H, W]
+        x = self.spectral_pool(x)
 
         # Patch embedding
         x = self.patch_embed(x)  # [B, dim, H/2, W/2]
@@ -870,39 +883,14 @@ class LoLA_hsViT(nn.Module):
         x = x.permute(0, 2, 1).contiguous().view(B, -1, H_feat, W_feat)
         
         # Decode & upsample to original spatial resolution
-        aux_fg_bg_logits = self.aux_fg_bg_head(x)
-        aux_fg_class_logits = self.aux_fg_class_head(x)
-
         x = self.seg_decoder(x)
         x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
-        fg_bg_logits = self.fg_bg_head(x)          # [B, 2, H, W], [bg, fg]
-        fg_class_logits = self.fg_class_head(x)    # [B, C-1, H, W], foreground subclasses
-        boundary_logits = self.boundary_head(x)    # [B, 1, H, W]
-
-        # Conditional fusion: P(class)=P(FG)*P(class|FG), P(BG)=1-P(FG).
-        p_bgfg = F.softmax(fg_bg_logits, dim=1)
-        p_bg = p_bgfg[:, 0:1, :, :]
-        p_fg = p_bgfg[:, 1:2, :, :]
-        p_fg_cond = F.softmax(fg_class_logits, dim=1)
-        if (not self.training) and (self.eval_fg_gate_threshold >= 0.0):
-            fg_mask = (p_fg >= self.eval_fg_gate_threshold).float()
-            p_fg = p_fg * fg_mask
-        p_fg_cls = p_fg_cond * p_fg
-        probs = torch.cat([p_bg, p_fg_cls], dim=1)
-        output = torch.log(probs + 1e-8)
-        staged_output = {
-            'fused_logits': output,
-            'fg_bg_logits': fg_bg_logits,
-            'fg_class_logits': fg_class_logits,
-            'boundary_logits': boundary_logits,
-            'aux_fg_bg_logits': aux_fg_bg_logits,
-            'aux_fg_class_logits': aux_fg_class_logits,
-        }
+        output = self.seg_head(x)
 
         if return_cam:
             cam = self.generate_cam()
-            return staged_output, cam
-        return staged_output
+            return output, cam
+        return output
 
 class LoLA_hsViT_reduced(LoLA_hsViT):
     """Reduced LoLA_hsViT: dim=64, depths=[2,3,3]."""

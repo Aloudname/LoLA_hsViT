@@ -5,6 +5,9 @@ common:
   weight_decay: 0.15      # Increased from 0.10 for stronger L2 regularization
   eval_interval: 1        # Evaluate every x epoch
   focal_gamma: 2.0        # Focal Loss focusing parameter (0 = CE, higher = more focus on hard samples)
+  loss_dice_weight: 0.35  # Composite loss: soft Dice term weight
+  loss_boundary_weight: 0.20  # Composite loss: boundary CE term weight
+  loss_boundary_dilation: 1   # Boundary mask dilation radius for boundary term
   patience: 25            # Slightly more patience to let slower LR explore
   use_amp: true           # Enable mixed precision (will auto-disable on CPU)
   label_smoothing: 0.1    # Label smoothing to prevent overconfident predictions
@@ -17,85 +20,11 @@ common:
   gradient_accumulation_steps: 2
   cv_folds: 1             # Default number of folds for cross-validation (0 = disabled)
   vis_samples: 8         # Number of samples to visualize in final eval
-  use_hierarchical_loss: true
-  fg_loss_weight: 0.6
-  bgfg_loss_weight: 1.2
-  bgfg_pos_weight: 1.0
-  bgfg_hard_neg_weight: 3.0
-  bgfg_boundary_weight: 0.25
-  eval_fg_gate_threshold: -1.0  # <0 disables eval hard FG gating; >=0 applies threshold on P(FG)
-  eval_decode_fg_threshold: 0.58  # keep FG gate conservative to avoid foreground flooding.
-  auto_calibrate_fg_threshold: false
-  calibrate_threshold_stage_c_only: true
-  fg_threshold_metric: ba_bgfg  # ba_bgfg | fg_dice
-  eval_fg_class_min_conf: 0.35  # reduce over-rejection of uncertain FG subclasses.
-  eval_fg_class_logit_bias: [0.02, -0.10, 0.28]  # [PG, Tra, TG] decode-time subclass bias
-  eval_fg_class_min_conf_per_class: [0.35, 0.45, 0.08]  # [PG, Tra, TG]
-  early_stop_metric: hybrid  # hybrid | composite | fg | all
-  metric_weight_bgfg: 0.45
-  metric_weight_fg: 0.5
-  metric_weight_fg_min_recall: 0.25
-  metric_weight_all: 0.5
-  hybrid_min_ba_bgfg: 52.0
-  hybrid_min_fg_recall: 10.0
-  hybrid_low_metric_penalty: 8.0
+  early_stop_metric: eval  # evaluation-class-only
+  exclude_class0_in_metrics: true  # Compute metrics/plots on foreground classes only
   max_train_batches_per_epoch: 320  # 0 -> full batch in a epoch
   save_topk_models: 3
-
-  # Stage schedule and rescue policy.
-  stage_start: A
-  stage_a_min_epochs: 6
-  stage_b_min_epochs: 3
-  stage_c_min_epochs: 2
-  stage_transition_patience: 4
-  stage_a_max_epochs: 0
-  stage_b_max_epochs: 0
-  stage_metric_ema_alpha: 0.6
-  stage_eval_uncapped: true
-  stage_a_target_ba_bgfg: 70.0
-  stage_a_target_ba_bgfg_boundary: 55.0
-  stage_a_min_boundary_ba_for_transition: 50.0
-  stage_a_boundary_metric_weight: 0.45
-  stage_b_target_ba_fg: 70.0
-  stage_b_target_fg_min_recall: 20.0
-  stage_b_weak_cls_target_recall: 16.0
-  stage_b_min_fg_recall_for_c: 12.0
-  stage_b_force_c_min_fg_recall: 6.0
-  stage_b_min_recall_metric_weight: 0.35
-  stage_b_weak_cls_focus: 0.12
-  stage_b_weak_cls_boost_max: 1.5
-  stage_b_weak_cls_boost_momentum: 0.7
-  stage_b_keep_bgfg_head: true
-  stage_b_extra_patterns:
-    - seg_decoder
-    - transformer_levels
-    - downsample_
-    - patch_embed
-    - spectral_conv
-  stage_a_ratio: 0.15
-  stage_b_ratio: 0.35
-  stage_rescue_ba_bgfg_threshold: 40.0
-  stage_rescue_epoch_limit: 3
-  stage_c_boundary_target_ba: 52.0
-  stage_c_boundary_boost_max: 1.6
-  stage_c_boundary_boost_min: 0.9
-  bgfgsplit_num_samples: 6
-  bgfgsplit_use_ema: true
-  bgfgsplit_collect_from_eval: true
-  bgfgsplit_allow_fallback_forward: false
-  bgfgsplit_max_batches: 32  # used only when fallback_forward=true
-  bgfgsplit_collect_uncapped: false  # true -> reconstruction uses full val loader (slow but complete)
-  bgfgsplit_min_cover_ratio: 0.15
-
-  # Foreground subclass loss variants and regularizers.
-  fg_loss_type: cb_focal  # focal | cb_focal | logit_adjust
-  cb_beta: 0.999
-  logit_adjust_tau: 1.0
-  bg_suppress_weight: 0.05
-  bg_suppress_threshold: 0.2
-  stage_b_bgfg_anchor_weight: 0.12
   eval_boundary_band_dilation: 2
-  boundary_loss_weight: 0.45
   class_weight_max_sample_patches: 10000   # 0 -> counts all train patches
   class_weight_max_sample_pixels: 5000000  # 0 -> no sampling inside patches
   class_weight_sample_seed: 350234
@@ -122,14 +51,15 @@ split:
   max_patches_per_sample_chunk: 0  # 0 => auto derive from target_patches_per_step and memory budget.
   patch_size: 31  # Pixel size of image patches.
   eval_batch_size: 256  # Smaller eval batch size for CPU training
-  sampler_mode: adaptive  # fixed | adaptive
-  sampler_ratio_fg: 0.16
-  sampler_ratio_boundary: 0.05
-  sampler_target_fg_ratio: 0.16
-  sampler_target_boundary_ratio: 0.05
+  sampler_mode: hsi_adaptive  # fixed | adaptive | hsi_adaptive
+  sampler_mix_fg: 0.16  # FG vs boundary relative mix (renormalized, no BG pool)
+  sampler_mix_boundary: 0.05  # FG vs boundary relative mix (renormalized, no BG pool)
+  sampler_target_mix_fg: 0.16  # Adaptive target for FG mix (renormalized with boundary)
+  sampler_target_mix_boundary: 0.05  # Adaptive target for boundary mix
   sampler_adapt_momentum: 0.9
-  sampler_min_fg_ratio: 0.08
-  sampler_max_fg_ratio: 0.22
+  sampler_diversity_strength: 0.75  # Group-diversity penalty strength for hsi_adaptive
+  sampler_fg_ratio_min: 0.08
+  sampler_fg_ratio_max: 0.22
   sampler_fg_inverse_pow: 1.0
   sampler_fg_min_per_class: 8
   min_boundary_centers_per_patient: 128
@@ -146,8 +76,8 @@ preprocess:
 
   # Train-only fitting controls
   pca_components: 48  # Number of PCA components to retain.
-  fit_on_non_bg_only: false  # false => fit normalization/PCA on FG + sampled BG for better BG/FG separation.
-  bg_sample_ratio: 1.0  # When fit_on_non_bg_only=false, BG samples ~= fg_count * ratio.
+  fit_on_foreground_only: false  # false => fit normalization/PCA on FG + sampled class-0 pixels.
+  class0_sample_ratio: 1.0  # When fit_on_foreground_only=false, class-0 samples ~= fg_count * ratio.
   max_fit_samples: 2000000
   max_pca_samples: 500000
 
@@ -195,5 +125,5 @@ clsf:
     - 'TG'   # ⭐Thyroid gland
   label_remap: [0, 1, 2, 3]  # raw(BG/PG/Tra/TG) -> remap(BG/PG/Tra/TG)
   strict_label_remap: true
-  unknown_label_policy: error  # error | map_to_bg
+  unknown_label_policy: error  # error | map_to_class0
 

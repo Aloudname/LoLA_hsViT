@@ -133,20 +133,14 @@ class Unet(nn.Module):
         self.head = nn.Linear(dim, num_classes)
 
         if self.num_classes <= 1:
-            raise ValueError("Unet requires num_classes > 1 for two-stage segmentation supervision")
+            raise ValueError("Unet requires num_classes > 1 for segmentation supervision")
 
-        # Two-stage segmentation heads: BG/FG then FG subclasses.
         self.seg_decoder = nn.Sequential(
             nn.Conv2d(dim, dim, kernel_size=3, padding=1),
             nn.BatchNorm2d(dim),
             nn.ReLU(inplace=True),
         )
-        self.fg_bg_head = nn.Conv2d(dim, 2, kernel_size=1)
-        self.fg_class_head = nn.Conv2d(dim, num_classes - 1, kernel_size=1)
-        self.boundary_head = nn.Conv2d(dim, 1, kernel_size=1)
-        self.aux_fg_bg_head = nn.Conv2d(dim, 2, kernel_size=1)
-        self.aux_fg_class_head = nn.Conv2d(dim, num_classes - 1, kernel_size=1)
-        self.seg_head = None
+        self.seg_head = nn.Conv2d(dim, num_classes, kernel_size=1)
         
         # useful components
         self.final_feature_map = None  # for CAM
@@ -238,39 +232,14 @@ class Unet(nn.Module):
             print(f"WARNING: Input has {C} channels, but model expects {self.in_channels}")
         
         x = self.forward_features(x)  # [B, dim, H, W]
-
-        aux_fg_bg_logits = self.aux_fg_bg_head(x)
-        aux_fg_class_logits = self.aux_fg_class_head(x)
-
         x = self.seg_decoder(x)
-        fg_bg_logits = self.fg_bg_head(x)
-        fg_class_logits = self.fg_class_head(x)
-        boundary_logits = self.boundary_head(x)
-
-        p_bgfg = F.softmax(fg_bg_logits, dim=1)
-        p_bg = p_bgfg[:, 0:1, :, :]
-        p_fg = p_bgfg[:, 1:2, :, :]
-        p_fg_cond = F.softmax(fg_class_logits, dim=1)
-        if (not self.training) and (self.eval_fg_gate_threshold >= 0.0):
-            fg_mask = (p_fg >= self.eval_fg_gate_threshold).float()
-            p_fg = p_fg * fg_mask
-        p_fg_cls = p_fg_cond * p_fg
-        probs = torch.cat([p_bg, p_fg_cls], dim=1)
-        fused_logits = torch.log(probs + 1e-8)
-        staged_output = {
-            'fused_logits': fused_logits,
-            'fg_bg_logits': fg_bg_logits,
-            'fg_class_logits': fg_class_logits,
-            'boundary_logits': boundary_logits,
-            'aux_fg_bg_logits': aux_fg_bg_logits,
-            'aux_fg_class_logits': aux_fg_class_logits,
-        }
+        logits = self.seg_head(x)
         
         if return_cam:
             cam = self.generate_cam()
-            return staged_output, cam
+            return logits, cam
         
-        return staged_output
+        return logits
 
 
 if __name__ == "__main__":
@@ -278,8 +247,7 @@ if __name__ == "__main__":
     
     dummy_input = torch.randn(4, 15, 15, 15)  # [B, C, H, W]
     output = model(dummy_input)
-    print(f"  Keys: {list(output.keys())}")
-    print(f"  fused_logits shape: {output['fused_logits'].shape}")  # Expected: [4, 9, 15, 15]
+    print(f"  Output shape: {output.shape}")  # Expected: [4, 9, 15, 15]
     
     output_with_cam = model(dummy_input, return_cam=True)
     if isinstance(output_with_cam, tuple):

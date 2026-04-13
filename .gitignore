@@ -6,6 +6,7 @@ __pycache__/
 # ignore Directory
 output/
 .github/
+scripts/
 
 # test file
 test.ipynb

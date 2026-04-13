@@ -36,15 +36,15 @@ def check_form(config: Munch = None) -> bool:
 
     # Dataset-stage validation for remap and preprocessor-fit settings
     unknown_policy = str(getattr(config.clsf, 'unknown_label_policy', 'error')).lower()
-    if unknown_policy not in ['error', 'map_to_bg']:
+    if unknown_policy not in ['error', 'map_to_class0']:
         raise ValueError(
-            f"clsf.unknown_label_policy must be 'error' or 'map_to_bg', got {unknown_policy}"
+            f"clsf.unknown_label_policy must be 'error' or 'map_to_class0', got {unknown_policy}"
         )
 
-    if hasattr(config.preprocess, 'bg_sample_ratio'):
-        bg_ratio = float(config.preprocess.bg_sample_ratio)
-        if bg_ratio < 0:
-            raise ValueError(f"preprocess.bg_sample_ratio must be >= 0, got {bg_ratio}")
+    if hasattr(config.preprocess, 'class0_sample_ratio'):
+        class0_ratio = float(config.preprocess.class0_sample_ratio)
+        if class0_ratio < 0:
+            raise ValueError(f"preprocess.class0_sample_ratio must be >= 0, got {class0_ratio}")
 
     # New split-first cache pipeline checks
     if hasattr(config.split, 'train_ratio') and hasattr(config.split, 'val_ratio') and hasattr(config.split, 'test_ratio'):
@@ -91,16 +91,10 @@ def check_form(config: Munch = None) -> bool:
 
     if hasattr(config.common, 'early_stop_metric'):
         metric = str(config.common.early_stop_metric).lower()
-        if metric not in ['hybrid', 'composite', 'fg', 'all']:
+        if metric not in ['eval']:
             raise ValueError(
-                f"common.early_stop_metric must be one of hybrid/composite/fg/all, got {metric}"
+                f"common.early_stop_metric must be 'eval', got {metric}"
             )
-
-    if hasattr(config.common, 'metric_weight_fg') and hasattr(config.common, 'metric_weight_all'):
-        w_fg = float(config.common.metric_weight_fg)
-        w_all = float(config.common.metric_weight_all)
-        if w_fg < 0 or w_all < 0:
-            raise ValueError("common.metric_weight_fg and metric_weight_all must be >= 0")
 
     if hasattr(config, 'rgb') and config.rgb is not None:
         rgb = config.rgb

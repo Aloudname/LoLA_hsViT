@@ -1,8 +1,4 @@
-"""
-RGBViT model for RGB image segmentation with two-stage heads:
-1) foreground/background classification
-2) foreground subclass classification
-"""
+"""RGBViT model for RGB image segmentation."""
 
 import torch
 import torch.nn as nn
@@ -112,7 +108,7 @@ class RGBViT(nn.Module):
         self.eval_fg_gate_threshold = float(eval_fg_gate_threshold)
 
         if self.num_classes <= 1:
-            raise ValueError("RGBViT requires num_classes > 1 for two-stage segmentation supervision")
+            raise ValueError("RGBViT requires num_classes > 1 for segmentation supervision")
 
         # Shallow RGB stem (pure 2D conv).
         self.rgb_stem = nn.Sequential(
@@ -186,12 +182,7 @@ class RGBViT(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        self.fg_bg_head = nn.Conv2d(128, 2, kernel_size=1)
-        self.fg_class_head = nn.Conv2d(128, self.num_classes - 1, kernel_size=1)
-        self.boundary_head = nn.Conv2d(128, 1, kernel_size=1)
-        self.aux_fg_bg_head = nn.Conv2d(self.dims[-1], 2, kernel_size=1)
-        self.aux_fg_class_head = nn.Conv2d(self.dims[-1], self.num_classes - 1, kernel_size=1)
-        self.seg_head = None
+        self.seg_head = nn.Conv2d(128, self.num_classes, kernel_size=1)
 
         self.apply(self._init_weights)
         trunc_normal_(self.pos_embed, std=0.02)
@@ -268,41 +259,13 @@ class RGBViT(nn.Module):
         h_feat, w_feat = self.final_feature_map.shape[2], self.final_feature_map.shape[3]
         x = x.permute(0, 2, 1).contiguous().view(b, -1, h_feat, w_feat)
 
-        aux_fg_bg_logits = self.aux_fg_bg_head(x)
-        aux_fg_class_logits = self.aux_fg_class_head(x)
-
         x = self.seg_decoder(x)
         x = F.interpolate(x, size=(h, w), mode='bilinear', align_corners=False)
-
-        fg_bg_logits = self.fg_bg_head(x)
-        fg_class_logits = self.fg_class_head(x)
-        boundary_logits = self.boundary_head(x)
-
-        p_bgfg = F.softmax(fg_bg_logits, dim=1)
-        p_bg = p_bgfg[:, 0:1, :, :]
-        p_fg = p_bgfg[:, 1:2, :, :]
-        p_fg_cond = F.softmax(fg_class_logits, dim=1)
-
-        if (not self.training) and (self.eval_fg_gate_threshold >= 0.0):
-            fg_mask = (p_fg >= self.eval_fg_gate_threshold).float()
-            p_fg = p_fg * fg_mask
-
-        p_fg_cls = p_fg_cond * p_fg
-        probs = torch.cat([p_bg, p_fg_cls], dim=1)
-        output = torch.log(probs + 1e-8)
-
-        staged_output = {
-            'fused_logits': output,
-            'fg_bg_logits': fg_bg_logits,
-            'fg_class_logits': fg_class_logits,
-            'boundary_logits': boundary_logits,
-            'aux_fg_bg_logits': aux_fg_bg_logits,
-            'aux_fg_class_logits': aux_fg_class_logits,
-        }
+        output = self.seg_head(x)
 
         if return_cam:
-            return staged_output, self.generate_cam()
-        return staged_output
+            return output, self.generate_cam()
+        return output
 
 
 class RGBViT_reduced(RGBViT):

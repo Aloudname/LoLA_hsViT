@@ -100,372 +100,101 @@ class FocalLoss(nn.Module):
         return loss.mean() if self.reduction == 'mean' else loss.sum()
 
 
-class HierarchicalSegLoss(nn.Module):
-    """
-    Hierarchical segmentation loss: BG/FG + foreground subclass loss.
-    Expects model outputs with two-stage heads:
-    
-    - fg_bg_logits: binary logits for foreground/background separation.
-    - fg_class_logits: multi-class logits for foreground subclass classification.
-    
-    Computes:
-        total_loss = w_fg_loss * fg_class_loss + w_bgfg_loss * fg_bg_loss
-    
-    This encourages to first learn a coarse FG/BG distinction,
-    then focus on fine-grained classification within the foreground.
+class SegmentationLoss(nn.Module):
+    """HSI-aware composite segmentation loss on dense logits.
+
+    Total loss:
+        L = L_focal + lambda_dice * L_dice + lambda_boundary * L_boundary
     """
 
     def __init__(self,
-                 num_classes: int,
                  class_weight=None,
-                 fg_weight: float = 1.0,
-                 bgfg_weight: float = 0.5,
-                 bgfg_pos_weight: float = 2.0,
-                 bgfg_hard_neg_weight: float = 2.0,
-                 bgfg_boundary_weight: float = 0.0,
-                 boundary_weight: float = 0.2,
-                 aux_weight: float = 0.3,
-                 fg_loss_type: str = 'focal',
-                 cb_beta: float = 0.999,
-                 logit_adjust_tau: float = 1.0,
-                 bg_suppress_weight: float = 0.0,
-                 bg_suppress_threshold: float = 0.2,
-                 stage_b_bgfg_anchor_weight: float = 0.0,
-                 stage_b_weak_cls_focus: float = 0.0,
-                 stage_b_weak_cls_boost_max: float = 1.8,
-                 stage_b_weak_cls_boost_momentum: float = 0.6,
-                 stage_c_boundary_boost_max: float = 2.0,
-                 stage_c_boundary_boost_min: float = 0.75,
                  gamma: float = 2.0,
                  ignore_index: int = 255,
-                 label_smoothing: float = 0.0):
-        
+                 label_smoothing: float = 0.0,
+                 dice_weight: float = 0.35,
+                 boundary_weight: float = 0.20,
+                 boundary_dilation: int = 1):
         super().__init__()
-        self.num_classes = int(num_classes)
-        self.fg_weight = float(fg_weight)
-        self.bgfg_weight = float(bgfg_weight)
-        self._base_fg_weight = float(fg_weight)
-        self._base_bgfg_weight = float(bgfg_weight)
-        self.bgfg_pos_weight = float(max(1.0, bgfg_pos_weight))
-        self.bgfg_hard_neg_weight = float(max(0.0, bgfg_hard_neg_weight))
-        self._base_bgfg_hard_neg_weight = float(max(0.0, bgfg_hard_neg_weight))
-        self.bgfg_boundary_weight = float(max(0.0, bgfg_boundary_weight))
-        self.boundary_weight = float(boundary_weight)
-        self.aux_weight = float(aux_weight)
-        self.fg_loss_type = str(fg_loss_type).lower()
-        self.cb_beta = float(np.clip(cb_beta, 0.0, 0.999999))
-        self.logit_adjust_tau = float(max(0.0, logit_adjust_tau))
-        self.bg_suppress_weight = float(max(0.0, bg_suppress_weight))
-        self.bg_suppress_threshold = float(np.clip(bg_suppress_threshold, 0.0, 1.0))
-        self.stage_b_bgfg_anchor_weight = float(max(0.0, stage_b_bgfg_anchor_weight))
-        self.stage_b_weak_cls_focus = float(np.clip(stage_b_weak_cls_focus, 0.0, 1.0))
-        self.stage_b_weak_cls_boost_max = float(max(1.0, stage_b_weak_cls_boost_max))
-        self.stage_b_weak_cls_boost_momentum = float(np.clip(stage_b_weak_cls_boost_momentum, 0.0, 0.99))
-        self.stage_c_boundary_boost_max = float(max(1.0, stage_c_boundary_boost_max))
-        self.stage_c_boundary_boost_min = float(np.clip(stage_c_boundary_boost_min, 0.1, 1.0))
+        self.class_weight = class_weight
         self.ignore_index = int(ignore_index)
-
-        # Foreground subclass targets are remapped from [1..C-1] -> [0..C-2].
-        # Use foreground-only class weights to avoid BG weight index misalignment.
-        fg_class_weight = None
-        if class_weight is not None:
-            if torch.is_tensor(class_weight):
-                cw = class_weight.detach().float().clone()
-            else:
-                cw = torch.as_tensor(class_weight, dtype=torch.float32)
-
-            if cw.numel() == self.num_classes:
-                fg_class_weight = cw[1:].clone()
-            elif cw.numel() == (self.num_classes - 1):
-                fg_class_weight = cw.clone()
-            else:
-                raise ValueError(
-                    f"class_weight length mismatch: got {cw.numel()}, "
-                    f"expected {self.num_classes} or {self.num_classes - 1}"
-                )
-
-            pos = fg_class_weight > 0
-            if pos.any():
-                fg_class_weight[pos] = fg_class_weight[pos] / fg_class_weight[pos].mean().clamp(min=1e-8)
-                if self.fg_loss_type == 'cb_focal':
-                    # Stronger long-tail emphasis for foreground subclasses.
-                    fg_class_weight[pos] = fg_class_weight[pos].pow(1.25)
-                    fg_class_weight[pos] = fg_class_weight[pos] / fg_class_weight[pos].mean().clamp(min=1e-8)
-
-        self.fg_logit_adjust = None
-        if fg_class_weight is not None:
-            # Infer normalized foreground priors from inverse-frequency style weights.
-            inv = 1.0 / fg_class_weight.clamp(min=1e-8)
-            prior = inv / inv.sum().clamp(min=1e-8)
-            self.fg_logit_adjust = prior.clamp(min=1e-8).log()
-
-        self.multi_cls_loss = FocalLoss(
-            weight=fg_class_weight,
+        self.dice_weight = float(dice_weight)
+        self.boundary_weight = float(boundary_weight)
+        self.boundary_dilation = int(max(0, boundary_dilation))
+        self.loss = FocalLoss(
+            weight=class_weight,
             gamma=gamma,
             ignore_index=ignore_index,
             reduction='mean',
             label_smoothing=label_smoothing,
         )
-        self._eps = 1e-8
-        self.active_stage = 'C'
-        self._fg_class_dynamic_boost = torch.ones(max(1, self.num_classes - 1), dtype=torch.float32)
-        self._boundary_dynamic_scale = 1.0
 
-    def set_active_stage(self, stage: str) -> None:
-        stage = str(stage).upper()
-        if stage not in {'A', 'B', 'C'}:
-            stage = 'C'
-        self.active_stage = stage
+    def _soft_dice_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        probs = F.softmax(logits, dim=1)
+        valid = (targets != self.ignore_index)
+        if not valid.any():
+            return logits.sum() * 0.0
 
-    def set_fg_class_recall_feedback(self, fg_class_recalls: Optional[np.ndarray],
-                                     target_min_recall: float) -> None:
-        """Update per-class weak boost based on latest foreground class recalls."""
-        if fg_class_recalls is None:
-            return
-        recalls = np.asarray(fg_class_recalls, dtype=np.float32).reshape(-1)
-        if recalls.size != max(1, self.num_classes - 1):
-            return
-        recalls = np.nan_to_num(recalls, nan=0.0, posinf=100.0, neginf=0.0)
-        target = float(max(1e-6, target_min_recall))
-        deficits = np.clip((target - recalls) / target, 0.0, 1.0)
-        raw_boost = 1.0 + deficits * (self.stage_b_weak_cls_boost_max - 1.0)
-        old = self._fg_class_dynamic_boost.detach().cpu().numpy()
-        m = self.stage_b_weak_cls_boost_momentum
-        smoothed = m * old + (1.0 - m) * raw_boost
-        self._fg_class_dynamic_boost = torch.as_tensor(smoothed, dtype=torch.float32)
+        safe_targets = targets.clone()
+        safe_targets[~valid] = 0
+        one_hot = F.one_hot(safe_targets, num_classes=logits.shape[1]).permute(0, 3, 1, 2).float()
 
-    def set_boundary_feedback(self, boundary_ba: float, target_ba: float) -> None:
-        """Adapt boundary loss scale for stage C according to boundary-band BA."""
-        ba = float(boundary_ba)
-        if not np.isfinite(ba):
-            return
-        target = float(max(1e-6, target_ba))
-        gap = (target - ba) / target
-        if gap >= 0.0:
-            scale = 1.0 + gap * (self.stage_c_boundary_boost_max - 1.0)
-        else:
-            scale = 1.0 + gap * (1.0 - self.stage_c_boundary_boost_min)
-        self._boundary_dynamic_scale = float(np.clip(scale, self.stage_c_boundary_boost_min, self.stage_c_boundary_boost_max))
+        valid_f = valid.unsqueeze(1).float()
+        probs = probs * valid_f
+        one_hot = one_hot * valid_f
 
-    @staticmethod
-    def _soft_dice_binary(prob: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        inter = (prob * target).sum()
-        denom = prob.sum() + target.sum()
-        return 1.0 - (2.0 * inter + 1e-8) / (denom + 1e-8)
+        reduce_dims = (0, 2, 3)
+        inter = (probs * one_hot).sum(dim=reduce_dims)
+        denom = probs.sum(dim=reduce_dims) + one_hot.sum(dim=reduce_dims)
+        dice = (2.0 * inter + 1e-6) / (denom + 1e-6)
 
-    @staticmethod
-    def _build_boundary_target(targets: torch.Tensor, ignore_index: int) -> torch.Tensor:
-        """Build binary boundary target map from dense labels."""
-        t = targets.clone()
-        valid = (t != ignore_index)
-        t[~valid] = 0
+        # Only classes present in current batch contribute.
+        present = one_hot.sum(dim=reduce_dims) > 0
+        if present.any():
+            return 1.0 - dice[present].mean()
+        return logits.sum() * 0.0
 
-        edge = torch.zeros_like(t, dtype=torch.bool)
-        # Horizontal and vertical label changes define boundaries.
-        edge[:, :, 1:] |= (t[:, :, 1:] != t[:, :, :-1]) & valid[:, :, 1:] & valid[:, :, :-1]
-        edge[:, 1:, :] |= (t[:, 1:, :] != t[:, :-1, :]) & valid[:, 1:, :] & valid[:, :-1, :]
-        return edge.float()
+    def _boundary_mask(self, targets: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        boundary = torch.zeros_like(valid)
+        boundary[:, :, 1:] |= (targets[:, :, 1:] != targets[:, :, :-1]) & valid[:, :, 1:] & valid[:, :, :-1]
+        boundary[:, 1:, :] |= (targets[:, 1:, :] != targets[:, :-1, :]) & valid[:, 1:, :] & valid[:, :-1, :]
+        if self.boundary_dilation > 0:
+            k = 2 * self.boundary_dilation + 1
+            boundary = F.max_pool2d(
+                boundary.float().unsqueeze(1),
+                kernel_size=k,
+                stride=1,
+                padding=self.boundary_dilation,
+            ).squeeze(1) > 0.5
+        return boundary & valid
 
-    def set_curriculum(self, progress: float) -> None:
-        """30/40/30 schedule: keep BG/FG supervision active through training."""
-        progress = float(np.clip(progress, 0.0, 1.0))
-        if progress < 0.3:
-            self.bgfg_weight = 1.0
-            self.fg_weight = 0.4
-        elif progress < 0.7:
-            self.bgfg_weight = 0.8
-            self.fg_weight = 0.8
-        else:
-            self.bgfg_weight = 0.6
-            self.fg_weight = 1.0
+    def _boundary_ce_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        valid = (targets != self.ignore_index)
+        if not valid.any():
+            return logits.sum() * 0.0
 
-    def set_fg_bias_feedback(self, pred_fg_ratio: float, gt_fg_ratio: float) -> None:
-        """Adapt hard-negative strength based on FG over/under prediction gap."""
-        gap = float(pred_fg_ratio - gt_fg_ratio)
-        if gap > 10.0:
-            scale = 1.3
-        elif gap < -10.0:
-            scale = 0.9
-        else:
-            scale = 1.0
-        self.bgfg_hard_neg_weight = float(np.clip(
-            self._base_bgfg_hard_neg_weight * scale, 0.0, self._base_bgfg_hard_neg_weight * 2.5
-        ))
+        boundary = self._boundary_mask(targets, valid)
+        if not boundary.any():
+            return logits.sum() * 0.0
 
-    def _prepare_fg_logits(self, fg_class_logits: torch.Tensor) -> torch.Tensor:
-        logits = fg_class_logits
-        if self.fg_loss_type == 'logit_adjust' and self.fg_logit_adjust is not None and self.logit_adjust_tau > 0:
-            bias = self.logit_adjust_tau * self.fg_logit_adjust.to(logits.device).view(1, -1, 1, 1)
-            logits = logits + bias
-        return logits
-
-    def decompose(self, outputs, targets: torch.Tensor):
-        if not isinstance(outputs, (dict, tuple, list)):
-            raise TypeError("HierarchicalSegLoss expects model outputs with two-stage heads")
-
-        if isinstance(outputs, dict):
-            fg_bg_logits = outputs.get('fg_bg_logits')
-            fg_class_logits = outputs.get('fg_class_logits')
-            boundary_logits = outputs.get('boundary_logits')
-            aux_fg_bg_logits = outputs.get('aux_fg_bg_logits')
-            aux_fg_class_logits = outputs.get('aux_fg_class_logits')
-        else:
-            if len(outputs) < 3:
-                raise ValueError("HierarchicalSegLoss expects (fused_logits, fg_bg_logits, fg_class_logits)")
-            fg_bg_logits = outputs[1]
-            fg_class_logits = outputs[2]
-            boundary_logits = None
-            aux_fg_bg_logits = None
-            aux_fg_class_logits = None
-
-        if fg_bg_logits is None or fg_class_logits is None:
-            raise ValueError("Missing fg_bg_logits/fg_class_logits for direct two-stage supervision")
-
-        # Foreground subclass loss on classes [1..C-1] with direct fg_class_logits.
-        fg_targets = targets.clone()
-        valid_fg = (fg_targets != self.ignore_index) & (fg_targets > 0)
-        fg_targets[valid_fg] = fg_targets[valid_fg] - 1
-        fg_targets[(fg_targets == 0) & (~valid_fg)] = self.ignore_index
-        fg_class_logits_adj = self._prepare_fg_logits(fg_class_logits)
-        stage = str(getattr(self, 'active_stage', 'C')).upper()
-        fg_loss = self.multi_cls_loss(fg_class_logits_adj, fg_targets)
-
-        if stage == 'B' and self.stage_b_weak_cls_focus > 0.0:
-            valid_fg_mask = (fg_targets != self.ignore_index)
-            if valid_fg_mask.any():
-                ce_fg_map = F.cross_entropy(
-                    fg_class_logits_adj,
-                    fg_targets,
-                    ignore_index=self.ignore_index,
-                    reduction='none',
-                )
-                boost = self._fg_class_dynamic_boost.to(ce_fg_map.device, dtype=ce_fg_map.dtype)
-                weight_map = torch.ones_like(ce_fg_map)
-                for c in range(min(boost.numel(), max(1, self.num_classes - 1))):
-                    bc = float(boost[c].item())
-                    if bc > 1.0 + 1e-6:
-                        weight_map = torch.where(fg_targets == c, weight_map * bc, weight_map)
-                weak_ce = (ce_fg_map[valid_fg_mask] * weight_map[valid_fg_mask]).mean()
-                alpha = self.stage_b_weak_cls_focus
-                fg_loss = (1.0 - alpha) * fg_loss + alpha * weak_ce
-
-        # Binary BG/FG loss with Dice + CE and hard-negative emphasis.
-        bin_targets = targets.clone()
-        valid = (bin_targets != self.ignore_index)
-        bin_targets[valid] = (bin_targets[valid] > 0).long()
-
-        ce_map = F.cross_entropy(fg_bg_logits, bin_targets, ignore_index=self.ignore_index, reduction='none')
-        fg_prob = F.softmax(fg_bg_logits, dim=1)[:, 1, :, :]
-        hard_neg = ((bin_targets == 0) & valid & (fg_prob > 0.5)).float()
-        pos_mask = ((bin_targets == 1) & valid).float()
-        boundary_target_bgfg = self._build_boundary_target(targets, self.ignore_index)
-        ce_weight = (
-            1.0
-            + self.bgfg_hard_neg_weight * hard_neg
-            + (self.bgfg_pos_weight - 1.0) * pos_mask
-            + self.bgfg_boundary_weight * boundary_target_bgfg * valid.float()
+        ce_map = F.cross_entropy(
+            logits,
+            targets,
+            weight=self.class_weight,
+            ignore_index=self.ignore_index,
+            reduction='none',
         )
-        ce_valid = ce_map[valid] * ce_weight[valid]
-        ce_loss = ce_valid.mean() if ce_valid.numel() > 0 else ce_map.sum() * 0.0
+        return (ce_map * boundary.float()).sum() / boundary.float().sum().clamp_min(1.0)
 
-        fg_gt = (bin_targets == 1).float()
-        valid_f = valid.float()
-        dice_loss = self._soft_dice_binary(fg_prob * valid_f, fg_gt * valid_f)
-        bin_loss = 0.5 * ce_loss + 0.5 * dice_loss
-
-        # Foreground class Dice to stabilize minority classes.
-        fg_dice_loss = fg_loss * 0.0
-        valid_fg_mask = (fg_targets != self.ignore_index)
-        if valid_fg_mask.any():
-            probs = F.softmax(fg_class_logits_adj, dim=1)
-            fg_dice_terms = []
-            for c in range(self.num_classes - 1):
-                cls_t = (fg_targets == c).float()
-                if cls_t.sum() <= 0:
-                    continue
-                cls_p = probs[:, c, :, :]
-                cls_valid = valid_fg_mask.float()
-                inter = (cls_p * cls_t * cls_valid).sum()
-                denom = (cls_p * cls_valid).sum() + (cls_t * cls_valid).sum()
-                fg_dice_terms.append(1.0 - (2.0 * inter + self._eps) / (denom + self._eps))
-            if fg_dice_terms:
-                fg_dice_loss = torch.stack(fg_dice_terms).mean()
-
-        fg_loss = 0.7 * fg_loss + 0.3 * fg_dice_loss
-
-        boundary_loss = fg_loss * 0.0
-        if boundary_logits is not None:
-            boundary_target = boundary_target_bgfg
-            boundary_valid = ((targets != self.ignore_index) & (targets > 0)).float()
-            bce = F.binary_cross_entropy_with_logits(
-                boundary_logits.squeeze(1), boundary_target, reduction='none')
-            denom = boundary_valid.sum().clamp(min=1.0)
-            boundary_loss = (bce * boundary_valid).sum() / denom
-
-        aux_bg_loss = fg_loss * 0.0
-        aux_fg_loss = fg_loss * 0.0
-        if aux_fg_bg_logits is not None and aux_fg_class_logits is not None:
-            if aux_fg_bg_logits.shape[-2:] != bin_targets.shape[-2:]:
-                aux_fg_bg_logits = F.interpolate(
-                    aux_fg_bg_logits,
-                    size=bin_targets.shape[-2:],
-                    mode='bilinear',
-                    align_corners=False,
-                )
-            if aux_fg_class_logits.shape[-2:] != fg_targets.shape[-2:]:
-                aux_fg_class_logits = F.interpolate(
-                    aux_fg_class_logits,
-                    size=fg_targets.shape[-2:],
-                    mode='bilinear',
-                    align_corners=False,
-                )
-            aux_ce_map = F.cross_entropy(aux_fg_bg_logits, bin_targets, ignore_index=self.ignore_index, reduction='none')
-            aux_bg_loss = aux_ce_map[valid].mean() if valid.any() else aux_ce_map.sum() * 0.0
-            aux_fg_loss = self.multi_cls_loss(self._prepare_fg_logits(aux_fg_class_logits), fg_targets)
-
-        bg_suppress_loss = fg_loss * 0.0
-        if self.bg_suppress_weight > 0.0:
-            bg_valid = (targets == 0) & valid
-            if bg_valid.any():
-                bg_prob_max = F.softmax(fg_class_logits_adj, dim=1).max(dim=1).values
-                suppress = F.relu(bg_prob_max - self.bg_suppress_threshold)
-                bg_suppress_loss = (suppress[bg_valid] ** 2).mean()
-
-        boundary_weight = self.boundary_weight
-        if stage == 'C':
-            boundary_weight = boundary_weight * float(self._boundary_dynamic_scale)
-
-        if stage == 'A':
-            total = self.bgfg_weight * bin_loss + self.aux_weight * aux_bg_loss
-        elif stage == 'B':
-            total = (
-                self.fg_weight * fg_loss
-                + self.boundary_weight * boundary_loss
-                + self.aux_weight * aux_fg_loss
-                + self.bg_suppress_weight * bg_suppress_loss
-                + self.stage_b_bgfg_anchor_weight * bin_loss
-            )
-        else:
-            aux_loss = 0.5 * aux_bg_loss + 0.5 * aux_fg_loss
-            total = (
-                self.fg_weight * fg_loss
-                + self.bgfg_weight * bin_loss
-                + boundary_weight * boundary_loss
-                + self.aux_weight * aux_loss
-                + self.bg_suppress_weight * bg_suppress_loss
-            )
-        return total, bin_loss, fg_loss
-
-    def forward(self, outputs, targets: torch.Tensor) -> torch.Tensor:
-        total, _, _ = self.decompose(outputs, targets)
-        return total
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        focal = self.loss(logits, targets)
+        dice = self._soft_dice_loss(logits, targets)
+        boundary = self._boundary_ce_loss(logits, targets)
+        return focal + self.dice_weight * dice + self.boundary_weight * boundary
 
 
 def _worker_plot_training_curves(train_losses, eval_losses,
-                                 train_bgfg_losses, train_fg_class_losses,
-                                 eval_bgfg_losses, eval_fg_class_losses,
                                  train_accs, eval_accs,
-                                 stage_history,
                                  eval_interval, debug_mode,
                                  best_acc, model_name, output):
     """Worker: training loss/accuracy curves."""
@@ -480,35 +209,13 @@ def _worker_plot_training_curves(train_losses, eval_losses,
             eval_epochs.append(e)
     eval_epochs = eval_epochs[:len(eval_losses)]
 
-    stage_colors = {
-        'A': '#d8ecff',
-        'B': '#ffe8cc',
-        'C': '#e6f7e6',
-    }
-    if stage_history:
-        start = 0
-        curr = stage_history[0]
-        for i in range(1, len(stage_history) + 1):
-            boundary = (i == len(stage_history)) or (stage_history[i] != curr)
-            if boundary:
-                for ax in axes:
-                    ax.axvspan(start, i - 1, color=stage_colors.get(curr, '#f2f2f2'), alpha=0.25)
-                start = i
-                if i < len(stage_history):
-                    curr = stage_history[i]
-
-    axes[0].plot(train_bgfg_losses, '--', color='#1f77b4', linewidth=1.8,
-                 label='Train bgfg_loss')
-    axes[0].plot(train_fg_class_losses, '--', color='#ff7f0e', linewidth=1.8,
-                 label='Train fg_class_loss')
-    if eval_bgfg_losses:
-        axes[0].plot(eval_epochs, eval_bgfg_losses, '--', color='#2ca02c', linewidth=1.8,
-                     label='Eval bgfg_loss')
-    if eval_fg_class_losses:
-        axes[0].plot(eval_epochs, eval_fg_class_losses, '--', color='#d62728', linewidth=1.8,
-                     label='Eval fg_class_loss')
+    axes[0].plot(train_losses, '--', color='#1f77b4', linewidth=1.8,
+                 label='Train loss')
+    if eval_losses:
+        axes[0].plot(eval_epochs, eval_losses, '--', color='#2ca02c', linewidth=1.8,
+                     label='Eval loss')
     axes[0].set_xlabel('Epoch'); axes[0].set_ylabel('Loss')
-    axes[0].set_title('Training Sub-loss Curves'); axes[0].legend(); axes[0].grid(True, alpha=0.3)
+    axes[0].set_title('Training Loss Curves'); axes[0].legend(); axes[0].grid(True, alpha=0.3)
 
     axes[1].plot(train_accs, label='Train Acc', marker='o', markersize=4)
     if eval_accs:
@@ -521,51 +228,6 @@ def _worker_plot_training_curves(train_losses, eval_losses,
     plt.savefig(os.path.join(output, 'training_curve.png'), dpi=150, bbox_inches='tight')
     plt.close()
 
-
-def _worker_plot_stage_timeline(stage_history, transition_log,
-                                model_name, output):
-    """Worker: stage timeline for strict A/B/C training."""
-    matplotlib.use('Agg')
-    if not stage_history:
-        return
-
-    stage_to_id = {'A': 0, 'B': 1, 'C': 2}
-    y = np.array([stage_to_id.get(str(s).upper(), 2) for s in stage_history], dtype=np.int64)
-    x = np.arange(1, len(stage_history) + 1)
-
-    fig, ax = plt.subplots(figsize=(12, 3))
-    ax.step(x, y, where='post', linewidth=2.0, color='#2f5d8a')
-    ax.set_yticks([0, 1, 2])
-    ax.set_yticklabels(['A: BG/FG', 'B: FG-subclass', 'C: Joint'])
-    ax.set_xlabel('Epoch')
-    ax.set_title(f'{model_name} - Training Stage Timeline', fontsize=12, fontweight='bold')
-    ax.grid(True, alpha=0.25)
-
-    for entry in (transition_log or []):
-        e = int(entry.get('epoch', 0))
-        if e > 0:
-            ax.axvline(e, linestyle='--', color='#c0392b', alpha=0.7, linewidth=1.2)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(output, 'stage_timeline.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-
-
-def _worker_write_stage_transition_summary(stage_transition_log, output):
-    """Worker: write stage transition diagnostics for quick debugging."""
-    path = os.path.join(output, 'stage_transition_summary.txt')
-    lines = []
-    for idx, item in enumerate(stage_transition_log or [], start=1):
-        lines.append(
-            f"{idx}. epoch={int(item.get('epoch', -1))}, "
-            f"{item.get('from', '?')}->{item.get('to', '?')}, "
-            f"metric={float(item.get('metric', 0.0)):.2f}, "
-            f"reason={item.get('reason', 'n/a')}"
-        )
-    if not lines:
-        lines = ['No stage transition recorded.']
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
 
 
 def _worker_plot_confusion_matrix(cm, cm_norm, metrics_text,
@@ -694,70 +356,12 @@ def _worker_plot_epoch_time(epoch_times, model_name, output):
     plt.close()
 
 
-def _worker_plot_fg_threshold_curve(scan_records, model_name, output):
-    """Worker: plot validation FG-threshold calibration curves."""
-    matplotlib.use('Agg')
 
-    if not scan_records:
-        return
-    latest = scan_records[-1]
-    scan = latest.get('scan', [])
-    if not scan:
-        return
-
-    thr = np.asarray([x['thr'] for x in scan], dtype=np.float32)
-    ba = np.asarray([x['ba_bgfg'] for x in scan], dtype=np.float32)
-    dice = np.asarray([x['fg_dice'] for x in scan], dtype=np.float32)
-    gap = np.asarray([abs(x['pred_fg_ratio'] - x['gt_fg_ratio']) for x in scan], dtype=np.float32)
-
-    fig, ax1 = plt.subplots(figsize=(10, 4.5))
-    ax1.plot(thr, ba, color='#1f77b4', linewidth=1.8, label='BA(BG/FG)')
-    ax1.plot(thr, dice, color='#ff7f0e', linewidth=1.8, label='FG Dice')
-    ax1.set_xlabel('FG Threshold')
-    ax1.set_ylabel('Score (%)')
-    ax1.grid(True, alpha=0.25)
-    ax1.legend(loc='upper left')
-
-    ax2 = ax1.twinx()
-    ax2.plot(thr, gap, color='#2ca02c', linestyle='--', linewidth=1.5, label='|PredFG-GtFG|')
-    ax2.set_ylabel('FG Ratio Gap (%)')
-
-    ax1.set_title(f"{model_name} — FG Threshold Scan (epoch {latest.get('epoch', '?')})")
-    plt.tight_layout()
-    plt.savefig(os.path.join(output, 'bgfg_threshold_scan.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-
-
-def _worker_plot_fg_ratio_trajectory(pred_fg_hist, gt_fg_hist, model_name, output):
-    """Worker: plot FG predicted/GT ratio trajectory across epochs."""
-    matplotlib.use('Agg')
-    if not pred_fg_hist or not gt_fg_hist:
-        return
-
-    n = min(len(pred_fg_hist), len(gt_fg_hist))
-    x = np.arange(1, n + 1)
-    pred = np.asarray(pred_fg_hist[:n], dtype=np.float32)
-    gt = np.asarray(gt_fg_hist[:n], dtype=np.float32)
-
-    fig, ax = plt.subplots(figsize=(10, 4.5))
-    ax.plot(x, pred, marker='o', markersize=3, linewidth=1.5, label='Pred FG ratio (%)')
-    ax.plot(x, gt, marker='s', markersize=3, linewidth=1.5, label='GT FG ratio (%)')
-    ax.plot(x, pred - gt, linestyle='--', linewidth=1.2, label='Pred-GT gap (%)')
-    ax.set_xlabel('Eval Epoch')
-    ax.set_ylabel('Ratio / Gap (%)')
-    ax.set_title(f'{model_name} — FG Ratio Trajectory', fontsize=13, fontweight='bold')
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(output, 'fg_ratio_trajectory.png'), dpi=150, bbox_inches='tight')
-    plt.close()
-
-
-def _worker_write_pairwise_fg_metrics(pairwise_text: str, output: str):
-    """Worker: write FG pairwise recall diagnostics to text file."""
+def _worker_write_pairwise_class_metrics(pairwise_text: str, output: str):
+    """Worker: write pairwise class recall diagnostics to text file."""
     if not pairwise_text:
         return
-    with open(os.path.join(output, 'classification_metrics_fg_pairwise.txt'), 'w') as f:
+    with open(os.path.join(output, 'classification_metrics_pairwise.txt'), 'w') as f:
         f.write(pairwise_text)
 
 
@@ -915,8 +519,6 @@ class hsTrainer(BaseEstimator):
                   f"test: {len(test_loader)} batches)")
         else:
             self._load_data()
-        self.stage_a_max_epochs = int(max(0, getattr(self.config.common, 'stage_a_max_epochs', 0)))
-        self.stage_b_max_epochs = int(max(0, getattr(self.config.common, 'stage_b_max_epochs', 0)))
         self._create_model()
         self._setup_multi_gpu()
         self._setup_training()
@@ -926,10 +528,6 @@ class hsTrainer(BaseEstimator):
         self.train_accs = []
         self.eval_accs = []
         self.eval_losses = []
-        self.train_bgfg_losses = []
-        self.train_fg_class_losses = []
-        self.eval_bgfg_losses = []
-        self.eval_fg_class_losses = []
         self.epoch_metrics = []
         self.best_acc = 0.0
         self.best_epoch = 0
@@ -940,8 +538,6 @@ class hsTrainer(BaseEstimator):
         self.grad_norms = []          # gradient L2 norm per epoch
         self.epoch_times = []         # wall-clock time per epoch
         self._eval_call_counter = 0
-        self.stage_history = []
-        self.stage_transition_log = []
 
         tprint(f"Trainer Initialized successfully with:")
         print(f"  model: {self.model_name}")
@@ -1027,9 +623,9 @@ class hsTrainer(BaseEstimator):
 
     @staticmethod
     def _metric_labels_from_config(config: Munch, num_classes: int):
-        """Return class indices used for metrics (optionally exclude BG=0)."""
-        exclude_bg = bool(getattr(config.common, 'exclude_bg_in_metrics', True))
-        if exclude_bg and num_classes > 1:
+        """Return class indices used for metrics (optionally exclude class-0)."""
+        exclude_class0 = bool(getattr(config.common, 'exclude_class0_in_metrics', True))
+        if exclude_class0 and num_classes > 1:
             labels = list(range(1, num_classes))
         else:
             labels = list(range(num_classes))
@@ -1171,206 +767,25 @@ class hsTrainer(BaseEstimator):
         return ba, kappa, miou
 
     def _select_early_stop_score(self) -> float:
-        """Choose scalar score for early stopping according to config."""
-        metric = getattr(self, 'early_stop_metric', 'composite')
-        if metric == 'hybrid':
-            ba_bgfg = float(getattr(self, '_last_ba_bgfg', 0.0))
-            ba_fg = float(getattr(self, '_last_ba_fg', 0.0))
-            fg_min_recall = float(getattr(self, '_last_fg_min_recall', 0.0))
-            score = (
-                self.metric_weight_bgfg * ba_bgfg
-                + self.metric_weight_fg * ba_fg
-                + self.metric_weight_fg_min_recall * fg_min_recall
-            )
-            if ba_bgfg < self.hybrid_min_ba_bgfg:
-                score -= self.hybrid_low_metric_penalty
-            if fg_min_recall < self.hybrid_min_fg_recall:
-                score -= self.hybrid_low_metric_penalty
-            return float(score)
-        if metric == 'fg':
-            return float(getattr(self, '_last_ba_fg', 0.0))
-        if metric == 'all':
-            return float(getattr(self, '_last_ba_all', 0.0))
-        fg = float(getattr(self, '_last_ba_fg', 0.0))
-        all_ = float(getattr(self, '_last_ba_all', 0.0))
-        return self.metric_weight_fg * fg + self.metric_weight_all * all_
-
-    def _current_stage_metric(self, stage: Optional[str] = None) -> float:
-        stage = str(stage or getattr(self, 'current_stage', 'C')).upper()
-        if stage == 'A':
-            ba_bgfg = float(getattr(self, '_last_ba_bgfg', 0.0))
-            ba_boundary = float(getattr(self, '_last_ba_bgfg_boundary', ba_bgfg))
-            w = float(np.clip(getattr(self, 'stage_a_boundary_metric_weight', 0.0), 0.0, 1.0))
-            return (1.0 - w) * ba_bgfg + w * ba_boundary
-        if stage == 'B':
-            ba_fg = float(getattr(self, '_last_ba_fg', 0.0))
-            fg_min_recall = float(getattr(self, '_last_fg_min_recall', ba_fg))
-            w = float(np.clip(getattr(self, 'stage_b_min_recall_metric_weight', 0.0), 0.0, 1.0))
-            return (1.0 - w) * ba_fg + w * fg_min_recall
-        return float(self._select_early_stop_score())
-
-    def _record_stage_metric(self, metric: float) -> None:
-        m = float(np.clip(getattr(self, 'stage_metric_ema_alpha', 0.6), 0.0, 0.99))
-        if self._stage_metric_ema is None:
-            self._stage_metric_ema = float(metric)
-        else:
-            self._stage_metric_ema = m * float(self._stage_metric_ema) + (1.0 - m) * float(metric)
-
-        metric_ref = float(self._stage_metric_ema)
-        if metric_ref > self._stage_best_metric + 1e-6:
-            self._stage_best_metric = metric_ref
-            self._stage_bad_epochs = 0
-        else:
-            self._stage_bad_epochs += 1
-
-    def _transition_stage(self, next_stage: str, epoch: int, metric: float, reason: str) -> None:
-        prev_stage = str(self.current_stage)
-        if prev_stage == next_stage:
-            return
-        self.stage_transition_log.append({
-            'epoch': int(epoch + 1),
-            'from': prev_stage,
-            'to': str(next_stage),
-            'metric': float(metric),
-            'reason': str(reason),
-        })
-        self.current_stage = str(next_stage)
-        self.stage_start_epoch = int(epoch + 1)
-        self._stage_best_metric = -1e18
-        self._stage_bad_epochs = 0
-        self._stage_metric_ema = None
-
-        if prev_stage == 'A' and str(next_stage) == 'B':
-            self._save_bgfg_split_snapshot(epoch=epoch, metric=metric, reason=reason)
-
-    def _maybe_advance_stage(self, epoch: int) -> None:
-        if self.stage_override in {'A', 'B', 'C'}:
-            self.current_stage = self.stage_override
-            return
-
-        stage = str(self.current_stage)
-        metric = self._current_stage_metric(stage)
-        self._record_stage_metric(metric)
-        elapsed = int(epoch + 1 - self.stage_start_epoch)
-
-        if stage == 'A':
-            a_boundary = float(getattr(self, '_last_ba_bgfg_boundary', 0.0))
-            cond_min_epoch = elapsed >= self.stage_a_min_epochs
-            cond_target = (
-                metric >= self.stage_a_target_ba_bgfg
-                and a_boundary >= self.stage_a_target_ba_bgfg_boundary
-            )
-            cond_plateau = (
-                self._stage_bad_epochs >= self.stage_transition_patience
-                and a_boundary >= self.stage_a_min_boundary_ba_for_transition
-            )
-            if cond_min_epoch and (cond_target or cond_plateau):
-                reason = 'reach_target' if cond_target else 'plateau'
-                self._transition_stage('B', epoch, metric, reason)
-                return
-
-            if self.stage_a_max_epochs > 0 and elapsed >= self.stage_a_max_epochs:
-                self._transition_stage('B', epoch, metric, 'max_stage_a_epochs')
-                return
-
-        if stage == 'B':
-            fg_min_recall = float(getattr(self, '_last_fg_min_recall', 0.0))
-            cond_min_epoch = elapsed >= self.stage_b_min_epochs
-            cond_target = (
-                metric >= self.stage_b_target_ba_fg
-                and fg_min_recall >= self.stage_b_target_fg_min_recall
-            )
-            cond_plateau = (
-                self._stage_bad_epochs >= self.stage_transition_patience
-                and fg_min_recall >= self.stage_b_min_fg_recall_for_c
-            )
-            if cond_min_epoch and (cond_target or cond_plateau):
-                reason = 'reach_target' if cond_target else 'plateau'
-                self._transition_stage('C', epoch, metric, reason)
-                return
-
-            remaining_epochs_b = int(self.epochs - (epoch + 1))
-            if (
-                self.stage_b_max_epochs > 0
-                and elapsed >= self.stage_b_max_epochs
-                and remaining_epochs_b >= self.stage_c_min_epochs
-            ):
-                self._transition_stage('C', epoch, metric, 'max_stage_b_epochs')
-                return
-
-        remaining_epochs = int(self.epochs - (epoch + 1))
-        if stage == 'A':
-            # Keep strict A->B->C semantics: never jump from A directly to C.
-            if remaining_epochs <= (self.stage_b_min_epochs + self.stage_c_min_epochs):
-                self._transition_stage('B', epoch, metric, 'force_stage_b_before_joint')
-                return
-
-        if stage == 'B':
-            if remaining_epochs <= self.stage_c_min_epochs:
-                fg_min_recall = float(getattr(self, '_last_fg_min_recall', 0.0))
-                if (fg_min_recall >= self.stage_b_force_c_min_fg_recall) or (remaining_epochs <= 1):
-                    self._transition_stage('C', epoch, metric, 'force_joint_finetune')
+        """Choose scalar score for early stopping."""
+        return float(getattr(self, '_last_ba', 0.0))
 
     def _parse_model_outputs(self, outputs):
-        """Parse model outputs and return (fused_logits, fg_bg_logits, fg_class_logits)."""
+        """Parse model outputs and return dense class logits [B, C, H, W]."""
         if isinstance(outputs, dict):
-            fused = outputs.get('fused_logits')
-            fg_bg = outputs.get('fg_bg_logits')
-            fg_cls = outputs.get('fg_class_logits')
+            logits = outputs.get('logits')
         elif isinstance(outputs, (tuple, list)):
-            if len(outputs) < 3:
-                raise ValueError("Model must return (fused_logits, fg_bg_logits, fg_class_logits)")
-            fused, fg_bg, fg_cls = outputs[0], outputs[1], outputs[2]
+            if len(outputs) < 1:
+                raise ValueError("Model output tuple/list is empty")
+            logits = outputs[0]
+        elif torch.is_tensor(outputs):
+            logits = outputs
         else:
-            raise TypeError("Model output must be tuple/list/dict with two-stage heads")
+            raise TypeError("Model output must be tensor/tuple/list/dict")
 
-        if fused is None or fg_bg is None or fg_cls is None:
-            raise ValueError("Model output missing required two-stage logits")
-        return fused, fg_bg, fg_cls
-
-    @staticmethod
-    def _decode_two_stage_predictions(fg_bg_logits: torch.Tensor,
-                                      fg_class_logits: torch.Tensor,
-                                      fg_threshold: float = -1.0,
-                                      fg_class_min_conf: float = -1.0,
-                                      fg_class_logit_bias: Optional[torch.Tensor] = None,
-                                      fg_class_min_conf_per_class: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Decode final class labels via two-step decision.
-
-        Step 1: FG/BG from ``fg_bg_logits`` (argmax over 2 channels).
-        Step 2: For FG pixels only, argmax over ``fg_class_logits`` and shift by +1.
-        """
-        fg_bg_logits = torch.nan_to_num(fg_bg_logits, nan=0.0, posinf=50.0, neginf=-50.0)
-        fg_class_logits = torch.nan_to_num(fg_class_logits, nan=0.0, posinf=50.0, neginf=-50.0)
-
-        decode_fg_logits = fg_class_logits.float()
-        if fg_class_logit_bias is not None:
-            bias = fg_class_logit_bias.to(decode_fg_logits.device, dtype=decode_fg_logits.dtype).view(1, -1, 1, 1)
-            if bias.shape[1] == decode_fg_logits.shape[1]:
-                decode_fg_logits = decode_fg_logits + bias
-
-        fg_bg_pred = torch.argmax(fg_bg_logits, dim=1)
-        fg_cls_pred = torch.argmax(decode_fg_logits, dim=1) + 1
-        fg_cls_probs = F.softmax(decode_fg_logits, dim=1)
-        fg_cls_conf = fg_cls_probs.max(dim=1).values
-
-        if float(fg_threshold) >= 0.0:
-            # Use FP32 softmax for stable thresholding under AMP/FP16.
-            p_bgfg = F.softmax(fg_bg_logits.float(), dim=1)
-            fg_mask = (p_bgfg[:, 1, :, :] >= float(fg_threshold))
-        else:
-            fg_mask = (fg_bg_pred > 0)
-
-        pred = torch.zeros_like(fg_bg_pred, dtype=torch.long)
-        if float(fg_class_min_conf) >= 0.0:
-            fg_mask = fg_mask & (fg_cls_conf >= float(fg_class_min_conf))
-        if fg_class_min_conf_per_class is not None and fg_class_min_conf_per_class.numel() == fg_cls_probs.shape[1]:
-            per_class_thr = fg_class_min_conf_per_class.to(fg_cls_probs.device, dtype=fg_cls_probs.dtype)
-            pred_fg_idx = (fg_cls_pred - 1).clamp(min=0)
-            pred_fg_thr = per_class_thr[pred_fg_idx]
-            fg_mask = fg_mask & (fg_cls_conf >= pred_fg_thr)
-        pred[fg_mask] = fg_cls_pred[fg_mask]
-        return pred
+        if logits is None:
+            raise ValueError("Model output missing logits")
+        return logits
     
     def _setup_device(self) -> None:
         """setup device and validate multi-GPU configuration"""
@@ -1583,7 +998,7 @@ class hsTrainer(BaseEstimator):
         # Optimizer with decoupled learning rates: backbone lower, heads higher.
         lr = self.config.common.lr
         weight_decay = self.config.common.weight_decay
-        head_keys = ('fg_bg_head', 'fg_class_head', 'boundary_head', 'seg_decoder', 'aux_')
+        head_keys = ('seg_decoder', 'seg_head')
         backbone_params, head_params = [], []
         for name, p in self.model.named_parameters():
             if not p.requires_grad:
@@ -1716,52 +1131,27 @@ class hsTrainer(BaseEstimator):
         except Exception as e:
             print(f"  Warning: uniform class weights ({e})")
 
-        self.early_stop_metric = str(getattr(self.config.common, 'early_stop_metric', 'composite')).lower()
-        self.metric_weight_fg = float(getattr(self.config.common, 'metric_weight_fg', 0.5))
-        self.metric_weight_all = float(getattr(self.config.common, 'metric_weight_all', 0.5))
-        self.metric_weight_bgfg = float(getattr(self.config.common, 'metric_weight_bgfg', 0.4))
-        self.metric_weight_fg_min_recall = float(getattr(self.config.common, 'metric_weight_fg_min_recall', 0.2))
-        self.hybrid_min_ba_bgfg = float(getattr(self.config.common, 'hybrid_min_ba_bgfg', 52.0))
-        self.hybrid_min_fg_recall = float(getattr(self.config.common, 'hybrid_min_fg_recall', 10.0))
-        self.hybrid_low_metric_penalty = float(getattr(self.config.common, 'hybrid_low_metric_penalty', 8.0))
+        self.early_stop_metric = str(getattr(self.config.common, 'early_stop_metric', 'eval')).lower()
         self.save_topk = int(max(1, getattr(self.config.common, 'save_topk_models', 3)))
         self.topk_models = []
 
         if self.config.clsf.num <= 1:
-            raise ValueError("Two-stage supervision requires clsf.num > 1")
+            raise ValueError("Segmentation supervision requires clsf.num > 1")
 
-        fg_w = float(getattr(self.config.common, 'fg_loss_weight', 1.0))
-        bgfg_w = float(getattr(self.config.common, 'bgfg_loss_weight', 0.5))
-        
-        # HierarchicalSegLoss combines:
-        # fg_bg_seghead: binary loss for fg/bg separation.
-        # fg_class_seghead: focal loss for fg inner classification.
-        self.criterion = HierarchicalSegLoss(
-            num_classes=self.config.clsf.num,
+        self.criterion = SegmentationLoss(
             class_weight=class_weights,
-            fg_weight=fg_w,
-            bgfg_weight=bgfg_w,
-            bgfg_pos_weight=float(getattr(self.config.common, 'bgfg_pos_weight', 2.0)),
-            bgfg_hard_neg_weight=float(getattr(self.config.common, 'bgfg_hard_neg_weight', 2.0)),
-            bgfg_boundary_weight=float(getattr(self.config.common, 'bgfg_boundary_weight', 0.0)),
-            boundary_weight=float(getattr(self.config.common, 'boundary_loss_weight', 0.2)),
-            aux_weight=float(getattr(self.config.common, 'aux_loss_weight', 0.3)),
-            fg_loss_type=str(getattr(self.config.common, 'fg_loss_type', 'focal')),
-            cb_beta=float(getattr(self.config.common, 'cb_beta', 0.999)),
-            logit_adjust_tau=float(getattr(self.config.common, 'logit_adjust_tau', 1.0)),
-            bg_suppress_weight=float(getattr(self.config.common, 'bg_suppress_weight', 0.05)),
-            bg_suppress_threshold=float(getattr(self.config.common, 'bg_suppress_threshold', 0.2)),
-            stage_b_bgfg_anchor_weight=float(getattr(self.config.common, 'stage_b_bgfg_anchor_weight', 0.0)),
-            stage_b_weak_cls_focus=float(getattr(self.config.common, 'stage_b_weak_cls_focus', 0.0)),
-            stage_b_weak_cls_boost_max=float(getattr(self.config.common, 'stage_b_weak_cls_boost_max', 1.8)),
-            stage_b_weak_cls_boost_momentum=float(getattr(self.config.common, 'stage_b_weak_cls_boost_momentum', 0.6)),
-            stage_c_boundary_boost_max=float(getattr(self.config.common, 'stage_c_boundary_boost_max', 2.0)),
-            stage_c_boundary_boost_min=float(getattr(self.config.common, 'stage_c_boundary_boost_min', 0.75)),
             gamma=focal_gamma,
             ignore_index=255,
             label_smoothing=getattr(self.config.common, 'label_smoothing', 0.0),
+            dice_weight=float(getattr(self.config.common, 'loss_dice_weight', 0.35)),
+            boundary_weight=float(getattr(self.config.common, 'loss_boundary_weight', 0.20)),
+            boundary_dilation=int(getattr(self.config.common, 'loss_boundary_dilation', 1)),
         )
-        print(f"  HierarchicalSegLoss(gamma={focal_gamma}, fg_w={fg_w}, bgfg_w={bgfg_w})")
+        print(
+            f"  SegmentationLoss(gamma={focal_gamma}, "
+            f"dice_w={getattr(self.config.common, 'loss_dice_weight', 0.35)}, "
+            f"boundary_w={getattr(self.config.common, 'loss_boundary_weight', 0.20)})"
+        )
         
         # Mixed precision
         use_amp = self.config.common.use_amp and self.device.type == 'cuda'
@@ -1777,80 +1167,7 @@ class hsTrainer(BaseEstimator):
         self.max_val_batches_per_epoch = int(
             getattr(self.config.common, 'max_val_batches_per_epoch', 0)
         )
-        decode_thr_cfg = getattr(self.config.common, 'eval_decode_fg_threshold', None)
-        if decode_thr_cfg is None:
-            decode_thr_cfg = getattr(self.config.common, 'eval_fg_gate_threshold', -1.0)
-        self.eval_decode_fg_threshold = float(decode_thr_cfg)
-        self.auto_calibrate_fg_threshold = bool(getattr(self.config.common, 'auto_calibrate_fg_threshold', True))
-        self.fg_threshold_metric = str(getattr(self.config.common, 'fg_threshold_metric', 'ba_bgfg')).lower()
-        self.best_fg_threshold = 0.55 if self.eval_decode_fg_threshold < 0.0 else self.eval_decode_fg_threshold
-        self.eval_fg_class_min_conf = float(getattr(self.config.common, 'eval_fg_class_min_conf', -1.0))
-        fg_bias_cfg = list(getattr(self.config.common, 'eval_fg_class_logit_bias', []))
-        fg_dim = max(0, int(self.config.clsf.num) - 1)
-        if len(fg_bias_cfg) == fg_dim and fg_dim > 0:
-            self.eval_fg_class_logit_bias = torch.as_tensor(fg_bias_cfg, dtype=torch.float32)
-        else:
-            self.eval_fg_class_logit_bias = torch.zeros(fg_dim, dtype=torch.float32)
-        fg_min_conf_pc_cfg = list(getattr(self.config.common, 'eval_fg_class_min_conf_per_class', []))
-        if len(fg_min_conf_pc_cfg) == fg_dim and fg_dim > 0:
-            self.eval_fg_class_min_conf_per_class = torch.as_tensor(fg_min_conf_pc_cfg, dtype=torch.float32)
-        else:
-            self.eval_fg_class_min_conf_per_class = torch.full((fg_dim,), -1.0, dtype=torch.float32)
-        self._last_threshold_scan = []
-        self.threshold_scan_history = []
-        self._last_selected_fg_threshold = float(self.best_fg_threshold)
-        self.stage_rescue_ba_bgfg_threshold = float(getattr(self.config.common, 'stage_rescue_ba_bgfg_threshold', 40.0))
-        self.stage_rescue_epoch_limit = int(getattr(self.config.common, 'stage_rescue_epoch_limit', 3))
-        self.stage_override = None
-        self.stage_transition_patience = int(getattr(self.config.common, 'stage_transition_patience', 3))
-        self.stage_a_min_epochs = int(getattr(self.config.common, 'stage_a_min_epochs', max(1, int(round(self.epochs * 0.15)))))
-        self.stage_b_min_epochs = int(getattr(self.config.common, 'stage_b_min_epochs', max(1, int(round(self.epochs * 0.35)))))
-        self.stage_c_min_epochs = int(getattr(self.config.common, 'stage_c_min_epochs', 3))
-        self.stage_a_target_ba_bgfg = float(getattr(self.config.common, 'stage_a_target_ba_bgfg', 80.0))
-        self.stage_b_target_ba_fg = float(getattr(self.config.common, 'stage_b_target_ba_fg', 70.0))
-        self.stage_a_target_ba_bgfg_boundary = float(
-            getattr(self.config.common, 'stage_a_target_ba_bgfg_boundary', 55.0)
-        )
-        self.stage_a_min_boundary_ba_for_transition = float(
-            getattr(self.config.common, 'stage_a_min_boundary_ba_for_transition', 50.0)
-        )
-        self.stage_a_boundary_metric_weight = float(
-            np.clip(getattr(self.config.common, 'stage_a_boundary_metric_weight', 0.45), 0.0, 1.0)
-        )
-        self.stage_b_target_fg_min_recall = float(
-            getattr(self.config.common, 'stage_b_target_fg_min_recall', 20.0)
-        )
-        self.stage_b_weak_cls_target_recall = float(
-            getattr(self.config.common, 'stage_b_weak_cls_target_recall', self.stage_b_target_fg_min_recall)
-        )
-        self.stage_b_min_fg_recall_for_c = float(
-            getattr(self.config.common, 'stage_b_min_fg_recall_for_c', 12.0)
-        )
-        self.stage_b_force_c_min_fg_recall = float(
-            getattr(self.config.common, 'stage_b_force_c_min_fg_recall', self.stage_b_min_fg_recall_for_c)
-        )
-        self.stage_b_min_recall_metric_weight = float(
-            np.clip(getattr(self.config.common, 'stage_b_min_recall_metric_weight', 0.35), 0.0, 1.0)
-        )
         self.eval_boundary_band_dilation = int(max(0, getattr(self.config.common, 'eval_boundary_band_dilation', 2)))
-        self.stage_c_boundary_target_ba = float(
-            getattr(self.config.common, 'stage_c_boundary_target_ba', self.stage_a_target_ba_bgfg_boundary)
-        )
-        self.stage_eval_uncapped = bool(getattr(self.config.common, 'stage_eval_uncapped', True))
-        self.calibrate_threshold_stage_c_only = bool(getattr(self.config.common, 'calibrate_threshold_stage_c_only', True))
-        self.stage_metric_ema_alpha = float(np.clip(getattr(self.config.common, 'stage_metric_ema_alpha', 0.6), 0.0, 0.99))
-        self._stage_metric_ema = None
-        self.stage_b_keep_bgfg_head = bool(getattr(self.config.common, 'stage_b_keep_bgfg_head', False))
-        extra_patterns = list(getattr(self.config.common, 'stage_b_extra_patterns', []))
-        if not extra_patterns:
-            extra_patterns = ['seg_decoder', 'transformer_levels', 'downsample_', 'patch_embed', 'spectral_conv']
-        self.stage_b_extra_patterns = [str(x) for x in extra_patterns]
-        self.current_stage = str(getattr(self.config.common, 'stage_start', 'A')).upper()
-        if self.current_stage not in {'A', 'B', 'C'}:
-            self.current_stage = 'A'
-        self.stage_start_epoch = 0
-        self._stage_best_metric = -1e18
-        self._stage_bad_epochs = 0
         if self.max_val_batches_per_epoch <= 0 and self.max_train_batches_per_epoch > 0:
             # Keep validation affordable by default; can be overridden explicitly.
             self.max_val_batches_per_epoch = max(1, self.max_train_batches_per_epoch // 2)
@@ -1868,13 +1185,7 @@ class hsTrainer(BaseEstimator):
         if self.max_val_batches_per_epoch > 0:
             print(f"  Val eval cap: {self.max_val_batches_per_epoch} batches/eval")
 
-        # Backward-compatible fields for external code paths that still inspect ratio schedule.
-        self.stage_a_epochs = self.stage_a_min_epochs
-        self.stage_b_epochs = self.stage_b_min_epochs
-        self.stage_c_start = min(self.epochs - 1, self.stage_a_epochs + self.stage_b_epochs)
-        self._last_fg_class_recalls = np.zeros(max(1, int(self.config.clsf.num) - 1), dtype=np.float32)
-    
-    def train_epoch(self, epoch: int) -> Tuple[float, float, float, float]:
+    def train_epoch(self, epoch: int) -> Tuple[float, float]:
         """
         Train for a single epoch.
         This method uses indexed batch unpacking and non-blocking transfers,
@@ -1889,14 +1200,8 @@ class hsTrainer(BaseEstimator):
         """
         self.model.train()
         total_loss = 0.0
-        total_bgfg_loss = 0.0
-        total_fg_class_loss = 0.0
         correct = 0
         total = 0
-
-        stage = self._apply_training_stage(epoch)
-        if hasattr(self.criterion, 'set_active_stage'):
-            self.criterion.set_active_stage(stage)
 
         if epoch < self.warmup_epochs:
             warmup_factor = (epoch + 1) / self.warmup_epochs
@@ -1930,8 +1235,8 @@ class hsTrainer(BaseEstimator):
                 if self.use_amp:
                     with autocast():
                         outputs = self.model(hsi)
-                        _, fg_bg_logits, fg_class_logits = self._parse_model_outputs(outputs)
-                        loss, bgfg_loss, fg_class_loss = self.criterion.decompose(outputs, labels)
+                        logits = self._parse_model_outputs(outputs)
+                        loss = self.criterion(logits, labels)
                     self.scaler.scale(loss).backward()
                     if self.grad_clip > 0:
                         self.scaler.unscale_(self.optimizer)
@@ -1940,8 +1245,8 @@ class hsTrainer(BaseEstimator):
                     self.scaler.update()
                 else:
                     outputs = self.model(hsi)
-                    _, fg_bg_logits, fg_class_logits = self._parse_model_outputs(outputs)
-                    loss, bgfg_loss, fg_class_loss = self.criterion.decompose(outputs, labels)
+                    logits = self._parse_model_outputs(outputs)
+                    loss = self.criterion(logits, labels)
                     loss.backward()
                     if self.grad_clip > 0:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
@@ -1952,27 +1257,21 @@ class hsTrainer(BaseEstimator):
                     self.scheduler.step()
 
                 total_loss += float(loss.item())
-                total_bgfg_loss += float(bgfg_loss.item())
-                total_fg_class_loss += float(fg_class_loss.item())
                 with torch.no_grad():
-                    predicted = self._decode_two_stage_predictions(
-                        fg_bg_logits.detach(), fg_class_logits.detach(), fg_threshold=-1.0)
+                    predicted = torch.argmax(logits.detach(), dim=1)
                     valid_mask = (labels != 255)
                     total += int(valid_mask.sum().item())
                     correct += int(((predicted == labels) & valid_mask).sum().item())
 
                 acc = 100.0 * correct / total if total > 0 else 0.0
                 pbar.set_postfix({
-                    'bgfg_loss': f'{bgfg_loss.item():.4f}',
-                    'fg_class_loss': f'{fg_class_loss.item():.4f}',
+                    'loss': f'{loss.item():.4f}',
                     'acc': f'{acc:.2f}%',
                     'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
                 })
 
         processed_batches = max(batch_idx + 1 if 'batch_idx' in locals() else 0, 1)
         epoch_loss = total_loss / processed_batches
-        epoch_bgfg_loss = total_bgfg_loss / processed_batches
-        epoch_fg_class_loss = total_fg_class_loss / processed_batches
         epoch_acc = 100.0 * correct / total if total > 0 else 0.0
         
         # record lr for this epoch
@@ -1985,59 +1284,8 @@ class hsTrainer(BaseEstimator):
                 total_norm += p.grad.data.norm(2).item() ** 2
         self.grad_norms.append(total_norm ** 0.5)
         
-        return epoch_loss, epoch_acc, epoch_bgfg_loss, epoch_fg_class_loss
+        return epoch_loss, epoch_acc
 
-    def _apply_training_stage(self, epoch: int) -> str:
-        """Apply 3-stage training policy without changing external API."""
-        raw_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-
-        if self.stage_override in {'A', 'B', 'C'}:
-            stage = self.stage_override
-        else:
-            stage = str(getattr(self, 'current_stage', 'A')).upper()
-
-        def _match_any(name: str, patterns: List[str]) -> bool:
-            return any(pat in name for pat in patterns)
-
-        # Stage A: focus on FG/BG + decoder stability.
-        if stage == 'A':
-            # Prefer coarse FG/BG learning first; keep a light feature path trainable.
-            stage_a_patterns = [
-                'fg_bg_head',
-                'aux_fg_bg_head',
-                'seg_decoder',
-                'spectral_conv',
-                'in_conv',
-                'decoder_conv',
-                'stem',
-                'patch_embed',
-                'blocks.0',
-                'norm',
-            ]
-            for name, p in raw_model.named_parameters():
-                trainable = _match_any(name, stage_a_patterns)
-                p.requires_grad_(trainable)
-        # Stage B: focus on foreground subclass discrimination.
-        elif stage == 'B':
-            # Freeze BG/FG branch and train only FG-subclass heads.
-            stage_b_patterns = [
-                'fg_class_head',
-                'aux_fg_class_head',
-                'boundary_head',
-                'norm',
-            ]
-            if bool(getattr(self, 'stage_b_keep_bgfg_head', False)):
-                stage_b_patterns.extend(['fg_bg_head', 'aux_fg_bg_head'])
-            stage_b_patterns.extend(list(getattr(self, 'stage_b_extra_patterns', [])))
-            for name, p in raw_model.named_parameters():
-                trainable = _match_any(name, stage_b_patterns)
-                p.requires_grad_(trainable)
-        # Stage C: joint finetune.
-        else:
-            for p in raw_model.parameters():
-                p.requires_grad_(True)
-        return stage
-    
     @torch.no_grad()
     def evaluate(self, collect_extra: bool = False, use_ema: bool = False,
                  loader=None, collect_reconstruction: bool = False,
@@ -2058,7 +1306,7 @@ class hsTrainer(BaseEstimator):
                            (needed for plots) and softmax probabilities (ROC).
                            Only set True for the final evaluation — not every epoch.
             collect_reconstruction: if True, collect reconstruction maps only
-                           (no ROC/vis arrays), used by A->B BGFG snapshot.
+                           (no ROC/vis arrays).
             uncapped: if True, bypass eval batch cap and run full loader.
             use_ema: if True, temporarily swap in EMA shadow weights for
                      evaluation, then restore original weights.
@@ -2077,33 +1325,13 @@ class hsTrainer(BaseEstimator):
         self.model.eval()
         model_ref = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         num_classes = int(model_ref.num_classes)
-        metric_labels_fg = self._metric_labels(num_classes)
-        metric_labels_all = list(range(num_classes))
+        metric_labels_eval = self._metric_labels(num_classes)
 
         total_loss = 0.0
-        total_bgfg_loss = 0.0
-        total_fg_class_loss = 0.0
         cm_gpu = torch.zeros(num_classes, num_classes,
                              dtype=torch.long, device=self.device)
-        pred_fg_pixels = 0
-        gt_fg_pixels = 0
-        valid_pixels = 0
-        sum_fg_prob = 0.0
-        thr_grid = np.arange(0.30, 0.80 + 1e-9, 0.02, dtype=np.float32)
-        thr_tp = np.zeros_like(thr_grid, dtype=np.float64)
-        thr_fp = np.zeros_like(thr_grid, dtype=np.float64)
-        thr_tn = np.zeros_like(thr_grid, dtype=np.float64)
-        thr_fn = np.zeros_like(thr_grid, dtype=np.float64)
-        boundary_tp = 0.0
-        boundary_fp = 0.0
-        boundary_tn = 0.0
-        boundary_fn = 0.0
 
         using_val_loader = (loader is None and self.val_loader is not None) or (loader is self.val_loader)
-        decode_threshold = float(self.best_fg_threshold)
-        if self.eval_decode_fg_threshold >= 0:
-            decode_threshold = float(self.eval_decode_fg_threshold)
-        self._last_selected_fg_threshold = decode_threshold
 
         predictions_list = [] if collect_extra else None
         targets_list = [] if collect_extra else None
@@ -2122,9 +1350,6 @@ class hsTrainer(BaseEstimator):
                 eval_cap = self.max_val_batches_per_epoch
         if uncapped:
             eval_cap = 0
-        if collect_reconstruction and bool(getattr(self.config.common, 'bgfgsplit_collect_uncapped', False)):
-            eval_cap = 0
-
         total_eval_batches = len(eval_loader)
         selected_eval_batches = self._select_eval_batch_indices(total_eval_batches, eval_cap)
         if selected_eval_batches is None:
@@ -2158,69 +1383,19 @@ class hsTrainer(BaseEstimator):
                 if self.use_amp:
                     with autocast():
                         outputs = self.model(hsi)
-                        _, fg_bg_logits, fg_class_logits = self._parse_model_outputs(outputs)
-                        loss, bgfg_loss, fg_class_loss = self.criterion.decompose(outputs, labels)
+                        logits = self._parse_model_outputs(outputs)
+                        loss = self.criterion(logits, labels)
                 else:
                     outputs = self.model(hsi)
-                    _, fg_bg_logits, fg_class_logits = self._parse_model_outputs(outputs)
-                    loss, bgfg_loss, fg_class_loss = self.criterion.decompose(outputs, labels)
+                    logits = self._parse_model_outputs(outputs)
+                    loss = self.criterion(logits, labels)
 
                 total_loss += float(loss.item())
-                total_bgfg_loss += float(bgfg_loss.item())
-                total_fg_class_loss += float(fg_class_loss.item())
-                predicted = self._decode_two_stage_predictions(
-                    fg_bg_logits, fg_class_logits,
-                    fg_threshold=decode_threshold,
-                    fg_class_min_conf=self.eval_fg_class_min_conf,
-                    fg_class_logit_bias=self.eval_fg_class_logit_bias,
-                    fg_class_min_conf_per_class=self.eval_fg_class_min_conf_per_class)
+                predicted = torch.argmax(logits, dim=1)
 
                 valid_mask = (labels != 255)
                 pred_valid = predicted[valid_mask]
                 tgt_valid = labels[valid_mask]
-                v_count = int(valid_mask.sum().item())
-                if v_count > 0:
-                    valid_pixels += v_count
-                    pred_fg_pixels += int((pred_valid > 0).sum().item())
-                    gt_fg_pixels += int((tgt_valid > 0).sum().item())
-
-                    # Boundary-band FG/BG quality: evaluate on a dilated GT boundary mask.
-                    boundary_mask = (HierarchicalSegLoss._build_boundary_target(labels, 255) > 0.5)
-                    if self.eval_boundary_band_dilation > 0:
-                        k = 2 * self.eval_boundary_band_dilation + 1
-                        boundary_mask = F.max_pool2d(
-                            boundary_mask.float().unsqueeze(1),
-                            kernel_size=k,
-                            stride=1,
-                            padding=self.eval_boundary_band_dilation,
-                        ).squeeze(1) > 0.5
-                    boundary_valid = boundary_mask & valid_mask
-                    if boundary_valid.any():
-                        pred_fg_b = (predicted > 0)[boundary_valid]
-                        tgt_fg_b = (labels > 0)[boundary_valid]
-                        boundary_tp += float((pred_fg_b & tgt_fg_b).sum().item())
-                        boundary_fp += float((pred_fg_b & (~tgt_fg_b)).sum().item())
-                        boundary_fn += float(((~pred_fg_b) & tgt_fg_b).sum().item())
-                        boundary_tn += float(((~pred_fg_b) & (~tgt_fg_b)).sum().item())
-
-                    # Aggregate FG probabilities in FP32 to avoid FP16 overflow.
-                    p_bgfg = F.softmax(fg_bg_logits.float(), dim=1)
-                    fg_prob_valid = p_bgfg[:, 1, :, :][valid_mask]
-                    fg_prob_valid = torch.nan_to_num(fg_prob_valid, nan=0.0, posinf=1.0, neginf=0.0)
-                    sum_fg_prob += float(fg_prob_valid.sum(dtype=torch.float32).item())
-
-                    # Threshold scan for BG/FG calibration on validation set.
-                    tgt_fg_valid = (tgt_valid > 0)
-                    for i_thr, thr in enumerate(thr_grid):
-                        pred_fg_thr = (fg_prob_valid >= float(thr))
-                        tp = (pred_fg_thr & tgt_fg_valid).sum().item()
-                        fp = (pred_fg_thr & (~tgt_fg_valid)).sum().item()
-                        fn = ((~pred_fg_thr) & tgt_fg_valid).sum().item()
-                        tn = ((~pred_fg_thr) & (~tgt_fg_valid)).sum().item()
-                        thr_tp[i_thr] += tp
-                        thr_fp[i_thr] += fp
-                        thr_fn[i_thr] += fn
-                        thr_tn[i_thr] += tn
 
                 linear_idx = tgt_valid * num_classes + pred_valid
                 cm_gpu.view(-1).scatter_add_(
@@ -2229,16 +1404,7 @@ class hsTrainer(BaseEstimator):
                 )
 
                 if need_reconstruction:
-                    if collect_reconstruction and not collect_extra:
-                        # For A->B snapshot, use direct BG/FG head output to avoid FG-subclass decoding artifacts.
-                        pred_bin = torch.argmax(fg_bg_logits.float(), dim=1).long()
-                        label_bin = labels.clone().long()
-                        valid_bin = (label_bin != 255)
-                        label_bin[valid_bin] = (label_bin[valid_bin] > 0).long()
-                        label_bin[~valid_bin] = 255
-                        self._accumulate_reconstruction_batch(recon_state, pred_bin, label_bin, batch_meta=batch_meta)
-                    else:
-                        self._accumulate_reconstruction_batch(recon_state, predicted, labels, batch_meta=batch_meta)
+                    self._accumulate_reconstruction_batch(recon_state, predicted, labels, batch_meta=batch_meta)
 
                 if collect_extra:
                     # Keep full metrics from cm_gpu; store only sampled pixels for plotting.
@@ -2258,9 +1424,7 @@ class hsTrainer(BaseEstimator):
                                 labels[b_idx].detach().cpu().numpy(),
                             ))
 
-                    p_bgfg = F.softmax(fg_bg_logits.float(), dim=1)
-                    p_fg_cond = F.softmax(fg_class_logits.float(), dim=1)
-                    proba = torch.cat([p_bgfg[:, 0:1, :, :], p_fg_cond * p_bgfg[:, 1:2, :, :]], dim=1)
+                    proba = F.softmax(logits.float(), dim=1)
                     proba = torch.nan_to_num(proba, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
                     proba_valid = proba.permute(0, 2, 3, 1)[valid_mask]
                     n_v = proba_valid.shape[0]
@@ -2279,125 +1443,36 @@ class hsTrainer(BaseEstimator):
             pbar.close()
 
         cm_np = cm_gpu.cpu().numpy().astype(np.int64)
-        total = int(cm_np.sum())
-        oa = float(np.diag(cm_np).sum()) / max(total, 1) * 100
-
-        ba_all, kappa_all, miou_all = self._metrics_from_confusion(cm_np, metric_labels_all)
-        ba_fg, kappa_fg, miou_fg = self._metrics_from_confusion(cm_np, metric_labels_fg)
-
-        # FG/BG binary metrics derived from full confusion matrix (class 0 = BG).
-        tp_fg = float(cm_np[1:, 1:].sum()) if cm_np.shape[0] > 1 else 0.0
-        fn_fg = float(cm_np[1:, 0].sum()) if cm_np.shape[0] > 1 else 0.0
-        fp_fg = float(cm_np[0, 1:].sum()) if cm_np.shape[0] > 1 else 0.0
-        fg_precision = 100.0 * tp_fg / max(tp_fg + fp_fg, 1.0)
-        fg_recall = 100.0 * tp_fg / max(tp_fg + fn_fg, 1.0)
-        fg_dice = 100.0 * (2.0 * tp_fg) / max(2.0 * tp_fg + fp_fg + fn_fg, 1.0)
-
-        if self.early_stop_metric == 'fg':
-            acc = ba_fg
-            kappa = kappa_fg
-            miou = miou_fg
-        elif self.early_stop_metric == 'all':
-            acc = ba_all
-            kappa = kappa_all
-            miou = miou_all
-        else:
-            acc = self.metric_weight_fg * ba_fg + self.metric_weight_all * ba_all
-            kappa = self.metric_weight_fg * kappa_fg + self.metric_weight_all * kappa_all
-            miou = self.metric_weight_fg * miou_fg + self.metric_weight_all * miou_all
+        ba_metric, kappa_metric, miou_metric = self._metrics_from_confusion(cm_np, metric_labels_eval)
+        acc = ba_metric
+        kappa = kappa_metric
+        miou = miou_metric
 
         processed_eval_batches = max(processed_eval_batches, 1)
         loss = total_loss / processed_eval_batches
-        self._last_eval_bgfg_loss = total_bgfg_loss / processed_eval_batches
-        self._last_eval_fg_class_loss = total_fg_class_loss / processed_eval_batches
-        self._last_oa = oa
-        self._last_ba_all = ba_all
-        self._last_ba_fg = ba_fg
-        self._last_kappa_all = kappa_all
-        self._last_kappa_fg = kappa_fg
-        self._last_miou_all = miou_all
-        self._last_miou_fg = miou_fg
+        self._last_eval_loss = loss
+        self._last_ba = ba_metric
+        self._last_kappa = kappa_metric
+        self._last_miou_metric = miou_metric
         self._last_miou = miou
-        self._last_fg_precision = fg_precision
-        self._last_fg_recall = fg_recall
-        self._last_fg_dice = fg_dice
-        self._last_pred_fg_ratio = (100.0 * pred_fg_pixels / max(valid_pixels, 1))
-        self._last_gt_fg_ratio = (100.0 * gt_fg_pixels / max(valid_pixels, 1))
-        self._last_ba_bgfg = 50.0 * (
-            tp_fg / max(tp_fg + fn_fg, 1.0) +
-            float(cm_np[0, 0]) / max(float(cm_np[0, :].sum()), 1.0)
-        ) if cm_np.shape[0] > 1 else 0.0
-        if (boundary_tp + boundary_fp + boundary_fn + boundary_tn) > 0:
-            self._last_ba_bgfg_boundary = 50.0 * (
-                boundary_tp / max(boundary_tp + boundary_fn, 1.0)
-                + boundary_tn / max(boundary_tn + boundary_fp, 1.0)
-            )
-        else:
-            self._last_ba_bgfg_boundary = float(self._last_ba_bgfg)
-
         if cm_np.shape[0] > 1:
-            fg_rows = cm_np[1:, :]
-            fg_row_sums = fg_rows.sum(axis=1).astype(np.float64)
-            fg_diag = np.diag(cm_np)[1:].astype(np.float64)
-            fg_valid_cls = fg_row_sums > 0
-            if fg_valid_cls.any():
-                fg_recalls = np.zeros_like(fg_row_sums, dtype=np.float64)
-                fg_recalls[fg_valid_cls] = fg_diag[fg_valid_cls] / np.maximum(fg_row_sums[fg_valid_cls], 1.0)
-                self._last_fg_min_recall = float(np.min(fg_recalls[fg_valid_cls]) * 100.0)
-                self._last_fg_mean_recall = float(np.mean(fg_recalls[fg_valid_cls]) * 100.0)
-                self._last_fg_class_recalls = (fg_recalls * 100.0).astype(np.float32)
+            eval_rows = cm_np[1:, :]
+            eval_row_sums = eval_rows.sum(axis=1).astype(np.float64)
+            eval_diag = np.diag(cm_np)[1:].astype(np.float64)
+            eval_valid_cls = eval_row_sums > 0
+            if eval_valid_cls.any():
+                eval_recalls = np.zeros_like(eval_row_sums, dtype=np.float64)
+                eval_recalls[eval_valid_cls] = eval_diag[eval_valid_cls] / np.maximum(eval_row_sums[eval_valid_cls], 1.0)
+                self._last_min_recall = float(np.min(eval_recalls[eval_valid_cls]) * 100.0)
+                self._last_mean_recall = float(np.mean(eval_recalls[eval_valid_cls]) * 100.0)
             else:
-                self._last_fg_min_recall = 0.0
-                self._last_fg_mean_recall = 0.0
-                self._last_fg_class_recalls = np.zeros_like(fg_row_sums, dtype=np.float32)
+                self._last_min_recall = 0.0
+                self._last_mean_recall = 0.0
         else:
-            self._last_fg_min_recall = 0.0
-            self._last_fg_mean_recall = 0.0
-            self._last_fg_class_recalls = np.zeros(max(1, int(self.config.clsf.num) - 1), dtype=np.float32)
-        mean_fg_prob = (100.0 * sum_fg_prob / max(valid_pixels, 1))
-        if not np.isfinite(mean_fg_prob):
-            tprint(f"  WARNING: non-finite mean FG prob detected ({mean_fg_prob}); clamped to 0.0")
-            mean_fg_prob = 0.0
-        self._last_mean_fg_prob = mean_fg_prob
+            self._last_min_recall = 0.0
+            self._last_mean_recall = 0.0
 
-        self._last_threshold_scan = []
-        calibrate_allowed = bool(self.auto_calibrate_fg_threshold)
-        if bool(getattr(self, 'calibrate_threshold_stage_c_only', False)):
-            calibrate_allowed = calibrate_allowed and (str(getattr(self, 'current_stage', 'C')) == 'C')
-
-        if using_val_loader and calibrate_allowed and thr_grid.size > 0:
-            best_idx = 0
-            best_tuple = (-1e9, -1e9, 1e9)  # primary score, secondary, fg-ratio-gap
-            gt_fg_ratio = 100.0 * (thr_tp[0] + thr_fn[0]) / max(thr_tp[0] + thr_fn[0] + thr_tn[0] + thr_fp[0], 1.0)
-            for i_thr, thr in enumerate(thr_grid):
-                tp = thr_tp[i_thr]
-                fp = thr_fp[i_thr]
-                fn = thr_fn[i_thr]
-                tn = thr_tn[i_thr]
-                tpr = tp / max(tp + fn, 1.0)
-                tnr = tn / max(tn + fp, 1.0)
-                ba_bgfg = 50.0 * (tpr + tnr)
-                fg_dice = 100.0 * (2.0 * tp) / max(2.0 * tp + fp + fn, 1.0)
-                pred_fg_ratio = 100.0 * (tp + fp) / max(tp + fp + tn + fn, 1.0)
-                fg_gap = abs(pred_fg_ratio - gt_fg_ratio)
-                self._last_threshold_scan.append({
-                    'thr': float(thr),
-                    'ba_bgfg': float(ba_bgfg),
-                    'fg_dice': float(fg_dice),
-                    'pred_fg_ratio': float(pred_fg_ratio),
-                    'gt_fg_ratio': float(gt_fg_ratio),
-                })
-                if self.fg_threshold_metric == 'fg_dice':
-                    candidate = (fg_dice, ba_bgfg, -fg_gap)
-                else:
-                    candidate = (ba_bgfg, fg_dice, -fg_gap)
-                if candidate > best_tuple:
-                    best_tuple = candidate
-                    best_idx = i_thr
-
-            self.best_fg_threshold = float(thr_grid[best_idx])
-            self._last_selected_fg_threshold = self.best_fg_threshold
-        self._metric_labels_used = metric_labels_fg
+        self._metric_labels_used = metric_labels_eval
 
         # final-eval: full arrays for plots / ROC (single GPU -> CPU transfer)
         if collect_extra:
@@ -2440,32 +1515,14 @@ class hsTrainer(BaseEstimator):
         fieldnames = [
             'epoch',
             'train_loss',
-            'train_bgfg_loss',
-            'train_fg_class_loss',
             'train_acc',
             'eval_loss',
-            'eval_bgfg_loss',
-            'eval_fg_class_loss',
             'eval_score',
-            'eval_ba_all',
-            'eval_ba_fg',
-            'eval_kappa_all',
-            'eval_kappa_fg',
-            'eval_miou_all',
-            'eval_miou_fg',
-            'eval_fg_precision',
-            'eval_fg_recall',
-            'eval_fg_dice',
-            'eval_ba_bgfg',
-            'eval_ba_bgfg_boundary',
-            'eval_fg_min_recall',
-            'eval_fg_mean_recall',
-            'eval_pred_fg_ratio',
-            'eval_gt_fg_ratio',
-            'eval_mean_fg_prob',
-            'eval_selected_fg_threshold',
-            'stage',
-            'stage_eval_metric',
+            'eval_ba',
+            'eval_kappa',
+            'eval_miou',
+            'eval_min_recall',
+            'eval_mean_recall',
         ]
 
         # Keep CSV writer robust when new metric keys are added in the future.
@@ -2490,7 +1547,6 @@ class hsTrainer(BaseEstimator):
         entry = {
             'epoch': int(epoch),
             'score': float(score),
-            'threshold': float(getattr(self, '_last_selected_fg_threshold', self.best_fg_threshold)),
             'model_state': state_cpu,
         }
         self.topk_models.append(entry)
@@ -2505,39 +1561,30 @@ class hsTrainer(BaseEstimator):
         if self.val_loader is None:
             return
 
-        prev_auto = self.auto_calibrate_fg_threshold
-        prev_thr = self.best_fg_threshold
-        self.auto_calibrate_fg_threshold = False
-
         best_entry = None
         best_eval_score = -1e18
         try:
             for entry in self.topk_models:
                 self.model.load_state_dict(entry['model_state'])
-                self.best_fg_threshold = float(entry.get('threshold', prev_thr))
-                self._last_selected_fg_threshold = self.best_fg_threshold
                 _ = self.evaluate(collect_extra=False, use_ema=False, loader=self.val_loader)
                 eval_score = self._select_early_stop_score()
                 if eval_score > best_eval_score:
                     best_eval_score = float(eval_score)
                     best_entry = entry
         finally:
-            self.auto_calibrate_fg_threshold = prev_auto
+            pass
 
         if best_entry is None:
-            self.best_fg_threshold = prev_thr
             return
 
         self.best_epoch = int(best_entry['epoch'])
         self.best_acc = float(best_entry['score'])
-        self.best_fg_threshold = float(best_entry.get('threshold', prev_thr))
         self.best_model_state = {
             'epoch': int(best_entry['epoch']),
             'model_state': best_entry['model_state'],
             'acc': float(best_entry['score']),
-            'kappa': float(getattr(self, '_last_kappa_fg', 0.0)),
+            'kappa': float(getattr(self, '_last_kappa', 0.0)),
         }
-        self._last_selected_fg_threshold = self.best_fg_threshold
         self._save_model()
     
     def train(self, _cv_mode: bool = False) -> Dict[str, float]:
@@ -2561,142 +1608,57 @@ class hsTrainer(BaseEstimator):
             tic = time.perf_counter()
 
             for epoch in range(self.epochs):
-                stage_this_epoch = str(getattr(self, 'current_stage', 'A')).upper()
-                self.stage_history.append(stage_this_epoch)
                 # training
                 epoch_tic = time.perf_counter()
-                train_loss, train_acc, train_bgfg_loss, train_fg_class_loss = self.train_epoch(epoch)
+                train_loss, train_acc = self.train_epoch(epoch)
                 self.epoch_times.append(time.perf_counter() - epoch_tic)
                 self.train_losses.append(train_loss)
                 self.train_accs.append(train_acc)
-                self.train_bgfg_losses.append(train_bgfg_loss)
-                self.train_fg_class_losses.append(train_fg_class_loss)
 
                 # validating
                 should_eval = ((epoch + 1) % self.eval_interval == 0) or (epoch + 1 == self.epochs)
 
                 if should_eval or self.debug_mode:
-                    collect_recon_now = (
-                        (stage_this_epoch == 'A')
-                        and bool(getattr(self.config.common, 'bgfgsplit_collect_from_eval', True))
-                        and ((epoch + 1) >= max(1, int(getattr(self, 'stage_a_min_epochs', 1))))
-                    )
                     # Evaluate on val set for early stopping (not test set)
                     eval_loss, eval_acc, kappa, pred, target = self.evaluate(
                         use_ema=True,
-                        collect_reconstruction=collect_recon_now,
+                        collect_reconstruction=False,
                     )
-
-                    if stage_this_epoch in {'A', 'B'} and self.stage_eval_uncapped:
-                        elapsed = int(epoch + 1 - self.stage_start_epoch)
-                        min_need = self.stage_a_min_epochs if stage_this_epoch == 'A' else self.stage_b_min_epochs
-                        if elapsed >= max(0, min_need - 1):
-                            _ = self.evaluate(
-                                use_ema=True,
-                                collect_reconstruction=False,
-                                uncapped=True,
-                            )
 
                     self.eval_losses.append(eval_loss)
                     self.eval_accs.append(eval_acc)
-                    self.eval_bgfg_losses.append(float(getattr(self, '_last_eval_bgfg_loss', 0.0)))
-                    self.eval_fg_class_losses.append(float(getattr(self, '_last_eval_fg_class_loss', 0.0)))
-                    eval_score = self._current_stage_metric(stage_this_epoch)
-
-                    if hasattr(self.criterion, 'set_fg_bias_feedback'):
-                        self.criterion.set_fg_bias_feedback(
-                            float(getattr(self, '_last_pred_fg_ratio', 0.0)),
-                            float(getattr(self, '_last_gt_fg_ratio', 0.0)),
-                        )
-                    if hasattr(self.criterion, 'set_fg_class_recall_feedback'):
-                        self.criterion.set_fg_class_recall_feedback(
-                            getattr(self, '_last_fg_class_recalls', None),
-                            float(getattr(self, 'stage_b_weak_cls_target_recall', self.stage_b_target_fg_min_recall)),
-                        )
-                    if hasattr(self.criterion, 'set_boundary_feedback'):
-                        self.criterion.set_boundary_feedback(
-                            float(getattr(self, '_last_ba_bgfg_boundary', 0.0)),
-                            float(getattr(self, 'stage_c_boundary_target_ba', self.stage_a_target_ba_bgfg_boundary)),
-                        )
-
-                    if (epoch + 1) <= max(1, self.stage_rescue_epoch_limit):
-                        ba_bgfg = float(getattr(self, '_last_ba_bgfg', 0.0))
-                        if ba_bgfg < self.stage_rescue_ba_bgfg_threshold:
-                            self.stage_override = 'B' if (epoch + 1) < self.stage_rescue_epoch_limit else 'C'
-
-                    self._maybe_advance_stage(epoch)
+                    eval_score = float(self._select_early_stop_score())
 
                     self.epoch_metrics.append({
                         'epoch': epoch + 1,
                         'train_loss': float(train_loss),
-                        'train_bgfg_loss': float(train_bgfg_loss),
-                        'train_fg_class_loss': float(train_fg_class_loss),
                         'train_acc': float(train_acc),
                         'eval_loss': float(eval_loss),
-                        'eval_bgfg_loss': float(getattr(self, '_last_eval_bgfg_loss', 0.0)),
-                        'eval_fg_class_loss': float(getattr(self, '_last_eval_fg_class_loss', 0.0)),
                         'eval_score': float(eval_score),
-                        'eval_ba_all': float(getattr(self, '_last_ba_all', eval_acc)),
-                        'eval_ba_fg': float(getattr(self, '_last_ba_fg', eval_acc)),
-                        'eval_kappa_all': float(getattr(self, '_last_kappa_all', kappa)),
-                        'eval_kappa_fg': float(getattr(self, '_last_kappa_fg', kappa)),
-                        'eval_miou_all': float(getattr(self, '_last_miou_all', 0.0)),
-                        'eval_miou_fg': float(getattr(self, '_last_miou_fg', 0.0)),
-                        'eval_fg_precision': float(getattr(self, '_last_fg_precision', 0.0)),
-                        'eval_fg_recall': float(getattr(self, '_last_fg_recall', 0.0)),
-                        'eval_fg_dice': float(getattr(self, '_last_fg_dice', 0.0)),
-                        'eval_ba_bgfg': float(getattr(self, '_last_ba_bgfg', 0.0)),
-                        'eval_ba_bgfg_boundary': float(getattr(self, '_last_ba_bgfg_boundary', 0.0)),
-                        'eval_fg_min_recall': float(getattr(self, '_last_fg_min_recall', 0.0)),
-                        'eval_fg_mean_recall': float(getattr(self, '_last_fg_mean_recall', 0.0)),
-                        'eval_pred_fg_ratio': float(getattr(self, '_last_pred_fg_ratio', 0.0)),
-                        'eval_gt_fg_ratio': float(getattr(self, '_last_gt_fg_ratio', 0.0)),
-                        'eval_mean_fg_prob': float(getattr(self, '_last_mean_fg_prob', 0.0)),
-                        'eval_selected_fg_threshold': float(getattr(self, '_last_selected_fg_threshold', self.best_fg_threshold)),
-                        'stage': stage_this_epoch,
-                        'stage_eval_metric': float(eval_score),
+                        'eval_ba': float(getattr(self, '_last_ba', eval_acc)),
+                        'eval_kappa': float(getattr(self, '_last_kappa', kappa)),
+                        'eval_miou': float(getattr(self, '_last_miou_metric', 0.0)),
+                        'eval_min_recall': float(getattr(self, '_last_min_recall', 0.0)),
+                        'eval_mean_recall': float(getattr(self, '_last_mean_recall', 0.0)),
                     })
-                    if getattr(self, '_last_threshold_scan', None):
-                        self.threshold_scan_history.append({
-                            'epoch': int(epoch + 1),
-                            'scan': copy.deepcopy(self._last_threshold_scan),
-                        })
 
                     miou_str = ''
                     if hasattr(self, '_last_miou'):
-                        miou_str = (
-                            f" mIoU(all/fg): "
-                            f"{getattr(self, '_last_miou_all', self._last_miou):6.2f}%/"
-                            f"{getattr(self, '_last_miou_fg', self._last_miou):6.2f}%"
-                        )
+                        miou_str = f" mIoU(eval): {getattr(self, '_last_miou_metric', self._last_miou):6.2f}%"
 
-                    oa_str = f' OA: {self._last_oa:6.2f}%' if hasattr(self, '_last_oa') else ''
                     eval_set_name = 'Val' if self.val_loader else 'Test'
                     tprint(f"\n[Epoch {epoch+1:3d}] "
-                          f"Train(bgfg/fg_cls): {train_bgfg_loss:.4f}/{train_fg_class_loss:.4f} Acc: {train_acc:6.2f}% | "
-                          f"{eval_set_name}(bgfg/fg_cls): {getattr(self, '_last_eval_bgfg_loss', 0.0):.4f}/{getattr(self, '_last_eval_fg_class_loss', 0.0):.4f} "
-                          f"BA(all/fg): {getattr(self, '_last_ba_all', eval_acc):6.2f}%/"
-                          f"{getattr(self, '_last_ba_fg', eval_acc):6.2f}%{oa_str} "
-                          f"Kappa(all/fg): {getattr(self, '_last_kappa_all', kappa):6.2f}%/"
-                          f"{getattr(self, '_last_kappa_fg', kappa):6.2f}% "
-                          f"FG(P/R/D): {getattr(self, '_last_fg_precision', 0.0):6.2f}%/"
-                          f"{getattr(self, '_last_fg_recall', 0.0):6.2f}%/"
-                          f"{getattr(self, '_last_fg_dice', 0.0):6.2f}% "
-                          f"BA(bgfg): {getattr(self, '_last_ba_bgfg', 0.0):6.2f}% "
-                          f"BA(boundary): {getattr(self, '_last_ba_bgfg_boundary', 0.0):6.2f}% "
-                          f"FGminR: {getattr(self, '_last_fg_min_recall', 0.0):6.2f}% "
-                          f"FGDiag(pred/gt/prob): {getattr(self, '_last_pred_fg_ratio', 0.0):6.2f}%/"
-                          f"{getattr(self, '_last_gt_fg_ratio', 0.0):6.2f}%/"
-                          f"{getattr(self, '_last_mean_fg_prob', 0.0):6.2f}% "
-                          f"Stage: {stage_this_epoch} "
-                          f"thr={getattr(self, '_last_selected_fg_threshold', self.best_fg_threshold):.2f} "
+                          f"Train(loss): {train_loss:.4f} Acc: {train_acc:6.2f}% | "
+                          f"{eval_set_name}(loss): {eval_loss:.4f} "
+                          f"BA(eval): {getattr(self, '_last_ba', eval_acc):6.2f}% "
+                          f"Kappa(eval): {getattr(self, '_last_kappa', kappa):6.2f}% "
+                          f"MinR: {getattr(self, '_last_min_recall', 0.0):6.2f}% "
                           f"Score: {eval_score:6.2f}%{miou_str}")
 
-                    if stage_this_epoch == 'C':
-                        self._register_topk_model(epoch=epoch, score=eval_score)
+                    self._register_topk_model(epoch=epoch, score=eval_score)
 
                     # save the best model
-                    if stage_this_epoch == 'C' and eval_score > self.best_acc:
+                    if eval_score > self.best_acc:
                         self.best_acc = eval_score
                         self.best_epoch = epoch
                         self.best_model_state = {
@@ -2709,40 +1671,22 @@ class hsTrainer(BaseEstimator):
                         tprint(f"  Best model saved (score: {eval_score:.2f}%) at {os.path.join(self.output, 'models', f'{self.model_name}_best.onnx')}")
                     else:
                         # early stopping check
-                        if stage_this_epoch == 'C' and epoch - self.best_epoch > self.patience:
+                        if epoch - self.best_epoch > self.patience:
                             tprint(f"\n  Early stopping: {epoch - self.best_epoch} epochs without improvement")
                             break
                 else:
-                    tprint(f"[Epoch {epoch+1:3d}] Train(bgfg/fg_cls): {train_bgfg_loss:.4f}/{train_fg_class_loss:.4f} Acc: {train_acc:6.2f}%", end='')
+                    tprint(f"[Epoch {epoch+1:3d}] Train(loss): {train_loss:.4f} Acc: {train_acc:6.2f}%", end='')
                     self.epoch_metrics.append({
                         'epoch': epoch + 1,
                         'train_loss': float(train_loss),
-                        'train_bgfg_loss': float(train_bgfg_loss),
-                        'train_fg_class_loss': float(train_fg_class_loss),
                         'train_acc': float(train_acc),
                         'eval_loss': None,
-                        'eval_bgfg_loss': None,
-                        'eval_fg_class_loss': None,
                         'eval_score': None,
-                        'eval_ba_all': None,
-                        'eval_ba_fg': None,
-                        'eval_kappa_all': None,
-                        'eval_kappa_fg': None,
-                        'eval_miou_all': None,
-                        'eval_miou_fg': None,
-                        'eval_fg_precision': None,
-                        'eval_fg_recall': None,
-                        'eval_fg_dice': None,
-                        'eval_ba_bgfg': None,
-                        'eval_ba_bgfg_boundary': None,
-                        'eval_fg_min_recall': None,
-                        'eval_fg_mean_recall': None,
-                        'eval_pred_fg_ratio': None,
-                        'eval_gt_fg_ratio': None,
-                        'eval_mean_fg_prob': None,
-                        'eval_selected_fg_threshold': None,
-                        'stage': stage_this_epoch,
-                        'stage_eval_metric': None,
+                        'eval_ba': None,
+                        'eval_kappa': None,
+                        'eval_miou': None,
+                        'eval_min_recall': None,
+                        'eval_mean_recall': None,
                     })
 
                 self._flush_epoch_metrics()
@@ -2771,12 +1715,12 @@ class hsTrainer(BaseEstimator):
         else:
             # Fallback when stage-C did not run long enough to produce a checkpoint.
             self.best_epoch = max(0, len(self.train_losses) - 1)
-            self.best_acc = float(self._current_stage_metric('C'))
+            self.best_acc = float(self._select_early_stop_score())
             self.best_model_state = {
                 'epoch': self.best_epoch,
                 'model_state': self.ema.state_dict(),
                 'acc': self.best_acc,
-                'kappa': float(getattr(self, '_last_kappa_fg', 0.0)),
+                'kappa': float(getattr(self, '_last_kappa', 0.0)),
             }
             self._save_model()
         
@@ -2804,14 +1748,10 @@ class hsTrainer(BaseEstimator):
             'final_kappa': final_kappa,
             'training_time': training_time,
             'model_path': os.path.join(self.output, 'models', f'{self.model_name}_best.onnx'),
-            'selected_fg_threshold': float(getattr(self, '_last_selected_fg_threshold', self.best_fg_threshold)),
         }
-        results['final_accuracy_all'] = float(getattr(self, '_last_ba_all', final_acc))
-        results['final_accuracy_fg'] = float(getattr(self, '_last_ba_fg', final_acc))
-        results['final_kappa_all'] = float(getattr(self, '_last_kappa_all', final_kappa))
-        results['final_kappa_fg'] = float(getattr(self, '_last_kappa_fg', final_kappa))
-        results['final_miou_all'] = float(getattr(self, '_last_miou_all', 0.0))
-        results['final_miou_fg'] = float(getattr(self, '_last_miou_fg', 0.0))
+        results['final_accuracy_eval'] = float(getattr(self, '_last_ba', final_acc))
+        results['final_kappa_eval'] = float(getattr(self, '_last_kappa', final_kappa))
+        results['final_miou_eval'] = float(getattr(self, '_last_miou_metric', 0.0))
         # Always include mIoU
         if hasattr(self, '_last_miou'):
             results['final_miou'] = self._last_miou
@@ -3412,19 +2352,33 @@ class hsTrainer(BaseEstimator):
             return None, None
 
         ds = loader.dataset
-        indices = None
+        index_chain: List[np.ndarray] = []
         visited = set()
         while ds is not None and id(ds) not in visited:
             visited.add(id(ds))
-            if hasattr(ds, 'indices') and indices is None:
+            if hasattr(ds, 'indices'):
                 try:
-                    indices = np.asarray(ds.indices)
+                    idx = np.asarray(ds.indices, dtype=np.int64)
+                    index_chain.append(idx)
                 except Exception:
-                    indices = None
+                    pass
             if hasattr(ds, 'dataset'):
                 ds = ds.dataset
             else:
                 break
+
+        # Compose indices from outer wrapper to inner wrapper so reconstruction
+        # always receives base-dataset absolute indices.
+        indices = None
+        for idx in index_chain:
+            if indices is None:
+                indices = idx
+            else:
+                try:
+                    indices = idx[indices]
+                except Exception:
+                    indices = None
+                    break
         return ds, indices
 
     def _init_reconstruction_state(self, loader):
@@ -3654,10 +2608,8 @@ class hsTrainer(BaseEstimator):
 
         num_classes = int(self.config.clsf.num)
         class_names = list(self.config.clsf.targets[:num_classes])
-        oa = float(getattr(self, '_last_oa', 0.0))
         score = float(getattr(self, '_last_ba', self.best_acc))
-        ba_all = float(getattr(self, '_last_ba_all', score))
-        ba_fg = float(getattr(self, '_last_ba_fg', score))
+        ba_eval = float(getattr(self, '_last_ba', score))
         miou = float(getattr(self, '_last_miou', 0.0))
         timestamp = time.strftime('%Y%m%d_%H%M%S')
 
@@ -3714,15 +2666,15 @@ class hsTrainer(BaseEstimator):
                 f"{self.model_name} | TEST Reconstruction | patient={patient_name} | "
                 f"patches={int(recon['patch_counts'][p_idx])} | covered_px={covered} | "
                 f"cover_ratio={coverage_ratio:.2%} | "
-                f"pixel_acc={pixel_acc:.2f}% | OA={oa:.2f}% | "
-                f"BA(all/fg)={ba_all:.2f}%/{ba_fg:.2f}% | "
+                f"pixel_acc={pixel_acc:.2f}% | "
+                f"BA(eval)={ba_eval:.2f}% | "
                 f"Score={score:.2f}% | mIoU={miou:.2f}%"
             )
             fig.suptitle(title, fontsize=11, fontweight='bold')
             plt.tight_layout()
 
             save_name = (
-                f"recon_{safe_patient}_pxacc{pixel_acc:.2f}_oa{oa:.2f}_"
+                f"recon_{safe_patient}_pxacc{pixel_acc:.2f}_"
                 f"miou{miou:.2f}_{timestamp}.png"
             )
             save_path = os.path.join(out_dir, save_name)
@@ -3732,7 +2684,7 @@ class hsTrainer(BaseEstimator):
             summary_lines.append(
                 f"patient={patient_name}, patches={int(recon['patch_counts'][p_idx])}, "
                 f"covered_px={covered}, correct_px={correct}, pixel_acc={pixel_acc:.4f}, "
-                f"OA={oa:.4f}, BA_all={ba_all:.4f}, BA_fg={ba_fg:.4f}, "
+                f"BA_eval={ba_eval:.4f}, "
                 f"Score={score:.4f}, mIoU={miou:.4f}, file={save_name}"
             )
             total_saved += 1
@@ -3747,171 +2699,12 @@ class hsTrainer(BaseEstimator):
             f.write(f"timestamp={timestamp}\n")
             f.write(f"classes={class_names}\n")
             f.write(
-                f"OA={oa:.4f}, BA_all={ba_all:.4f}, BA_fg={ba_fg:.4f}, "
+                f"BA_eval={ba_eval:.4f}, "
                 f"Score={score:.4f}, mIoU={miou:.4f}\n"
             )
             f.write("\n".join(summary_lines))
 
         tprint(f"  Full reconstruction plots saved: {total_saved} file(s) -> {out_dir}")
-
-    @torch.no_grad()
-    def _save_bgfg_split_snapshot(self, epoch: int, metric: float, reason: str) -> None:
-        """Save random whole-image FG/BG split maps when stage changes A -> B."""
-        recon_state = getattr(self, '_last_transition_reconstruction', None)
-
-        if not recon_state or not recon_state.get('enabled', False):
-            # Fallback path: capped and optional to avoid long pause during stage transition.
-            if not bool(getattr(self.config.common, 'bgfgsplit_allow_fallback_forward', False)):
-                tprint("  BGFGsplit skipped: no cached reconstruction from eval")
-                return
-
-            loader = self.val_loader if self.val_loader is not None else self.test_loader
-            if loader is None:
-                tprint("  BGFGsplit skipped: no val/test loader available")
-                return
-
-            recon_state = self._init_reconstruction_state(loader)
-            if not recon_state or not recon_state.get('enabled', False):
-                tprint("  BGFGsplit skipped: reconstruction state unavailable")
-                return
-
-            was_training = self.model.training
-            use_ema = bool(getattr(self.config.common, 'bgfgsplit_use_ema', True))
-            max_batches = int(getattr(self.config.common, 'bgfgsplit_max_batches', 32))
-
-            if use_ema:
-                self.ema.swap(self.model)
-            self.model.eval()
-
-            try:
-                batch_count = 0
-                with self._batch_stream_manager(loader) as batch_iter:
-                    for batch_data in batch_iter:
-                        if max_batches > 0 and batch_count >= max_batches:
-                            break
-
-                        hsi, labels, batch_meta = self._unpack_batch(batch_data)
-                        if hsi.device.type != self.device.type:
-                            hsi = hsi.to(self.device, non_blocking=True)
-                        if labels.device.type != self.device.type:
-                            labels = labels.to(self.device, non_blocking=True, memory_format=torch.contiguous_format)
-                        if hsi.dim() == 4 and hsi.shape[-1] <= 16:
-                            hsi = hsi.permute(0, 3, 1, 2)
-
-                        outputs = self.model(hsi)
-                        _, fg_bg_logits, _ = self._parse_model_outputs(outputs)
-                        fg_bg_logits = torch.nan_to_num(fg_bg_logits, nan=0.0, posinf=50.0, neginf=-50.0)
-                        pred_bin = torch.argmax(fg_bg_logits, dim=1).long()
-
-                        label_bin = labels.clone().long()
-                        valid = (label_bin != 255)
-                        label_bin[valid] = (label_bin[valid] > 0).long()
-                        label_bin[~valid] = 255
-                        self._accumulate_reconstruction_batch(recon_state, pred_bin, label_bin, batch_meta=batch_meta)
-                        batch_count += 1
-            finally:
-                if use_ema:
-                    self.ema.swap(self.model)
-                if was_training:
-                    self.model.train()
-
-        out_dir = os.path.join(self.output, 'BGFGsplit')
-        os.makedirs(out_dir, exist_ok=True)
-        num_samples = int(getattr(self.config.common, 'bgfgsplit_num_samples', 6))
-        num_samples = max(1, num_samples)
-        min_cover_ratio = float(getattr(self.config.common, 'bgfgsplit_min_cover_ratio', 0.15))
-
-        valid_ids = []
-        for i, label_map in enumerate(recon_state['label_maps']):
-            if np.any(label_map != 255):
-                valid_ids.append(i)
-        if not valid_ids:
-            tprint("  BGFGsplit skipped: no covered pixels after reconstruction")
-            return
-
-        seed = int(getattr(self.config.split, 'split_seed', 350234)) + int(epoch + 1)
-        rng = np.random.RandomState(seed)
-        pick_count = min(num_samples, len(valid_ids))
-        chosen = rng.choice(np.array(valid_ids, dtype=np.int64), size=pick_count, replace=False)
-
-        cmap = plt.cm.get_cmap('tab10', 2)
-        timestamp = time.strftime('%Y%m%d_%H%M%S')
-        summary_lines = [
-            f"epoch={int(epoch + 1)}",
-            f"transition=A->B",
-            f"metric={float(metric):.4f}",
-            f"reason={reason}",
-            f"sample_count={int(pick_count)}",
-            f"seed={seed}",
-        ]
-
-        for idx in chosen.tolist():
-            pred_map_raw = recon_state['pred_maps'][idx]
-            label_map_raw = recon_state['label_maps'][idx]
-            pred_map = pred_map_raw.copy()
-            label_map = label_map_raw.copy()
-            pred_valid = (pred_map != 255)
-            label_valid = (label_map != 255)
-            pred_map[pred_valid] = (pred_map[pred_valid] > 0).astype(np.int32)
-            label_map[label_valid] = (label_map[label_valid] > 0).astype(np.int32)
-            patient_name = recon_state['patient_names'][idx]
-            safe_patient = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(patient_name))
-
-            valid_mask = (label_map != 255)
-            covered = int(valid_mask.sum())
-            if covered <= 0:
-                continue
-            correct = int(((pred_map == label_map) & valid_mask).sum())
-            pixel_acc = 100.0 * correct / covered
-            cover_ratio = covered / float(label_map.size)
-
-            diff_map = np.full(pred_map.shape, np.nan, dtype=np.float32)
-            diff_map[valid_mask] = (pred_map[valid_mask] != label_map[valid_mask]).astype(np.float32)
-            pred_show = pred_map.astype(np.float32).copy()
-            label_show = label_map.astype(np.float32).copy()
-            pred_show[~valid_mask] = np.nan
-            label_show[~valid_mask] = np.nan
-
-            fig, axes = plt.subplots(1, 3, figsize=(16, 5.5))
-            base_cmap = cmap.copy()
-            base_cmap.set_bad(color='lightgrey')
-            axes[0].imshow(pred_show, cmap=base_cmap, vmin=0, vmax=1)
-            axes[0].set_title('Pred FG/BG')
-            axes[0].axis('off')
-
-            axes[1].imshow(label_show, cmap=base_cmap, vmin=0, vmax=1)
-            axes[1].set_title('Label FG/BG')
-            axes[1].axis('off')
-
-            diff_cmap = plt.cm.get_cmap('coolwarm').copy()
-            diff_cmap.set_bad(color='lightgrey')
-            axes[2].imshow(diff_map, cmap=diff_cmap, vmin=0, vmax=1)
-            axes[2].set_title('Mismatch Map')
-            axes[2].axis('off')
-
-            fig.suptitle(
-                f"A->B BGFG split | epoch={epoch + 1} | patient={patient_name} | "
-                f"covered={covered} ({cover_ratio:.1%}) | px_acc={pixel_acc:.2f}%",
-                fontsize=11,
-                fontweight='bold',
-            )
-            plt.tight_layout()
-
-            save_name = f"bgfgsplit_e{epoch + 1:03d}_{safe_patient}_{timestamp}.png"
-            save_path = os.path.join(out_dir, save_name)
-            plt.savefig(save_path, dpi=170, bbox_inches='tight')
-            plt.close()
-
-            summary_lines.append(
-                f"patient={patient_name}, covered_px={covered}, cover_ratio={cover_ratio:.4f}, "
-                f"pixel_acc={pixel_acc:.4f}, low_coverage={cover_ratio < min_cover_ratio}, file={save_name}"
-            )
-
-        summary_path = os.path.join(out_dir, f'bgfgsplit_summary_e{epoch + 1:03d}_{timestamp}.txt')
-        with open(summary_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(summary_lines) + '\n')
-
-        tprint(f"  BGFGsplit snapshots saved to {out_dir} ({pick_count} sample(s))")
 
     @staticmethod
     def _dense_fill_for_display(x: np.ndarray, invalid_value: int = 255) -> np.ndarray:
@@ -3937,13 +2730,8 @@ class hsTrainer(BaseEstimator):
         ~10 min to ~seconds.
         """
         num_classes = self.config.clsf.num
-        all_labels = list(range(num_classes))
         metric_labels = self._metric_labels(num_classes)
         eval_num_classes = len(metric_labels)
-        all_class_names = [
-            self.config.clsf.targets[i] if i < len(self.config.clsf.targets) else f'Class_{i}'
-            for i in all_labels
-        ]
         class_names = [
             self.config.clsf.targets[i] if i < len(self.config.clsf.targets) else f'Class_{i}'
             for i in metric_labels
@@ -3954,9 +2742,7 @@ class hsTrainer(BaseEstimator):
         tprint("  pre-computing plot metrics in main process...")
         t_pre = time.perf_counter()
 
-        # confusion matrices: full classes + metric-selected classes.
-        cm_all = _cm(final_target, final_pred, labels=all_labels)
-        cm_all_norm = cm_all.astype('float') / (cm_all.sum(axis=1, keepdims=True) + 1e-8)
+        # confusion matrix: foreground-only labels.
         y_true_present = set(np.unique(final_target).tolist())
         metric_has_support = any(lbl in y_true_present for lbl in metric_labels)
         if metric_has_support:
@@ -3964,16 +2750,6 @@ class hsTrainer(BaseEstimator):
         else:
             cm = np.zeros((len(metric_labels), len(metric_labels)), dtype=np.int64)
         cm_norm = cm.astype('float') / (cm.sum(axis=1, keepdims=True) + 1e-8)
-
-        precision_all, recall_all, f1_all, _ = precision_recall_fscore_support(
-            final_target, final_pred, labels=all_labels, zero_division=0)
-        report_lines_all = []
-        for i, cls_i in enumerate(all_labels):
-            name = all_class_names[i] if i < len(all_class_names) else f'Class_{cls_i}'
-            report_lines_all.append(
-                f"{name}: P={precision_all[i]:.4f}, R={recall_all[i]:.4f}, F1={f1_all[i]:.4f}"
-            )
-        metrics_text_all = '\n'.join(report_lines_all) + '\n'
 
         # per-class precision, recall, f1 — each shape (num_classes,)
         if metric_has_support:
@@ -3991,7 +2767,7 @@ class hsTrainer(BaseEstimator):
             report_lines.append(
                 f"{name}: P={precision[i]:.4f}, R={recall[i]:.4f}, F1={f1[i]:.4f}")
         if not metric_has_support:
-            report_lines.append('WARNING: no fg-only labels present in y_true for this evaluation split.')
+            report_lines.append('WARNING: no valid evaluation labels present in y_true for this evaluation split.')
         metrics_text = '\n'.join(report_lines) + '\n'
 
         pairwise_lines = []
@@ -4011,16 +2787,6 @@ class hsTrainer(BaseEstimator):
                         f"recall_{name_j}_vs_{name_i}={rec_j_vs_i:.2f}%"
                     )
         pairwise_text = '\n'.join(pairwise_lines) + ('\n' if pairwise_lines else '')
-
-        pred_fg_hist = [
-            float(x.get('eval_pred_fg_ratio', np.nan))
-            for x in self.epoch_metrics if x.get('eval_pred_fg_ratio') is not None
-        ]
-        gt_fg_hist = [
-            float(x.get('eval_gt_fg_ratio', np.nan))
-            for x in self.epoch_metrics if x.get('eval_gt_fg_ratio') is not None
-        ]
-        threshold_scan_records = list(getattr(self, 'threshold_scan_history', []))
 
         # roc curves — list of (fpr, tpr, auc_val) per class, ~200 points each.
         # probas is already sub-sampled to ~2M pixels (done in evaluate()).
@@ -4058,22 +2824,14 @@ class hsTrainer(BaseEstimator):
         tasks = [
             (_worker_plot_training_curves,
              (list(self.train_losses), list(self.eval_losses),
-              list(self.train_bgfg_losses), list(self.train_fg_class_losses),
-              list(self.eval_bgfg_losses), list(self.eval_fg_class_losses),
               list(self.train_accs), list(self.eval_accs),
-                            list(self.stage_history),
               self.eval_interval, self.debug_mode,
               self.best_acc, self.model_name, self.output)),
-            (_worker_plot_confusion_matrix,
-                         (cm_all, cm_all_norm, metrics_text_all,
-                            all_class_names, self.model_name, self.output,
-                            'confusion_matrix_all', 'All-Class Confusion Matrix',
-                            'classification_metrics_all.txt')),
                         (_worker_plot_confusion_matrix,
                          (cm, cm_norm, metrics_text,
                             class_names, self.model_name, self.output,
-                            'confusion_matrix_fg_only', 'FG-Only Confusion Matrix',
-                            'classification_metrics_fg_only.txt')),
+                                             'confusion_matrix_eval_classes', 'Evaluation-Class Confusion Matrix',
+                                             'classification_metrics_eval_classes.txt')),
             (_worker_plot_per_class_metrics,
                          (precision, recall, f1, eval_num_classes, class_names,
               self.model_name, self.output)),
@@ -4086,16 +2844,8 @@ class hsTrainer(BaseEstimator):
              (list(self.lr_history), self.model_name, self.output)),
             (_worker_plot_epoch_time,
              (list(self.epoch_times), self.model_name, self.output)),
-              (_worker_plot_fg_threshold_curve,
-               (threshold_scan_records, self.model_name, self.output)),
-              (_worker_plot_fg_ratio_trajectory,
-               (pred_fg_hist, gt_fg_hist, self.model_name, self.output)),
-              (_worker_write_pairwise_fg_metrics,
+            (_worker_write_pairwise_class_metrics,
                (pairwise_text, self.output)),
-            (_worker_plot_stage_timeline,
-             (list(self.stage_history), list(self.stage_transition_log), self.model_name, self.output)),
-            (_worker_write_stage_transition_summary,
-             (list(self.stage_transition_log), self.output)),
         ]
 
         t0 = time.perf_counter()
@@ -4139,8 +2889,8 @@ class hsTrainer(BaseEstimator):
             
             with torch.no_grad():
                 outputs = self.model(hsi[:num_samples])
-                fused_logits, _, _ = self._parse_model_outputs(outputs)
-                preds = torch.argmax(fused_logits, dim=1)
+                logits = self._parse_model_outputs(outputs)
+                preds = torch.argmax(logits, dim=1)
             
             for i in range(num_samples):
                 # pseudo-RGB visualization
@@ -4272,7 +3022,7 @@ class hsTrainer(BaseEstimator):
                 def forward(self, x):
                     out = self.model(x)
                     if isinstance(out, dict):
-                        return out['fused_logits']
+                        return out.get('logits', out.get('fused_logits'))
                     if isinstance(out, (tuple, list)):
                         return out[0]
                     return out
@@ -4336,12 +3086,12 @@ class hsTrainer(BaseEstimator):
             # Forward pass through the ORIGINAL self.model (may be DataParallel)
             self.model.zero_grad()
             output = self.model(x)
-            fused_logits, _, _ = self._parse_model_outputs(output)
+            logits = self._parse_model_outputs(output)
             # For segmentation output [B, K, H, W], sum spatial dims to get scalar
-            if fused_logits.dim() == 4:
-                loss = fused_logits[0, class_idx].sum()
+            if logits.dim() == 4:
+                loss = logits[0, class_idx].sum()
             else:
-                loss = fused_logits[0, class_idx]
+                loss = logits[0, class_idx]
             loss.backward(retain_graph=False)
             
             # Compute CAM

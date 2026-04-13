@@ -40,6 +40,18 @@ def _ensure_background_class(config: Munch) -> None:
     config.clsf.num = len(config.clsf.targets)
 
 
+def _split_cfg(config: Munch, key: str, default):
+    """Read split config with strict key usage."""
+    split_cfg = getattr(config, 'split', Munch())
+    return getattr(split_cfg, key, default)
+
+
+def _preprocess_cfg(config: Munch, key: str, default):
+    """Read preprocess config with strict key usage."""
+    pre_cfg = getattr(config, 'preprocess', Munch())
+    return getattr(pre_cfg, key, default)
+
+
 class HSPreprocessor(BaseEstimator, TransformerMixin):
     """
     Sklearn-API preprocessor for hyperspectral data.
@@ -51,7 +63,7 @@ class HSPreprocessor(BaseEstimator, TransformerMixin):
     Follows sklearn ``fit`` / ``transform`` API. Example::
 
         preprocessor = HSPreprocessor(pca_components=48)
-        preprocessor.fit(non_bg_pixels)             # get stats + fit.
+        preprocessor.fit(foreground_pixels)         # get stats + fit.
         processed = preprocessor.transform(raw_data) # norm + transform.
 
     Attributes (NOTE: set after use ``fit``):
@@ -296,9 +308,9 @@ class AbstractHSDataset(ABC, Dataset):
         # Validate label range
         print("Validating raw label...")
         unique_labels = np.unique(self.raw_labels)
-        if not np.all((unique_labels >= 0) & (unique_labels <= self.num)):
+        if not np.all((unique_labels >= 0) & (unique_labels < self.num)):
             raise ValueError(
-                f"Labels contain values outside valid range [0, {self.num}]"
+                f"Labels contain values outside valid range [0, {self.num - 1}]"
             )
         print("Raw label validated!")
 
@@ -554,8 +566,8 @@ class NpyHSDataset(AbstractHSDataset):
             'test_ratio': float(getattr(self.config.split, 'test_ratio', 0.1)),
             'patch_size': int(getattr(self.config.split, 'patch_size', 31)),
             'pca_components': int(getattr(self.config.preprocess, 'pca_components', 48)),
-            'fit_on_non_bg_only': bool(getattr(self.config.preprocess, 'fit_on_non_bg_only', False)),
-            'bg_sample_ratio': float(getattr(self.config.preprocess, 'bg_sample_ratio', 1.0)),
+            'fit_on_foreground_only': bool(_preprocess_cfg(self.config, 'fit_on_foreground_only', False)),
+            'class0_sample_ratio': float(_preprocess_cfg(self.config, 'class0_sample_ratio', 1.0)),
             'label_remap': list(getattr(self.config.clsf, 'label_remap', [])),
         }
         txt = json.dumps(tracked, sort_keys=True, ensure_ascii=True)
@@ -730,9 +742,9 @@ class NpyHSDataset(AbstractHSDataset):
         unknown_policy = str(
             getattr(self.config.clsf, 'unknown_label_policy', 'error')
         ).strip().lower()
-        if unknown_policy not in {'error', 'map_to_bg'}:
+        if unknown_policy not in {'error', 'map_to_class0'}:
             raise ValueError(
-                "clsf.unknown_label_policy must be 'error' or 'map_to_bg'"
+                "clsf.unknown_label_policy must be 'error' or 'map_to_class0'"
             )
 
         min_raw = int(labels_raw.min())
@@ -759,10 +771,10 @@ class NpyHSDataset(AbstractHSDataset):
         labels_clipped = np.clip(labels_raw, 0, len(remap) - 1)
         labels = remap[labels_clipped]
 
-        if unknown_count > 0 and unknown_policy == 'map_to_bg':
+        if unknown_count > 0 and unknown_policy == 'map_to_class0':
             labels[unknown_mask] = 0
 
-        if max_raw >= len(remap) and not (unknown_count > 0 and unknown_policy == 'map_to_bg'):
+        if max_raw >= len(remap) and not (unknown_count > 0 and unknown_policy == 'map_to_class0'):
             print(f"\t\tWARNING: {os.path.basename(label_file)} has max raw label {max_raw} "
                   f"over remap max {len(remap)-1}")
 
@@ -772,32 +784,32 @@ class NpyHSDataset(AbstractHSDataset):
                                          data: np.ndarray,
                                          labels: np.ndarray,
                                          rng: np.random.RandomState) -> np.ndarray:
-        """Collect pixels for norm/PCA fitting with configurable FG/BG mix."""
+        """Collect pixels for norm/PCA fitting with configurable FG/class-0 mix."""
         flat_data = data.reshape(-1, data.shape[2])
         flat_labels = labels.reshape(-1)
 
         fg_pixels = flat_data[flat_labels > 0]
-        fit_on_non_bg_only = bool(getattr(self.config.preprocess, 'fit_on_non_bg_only', True))
-        if fit_on_non_bg_only:
+        fit_on_foreground_only = bool(_preprocess_cfg(self.config, 'fit_on_foreground_only', False))
+        if fit_on_foreground_only:
             return fg_pixels
 
-        bg_pixels = flat_data[flat_labels == 0]
-        if len(bg_pixels) == 0:
+        class0_pixels = flat_data[flat_labels == 0]
+        if len(class0_pixels) == 0:
             return fg_pixels
         if len(fg_pixels) == 0:
-            return bg_pixels
+            return class0_pixels
 
-        bg_ratio = float(getattr(self.config.preprocess, 'bg_sample_ratio', 1.0))
-        if bg_ratio <= 0:
+        class0_ratio = float(_preprocess_cfg(self.config, 'class0_sample_ratio', 1.0))
+        if class0_ratio <= 0:
             return fg_pixels
 
-        max_bg = int(max(1, round(len(fg_pixels) * bg_ratio)))
-        n_bg = min(len(bg_pixels), max_bg)
-        if n_bg < len(bg_pixels):
-            sel = rng.choice(len(bg_pixels), size=n_bg, replace=False)
-            bg_pixels = bg_pixels[sel]
+        max_class0 = int(max(1, round(len(fg_pixels) * class0_ratio)))
+        n_class0 = min(len(class0_pixels), max_class0)
+        if n_class0 < len(class0_pixels):
+            sel = rng.choice(len(class0_pixels), size=n_class0, replace=False)
+            class0_pixels = class0_pixels[sel]
 
-        return np.concatenate([fg_pixels, bg_pixels], axis=0)
+        return np.concatenate([fg_pixels, class0_pixels], axis=0)
 
     def _resolve_boundary_class_pair(self) -> Optional[Tuple[int, int]]:
         """
@@ -885,8 +897,8 @@ class NpyHSDataset(AbstractHSDataset):
         load, normalize, pca, and extract patches per-patient independently.
 
         pipeline:
-          - load all patients, collect real (non-bg) pixels for global stats
-          - fit global normalization + pca on non-bg pixels only
+                    - load all patients, collect foreground/class-0 pixels for global stats
+                    - fit global normalization + pca on selected training pixels
           - per-patient: normalize -> pca -> pad -> extract patches
           - concatenate patches from all patients
           
@@ -912,10 +924,21 @@ class NpyHSDataset(AbstractHSDataset):
 
         tprint("loading patients...")
         patient_records = []
-        all_real_pixels = []
+        patient_fit_pixels: Dict[int, List[np.ndarray]] = {}
         _patient_id_map = {}
         rng_fit = np.random.RandomState(350236)
         boundary_pair = self._resolve_boundary_class_pair()
+        split_seed = int(getattr(self.config.split, 'split_seed', 350234))
+        test_rate = float(getattr(self.config.split, 'test_rate', 0.2))
+        val_rate = float(getattr(self.config.split, 'val_rate', 0.1))
+        targets = list(getattr(self.config.clsf, 'targets', []))
+        pg_idx = targets.index('PG') if 'PG' in targets else 1
+        tg_idx = targets.index('TG') if 'TG' in targets else max(1, self.num - 1)
+
+        patient_fg_cnt: Dict[int, int] = {}
+        patient_total_cnt: Dict[int, int] = {}
+        patient_pg_cnt: Dict[int, int] = {}
+        patient_tg_cnt: Dict[int, int] = {}
 
         for idx, (data_file, label_file) in enumerate(pairs):
             data = np.load(data_file).astype(np.float32)    # shape: (h_i, w_i, c)
@@ -938,14 +961,20 @@ class NpyHSDataset(AbstractHSDataset):
 
             patient_records.append((data, labels, pid_idx))
 
-            # collect pixels for global stats; strategy can be FG-only or FG+sampled-BG
+            # collect pixels for global stats; strategy can be FG-only or FG+sampled class-0
             fit_pixels = self._collect_pixels_for_preprocessor(data, labels, rng_fit)
-            all_real_pixels.append(fit_pixels)
+            patient_fit_pixels.setdefault(pid_idx, []).append(fit_pixels)
             mask = labels.reshape(-1) > 0
+
+            flat_labels = labels.reshape(-1)
+            patient_fg_cnt[pid_idx] = int(patient_fg_cnt.get(pid_idx, 0) + int((flat_labels > 0).sum()))
+            patient_total_cnt[pid_idx] = int(patient_total_cnt.get(pid_idx, 0) + int(flat_labels.size))
+            patient_pg_cnt[pid_idx] = int(patient_pg_cnt.get(pid_idx, 0) + int((flat_labels == pg_idx).sum()))
+            patient_tg_cnt[pid_idx] = int(patient_tg_cnt.get(pid_idx, 0) + int((flat_labels == tg_idx).sum()))
 
             tprint(f"  loaded {idx+1}/{len(pairs)}: "
                    f"{os.path.basename(data_file)} ({patient_id}), "
-                   f"shape {data.shape}, non-bg pixels: {mask.sum():,}, "
+                     f"shape {data.shape}, foreground pixels: {mask.sum():,}, "
                    f"possesses labels: {np.unique(labels)}, "
                    f"max label {labels.max()}, min label {labels.min()}"
                    )
@@ -954,11 +983,78 @@ class NpyHSDataset(AbstractHSDataset):
         self._num_patients = len(_patient_id_map)
         tprint(f"  {len(pairs)} pairs, {self._num_patients} unique patients")
 
-        # norm + pca on non-bg pixels (via sklearn-compatible HSPreprocessor)
-        # excludes background and zero-padding -> cleaner statistics
-        tprint("fitting norm + pca...")
+        # Build patient-level split before fitting preprocessor to avoid train/val/test leakage.
+        patient_ids = np.asarray(sorted(self._patient_names.keys()), dtype=np.int64)
+        train_patient_ids: np.ndarray
+        val_patient_ids: np.ndarray
+        test_patient_ids: np.ndarray
+
+        if patient_ids.size < 3:
+            train_patient_ids = patient_ids.copy()
+            val_patient_ids = np.empty((0,), dtype=np.int64)
+            test_patient_ids = np.empty((0,), dtype=np.int64)
+            tprint("  WARNING: <3 patients; using all patients for train-only preprocessing fit")
+        else:
+            fg_ratio = np.asarray([
+                float(patient_fg_cnt.get(int(pid), 0)) / float(max(patient_total_cnt.get(int(pid), 1), 1))
+                for pid in patient_ids
+            ], dtype=np.float64)
+            pg_tg_ratio = np.asarray([
+                float(patient_pg_cnt.get(int(pid), 0) + 1.0) / float(patient_tg_cnt.get(int(pid), 0) + 1.0)
+                for pid in patient_ids
+            ], dtype=np.float64)
+            fg_bins = np.digitize(fg_ratio, np.quantile(fg_ratio, [0.33, 0.66]), right=False)
+            pgtg_bins = np.digitize(pg_tg_ratio, np.quantile(pg_tg_ratio, [0.33, 0.66]), right=False)
+            strata = fg_bins * 3 + pgtg_bins
+
+            try:
+                trainval_patients, test_patient_ids = train_test_split(
+                    patient_ids,
+                    test_size=test_rate,
+                    random_state=split_seed,
+                    stratify=strata,
+                )
+            except Exception:
+                trainval_patients, test_patient_ids = train_test_split(
+                    patient_ids,
+                    test_size=test_rate,
+                    random_state=split_seed,
+                    stratify=None,
+                )
+
+            strata_map = {int(pid): int(s) for pid, s in zip(patient_ids, strata)}
+            trainval_strata = np.asarray([strata_map[int(pid)] for pid in trainval_patients], dtype=np.int64)
+            try:
+                train_patient_ids, val_patient_ids = train_test_split(
+                    trainval_patients,
+                    test_size=val_rate,
+                    random_state=split_seed,
+                    stratify=trainval_strata,
+                )
+            except Exception:
+                train_patient_ids, val_patient_ids = train_test_split(
+                    trainval_patients,
+                    test_size=val_rate,
+                    random_state=split_seed,
+                    stratify=None,
+                )
+
+        self._patient_split_plan = {
+            'train': set(int(x) for x in np.asarray(train_patient_ids, dtype=np.int64).tolist()),
+            'val': set(int(x) for x in np.asarray(val_patient_ids, dtype=np.int64).tolist()),
+            'test': set(int(x) for x in np.asarray(test_patient_ids, dtype=np.int64).tolist()),
+        }
+
+        # norm + pca on selected training pixels (via sklearn-compatible HSPreprocessor)
+        # excludes padding and supports configurable class-0 mix
+        tprint("fitting norm + pca on TRAIN patients only...")
+        all_real_pixels = []
+        for pid in self._patient_split_plan['train']:
+            all_real_pixels.extend(patient_fit_pixels.get(int(pid), []))
+        if not all_real_pixels:
+            raise RuntimeError("No train pixels available for preprocessor fit")
         all_real = np.concatenate(all_real_pixels, axis=0)   # shape: (n_total_real, c)
-        del all_real_pixels
+        del all_real_pixels, patient_fit_pixels
         c = all_real.shape[1]
 
         n_components = self.config.preprocess.pca_components
@@ -1151,13 +1247,13 @@ class NpyHSDataset(AbstractHSDataset):
         # sorted() ensures deterministic file order across OS/filesystems
         all_files = sorted(os.listdir(self.data_path))
 
-        # Filter for .npy files and pair them
+        # filter for .npy files and pair them
         data_files = [f for f in all_files if f.endswith('.npy') and not f.endswith('_gt.npy')]
         label_files = [f for f in all_files if f.endswith('_gt.npy')]
         
         pairs = []
         for data_file in data_files:
-            base_name = data_file[:-4]  # Remove .npy extension
+            base_name = data_file[:-4]  # remove .npy extension
             label_file = base_name + '_gt.npy'
             if label_file in label_files:
                 pairs.append((os.path.join(self.data_path, data_file), os.path.join(self.data_path, label_file)))
@@ -1177,6 +1273,12 @@ class NpyHSDataset(AbstractHSDataset):
                            prefetch_factor=2, persistent_workers=False):
         """
         Create torch.utils.data.DataLoaders.
+        Core function in dataset preprocessing.
+        
+        Pipeline:
+            - retrieve patch indices, labels, and patient groups from the per-patient pipeline.
+            - split patients into train/val/test with stratification on patient-level stats (FG ratio, PG/TG ratio).
+            - 
         
         Uses StratifiedGroupKFold (single fold) for train/val+test split,
         to preserve distribution across splits while preventing patient-level leakage.
@@ -1209,71 +1311,72 @@ class NpyHSDataset(AbstractHSDataset):
         test_rate = float(getattr(self.config.split, 'test_rate', 0.2))
         val_rate = float(getattr(self.config.split, 'val_rate', 0.1))
 
-        # Patient level split using stats.
-        # Same process as cached one.
-        patient_ids = np.unique(self.patch_patient_groups)
-        targets = list(getattr(self.config.clsf, 'targets', []))
-        pg_idx = targets.index('PG') if 'PG' in targets else 1
-        tg_idx = targets.index('TG') if 'TG' in targets else max(1, self.num - 1)
+        # Reuse split plan from preprocessor fitting when available to avoid mismatch.
+        if hasattr(self, '_patient_split_plan') and isinstance(self._patient_split_plan, dict):
+            train_patients = np.asarray(sorted(self._patient_split_plan.get('train', [])), dtype=np.int64)
+            val_patients = np.asarray(sorted(self._patient_split_plan.get('val', [])), dtype=np.int64)
+            test_patients = np.asarray(sorted(self._patient_split_plan.get('test', [])), dtype=np.int64)
+        else:
+            # Fallback for backward compatibility.
+            patient_ids = np.unique(self.patch_patient_groups)
+            targets = list(getattr(self.config.clsf, 'targets', []))
+            pg_idx = targets.index('PG') if 'PG' in targets else 1
+            tg_idx = targets.index('TG') if 'TG' in targets else max(1, self.num - 1)
 
-        patient_fg_ratio = []
-        patient_pg_tg_ratio = []
-        for pid in patient_ids:
-            p_mask = (self.patch_patient_groups == pid)
-            p_labels = self.patch_labels[p_mask]
-            fg_ratio = float((p_labels > 0).mean())
-            pg_cnt = int((p_labels == pg_idx).sum())
-            tg_cnt = int((p_labels == tg_idx).sum())
-            pg_tg_ratio = float((pg_cnt + 1.0) / (tg_cnt + 1.0))
-            patient_fg_ratio.append(fg_ratio)
-            patient_pg_tg_ratio.append(pg_tg_ratio)
+            patient_fg_ratio = []
+            patient_pg_tg_ratio = []
+            for pid in patient_ids:
+                p_mask = (self.patch_patient_groups == pid)
+                p_labels = self.patch_labels[p_mask]
+                fg_ratio = float((p_labels > 0).mean())
+                pg_cnt = int((p_labels == pg_idx).sum())
+                tg_cnt = int((p_labels == tg_idx).sum())
+                pg_tg_ratio = float((pg_cnt + 1.0) / (tg_cnt + 1.0))
+                patient_fg_ratio.append(fg_ratio)
+                patient_pg_tg_ratio.append(pg_tg_ratio)
 
-        patient_fg_ratio = np.asarray(patient_fg_ratio, dtype=np.float64)
-        patient_pg_tg_ratio = np.asarray(patient_pg_tg_ratio, dtype=np.float64)
-        fg_bins = np.digitize(patient_fg_ratio, np.quantile(patient_fg_ratio, [0.33, 0.66]), right=False)
-        pgtg_bins = np.digitize(patient_pg_tg_ratio, np.quantile(patient_pg_tg_ratio, [0.33, 0.66]), right=False)
-        patient_strata = fg_bins * 3 + pgtg_bins
+            patient_fg_ratio = np.asarray(patient_fg_ratio, dtype=np.float64)
+            patient_pg_tg_ratio = np.asarray(patient_pg_tg_ratio, dtype=np.float64)
+            fg_bins = np.digitize(patient_fg_ratio, np.quantile(patient_fg_ratio, [0.33, 0.66]), right=False)
+            pgtg_bins = np.digitize(patient_pg_tg_ratio, np.quantile(patient_pg_tg_ratio, [0.33, 0.66]), right=False)
+            patient_strata = fg_bins * 3 + pgtg_bins
 
-        try:
-            trainval_patients, test_patients = train_test_split(
-                patient_ids,
-                test_size=test_rate,
-                random_state=split_seed,
-                stratify=patient_strata,
-            )
-        except Exception:
-            trainval_patients, test_patients = train_test_split(
-                patient_ids,
-                test_size=test_rate,
-                random_state=split_seed,
-                stratify=None,
-            )
+            try:
+                trainval_patients, test_patients = train_test_split(
+                    patient_ids,
+                    test_size=test_rate,
+                    random_state=split_seed,
+                    stratify=patient_strata,
+                )
+            except Exception:
+                trainval_patients, test_patients = train_test_split(
+                    patient_ids,
+                    test_size=test_rate,
+                    random_state=split_seed,
+                    stratify=None,
+                )
 
-        trainval_mask = np.isin(self.patch_patient_groups, trainval_patients)
-        test_mask = np.isin(self.patch_patient_groups, test_patients)
-        trainval_idx = total_indices[trainval_mask]
-        test_idx = total_indices[test_mask]
-
-        # Split train/val at patient level with stratification on the same strata code.
-        strata_map = {int(pid): int(s) for pid, s in zip(patient_ids, patient_strata)}
-        trainval_strata = np.array([strata_map[int(pid)] for pid in trainval_patients], dtype=np.int64)
-        try:
-            train_patients, val_patients = train_test_split(
-                trainval_patients,
-                test_size=val_rate,
-                random_state=split_seed,
-                stratify=trainval_strata,
-            )
-        except Exception:
-            train_patients, val_patients = train_test_split(
-                trainval_patients,
-                test_size=val_rate,
-                random_state=split_seed,
-                stratify=None,
-            )
+            # split train/val at patient level with stratification on the same strata code.
+            strata_map = {int(pid): int(s) for pid, s in zip(patient_ids, patient_strata)}
+            trainval_strata = np.array([strata_map[int(pid)] for pid in trainval_patients], dtype=np.int64)
+            try:
+                train_patients, val_patients = train_test_split(
+                    trainval_patients,
+                    test_size=val_rate,
+                    random_state=split_seed,
+                    stratify=trainval_strata,
+                )
+            except Exception:
+                train_patients, val_patients = train_test_split(
+                    trainval_patients,
+                    test_size=val_rate,
+                    random_state=split_seed,
+                    stratify=None,
+                )
 
         train_idx = total_indices[np.isin(self.patch_patient_groups, train_patients)]
         val_idx = total_indices[np.isin(self.patch_patient_groups, val_patients)]
+        test_idx = total_indices[np.isin(self.patch_patient_groups, test_patients)]
         
         # verify no patient leakage.
         train_patients = set(self.patch_patient_groups[train_idx])
@@ -1297,8 +1400,11 @@ class NpyHSDataset(AbstractHSDataset):
             pct = (dist / dist.sum() * 100).round(1)
             print(f"  {name} label distribution: {dict(zip(self.config.clsf.targets, pct))}")
         
-        # create indexed subsets
-        # augmentation for train only, with fixed-ratio class/boundary-aware batching
+        # create indexed subsets.
+        # subsets are lightweight wrappers around the main dataset,
+        # indexing into the global patch arrays.
+        # train subset with augmentation and fixed-ratio batch sampler;
+        # val/test subsets with simple indexing.
         train_subset = _AugmentedSubset(
             self, train_idx,
             noise_std=0.01,
@@ -1315,16 +1421,11 @@ class NpyHSDataset(AbstractHSDataset):
                          getattr(self, 'batch_size', 32))
         actual_pin_memory = pin_memory and torch.cuda.is_available()
 
-        # Build tri-route pools on subset positions (not global indices).
+        # build tri-route pools on subset positions (not global indices).
         train_labels = self.patch_labels[train_idx]
         train_boundary = self.patch_pg_tg_boundary[train_idx] if self.patch_pg_tg_boundary is not None else np.zeros_like(train_labels, dtype=np.bool_)
-        train_roi = self.patch_fg_roi_mask[train_idx] if hasattr(self, 'patch_fg_roi_mask') else (train_labels > 0)
-
         fg_positions = np.where(train_labels > 0)[0]
         boundary_positions = np.where(train_boundary)[0]
-        bg_positions = np.where((train_labels == 0) & train_roi)[0]
-        if bg_positions.size == 0:
-            bg_positions = np.where(train_labels == 0)[0]
 
         fg_class_positions = {}
         num_cls = int(getattr(self.config.clsf, 'num', 0))
@@ -1337,36 +1438,37 @@ class NpyHSDataset(AbstractHSDataset):
 
         steps_per_epoch = max(1, len(train_idx) // max(int(batch_size), 1))
         sampler_mode = str(getattr(self.config.split, 'sampler_mode', 'fixed')).lower()
-        ratio_fg = float(getattr(self.config.split, 'sampler_ratio_fg', 0.25))
-        ratio_boundary = float(getattr(self.config.split, 'sampler_ratio_boundary', 0.15))
+        ratio_fg = float(_split_cfg(self.config, 'sampler_mix_fg', 0.25))
+        ratio_boundary = float(_split_cfg(self.config, 'sampler_mix_boundary', 0.15))
         train_batch_sampler = _FixedRatioBatchSampler(
             fg_positions=fg_positions,
             fg_class_positions=fg_class_positions,
             boundary_positions=boundary_positions,
-            bg_positions=bg_positions,
+            position_groups=self.patch_patient_groups[train_idx],
             batch_size=int(batch_size),
             ratio_fg=ratio_fg,
             ratio_boundary=ratio_boundary,
             sampler_mode=sampler_mode,
-            target_fg_ratio=float(getattr(self.config.split, 'sampler_target_fg_ratio', ratio_fg)),
-            target_boundary_ratio=float(getattr(self.config.split, 'sampler_target_boundary_ratio', ratio_boundary)),
+            target_fg_ratio=float(_split_cfg(self.config, 'sampler_target_mix_fg', ratio_fg)),
+            target_boundary_ratio=float(_split_cfg(self.config, 'sampler_target_mix_boundary', ratio_boundary)),
             adapt_momentum=float(getattr(self.config.split, 'sampler_adapt_momentum', 0.9)),
-            min_fg_ratio=float(getattr(self.config.split, 'sampler_min_fg_ratio', 0.12)),
-            max_fg_ratio=float(getattr(self.config.split, 'sampler_max_fg_ratio', 0.28)),
+            min_fg_ratio=float(_split_cfg(self.config, 'sampler_fg_ratio_min', 0.12)),
+            max_fg_ratio=float(_split_cfg(self.config, 'sampler_fg_ratio_max', 0.28)),
             empirical_fg_ratio=empirical_fg_ratio,
-            fg_inverse_pow=float(getattr(self.config.split, 'sampler_fg_inverse_pow', 1.0)),
-            fg_min_per_class=int(getattr(self.config.split, 'sampler_fg_min_per_class', 0)),
+            fg_inverse_pow=float(_split_cfg(self.config, 'sampler_fg_inverse_pow', 1.0)),
+            fg_min_per_class=int(_split_cfg(self.config, 'sampler_fg_min_per_class', 0)),
+            diversity_strength=float(getattr(self.config.split, 'sampler_diversity_strength', 0.75)),
             steps_per_epoch=steps_per_epoch,
             seed=split_seed,
         )
-        cur_fg_ratio, cur_bd_ratio, cur_bg_ratio = train_batch_sampler.get_current_ratios()
+        cur_fg_ratio, cur_bd_ratio = train_batch_sampler.get_current_ratios()
         print(
             f"Train sampler pools (subset positions): FG={len(fg_positions)}, "
-            f"Boundary={len(boundary_positions)}, BG-hard={len(bg_positions)}"
+            f"Boundary={len(boundary_positions)}"
         )
         print(
             f"Train sampler ratios(init): fg={cur_fg_ratio:.2f}, boundary={cur_bd_ratio:.2f}, "
-            f"bg={cur_bg_ratio:.2f} | empirical_fg={empirical_fg_ratio:.2f} | mode={sampler_mode}"
+            f"empirical_fg={empirical_fg_ratio:.2f} | mode={sampler_mode}"
         )
         
         train_loader = torch.utils.data.DataLoader(
@@ -1411,8 +1513,22 @@ class NpyHSDataset(AbstractHSDataset):
         
         return train_loader, val_loader, test_loader
 
-    def _create_cached_split_loaders(self, num_workers=4, batch_size=None, pin_memory=True,
-                                     prefetch_factor=2, persistent_workers=False):
+    def _create_cached_split_loaders(self,
+                                     num_workers=4, prefetch_factor=2,
+                                     batch_size=None, pin_memory=True,
+                                     persistent_workers=False) -> Tuple[torch.utils.data.DataLoader,
+                                            torch.utils.data.DataLoader,
+                                            torch.utils.data.DataLoader]:
+        """
+        Pipeline:
+            - per-patient norm + pca + pad + patch extraction.
+            - cache extracted patches as sample-wise chunks of multiple patches.
+            - train/val/test split at sample chunk level with balanced sampling on patch-level labels.
+
+        Returns:
+            Tuple of (`train_loader`, `val_loader`, `test_loader`).
+        """
+        
         samples_per_step = int(getattr(self.config.split, 'samples_per_step', 1))
         samples_per_step = max(1, samples_per_step)
         actual_pin_memory = pin_memory and torch.cuda.is_available()
@@ -1462,19 +1578,19 @@ class NpyHSDataset(AbstractHSDataset):
             augment=False,
         )
         sampler_mode = str(getattr(self.config.split, 'sampler_mode', 'fixed')).lower()
-        ratio_fg = float(getattr(self.config.split, 'sampler_ratio_fg', 0.20))
-        ratio_boundary = float(getattr(self.config.split, 'sampler_ratio_boundary', 0.08))
+        ratio_fg = float(_split_cfg(self.config, 'sampler_mix_fg', 0.20))
+        ratio_boundary = float(_split_cfg(self.config, 'sampler_mix_boundary', 0.08))
         train_batch_sampler = _CachedSplitRatioBatchSampler(
             dataset=train_ds,
             samples_per_step=samples_per_step,
             ratio_fg=ratio_fg,
             ratio_boundary=ratio_boundary,
             sampler_mode=sampler_mode,
-            target_fg_ratio=float(getattr(self.config.split, 'sampler_target_fg_ratio', ratio_fg)),
-            target_boundary_ratio=float(getattr(self.config.split, 'sampler_target_boundary_ratio', ratio_boundary)),
+            target_fg_ratio=float(_split_cfg(self.config, 'sampler_target_mix_fg', ratio_fg)),
+            target_boundary_ratio=float(_split_cfg(self.config, 'sampler_target_mix_boundary', ratio_boundary)),
             adapt_momentum=float(getattr(self.config.split, 'sampler_adapt_momentum', 0.9)),
-            min_fg_ratio=float(getattr(self.config.split, 'sampler_min_fg_ratio', 0.12)),
-            max_fg_ratio=float(getattr(self.config.split, 'sampler_max_fg_ratio', 0.28)),
+            min_fg_ratio=float(_split_cfg(self.config, 'sampler_fg_ratio_min', 0.12)),
+            max_fg_ratio=float(_split_cfg(self.config, 'sampler_fg_ratio_max', 0.28)),
             seed=int(getattr(self.config.split, 'split_seed', 350234)),
         )
 
@@ -2178,7 +2294,7 @@ class _CachedSplitRatioBatchSampler(Sampler[List[int]]):
         self.max_fg_ratio = float(np.clip(max_fg_ratio, self.min_fg_ratio, 1.0))
 
         self._ratio_fg = float(np.clip(ratio_fg, 0.0, 1.0))
-        self._ratio_boundary = float(np.clip(ratio_boundary, 0.0, 1.0 - self._ratio_fg))
+        self._ratio_boundary = float(np.clip(ratio_boundary, 0.0, 1.0))
 
         self.sample_fg_ratio = np.asarray([
             float(item.get('fg_ratio', 0.0)) for item in self.dataset.samples
@@ -2190,6 +2306,10 @@ class _CachedSplitRatioBatchSampler(Sampler[List[int]]):
             np.asarray(item.get('class_hist', []), dtype=np.int64)
             for item in self.dataset.samples
         ]
+        self.sample_patient_ids = np.asarray([
+            str(item.get('patient_id', item.get('name', f'sample_{i:03d}')))
+            for i, item in enumerate(self.dataset.samples)
+        ], dtype=object)
 
         fg_thr = float(np.percentile(self.sample_fg_ratio, 65)) if self.sample_fg_ratio.size > 0 else 0.0
         bd_thr = float(np.percentile(self.sample_boundary_ratio, 65)) if self.sample_boundary_ratio.size > 0 else 0.0
@@ -2197,9 +2317,10 @@ class _CachedSplitRatioBatchSampler(Sampler[List[int]]):
         all_ids = np.arange(len(self.dataset.samples), dtype=np.int64)
         self.fg_sample_ids = all_ids[self.sample_fg_ratio >= max(fg_thr, 1e-6)]
         self.boundary_sample_ids = all_ids[self.sample_boundary_ratio >= max(bd_thr, 1e-6)]
-        self.bg_sample_ids = all_ids[~np.isin(all_ids, self.fg_sample_ids)]
-        if self.bg_sample_ids.size == 0:
-            self.bg_sample_ids = all_ids
+
+        if self.fg_sample_ids.size == 0:
+            # Fallback: keep sampler functional even when FG pool is empty in tiny subsets.
+            self.fg_sample_ids = all_ids
 
         self.fg_class_to_sample_ids: Dict[int, np.ndarray] = {}
         if self.sample_class_hist:
@@ -2212,6 +2333,10 @@ class _CachedSplitRatioBatchSampler(Sampler[List[int]]):
                 if cls_samples:
                     self.fg_class_to_sample_ids[int(cls_idx)] = np.asarray(cls_samples, dtype=np.int64)
 
+            # HSI-friendly difficulty score: foreground ratio + boundary ratio + rare-class presence.
+            self.sample_hsi_score = self._build_hsi_sample_scores()
+            self.diversity_strength = 0.8
+
         self.steps_per_epoch = max(1, len(self.dataset.chunks) // self.samples_per_step)
         self._epoch = 0
         self._refresh_quota()
@@ -2220,27 +2345,119 @@ class _CachedSplitRatioBatchSampler(Sampler[List[int]]):
         return self.steps_per_epoch
 
     def _refresh_quota(self) -> None:
-        self.n_fg = int(round(self.samples_per_step * self._ratio_fg))
-        self.n_boundary = int(round(self.samples_per_step * self._ratio_boundary))
-        self.n_bg = self.samples_per_step - self.n_fg - self.n_boundary
-        if self.n_fg <= 0 and self.n_boundary <= 0:
-            self.n_bg = self.samples_per_step
+        mix = float(max(self._ratio_fg + self._ratio_boundary, 1e-8))
+        fg_share = self._ratio_fg / mix
+        self.n_fg = int(round(self.samples_per_step * fg_share))
+        self.n_fg = int(np.clip(self.n_fg, 0, self.samples_per_step))
+        self.n_boundary = self.samples_per_step - self.n_fg
 
     def _adapt_ratios(self) -> None:
-        if self.sampler_mode != 'adaptive':
+        if self.sampler_mode not in {'adaptive', 'hsi_adaptive'}:
             return
 
         empirical_fg = float(np.mean(self.sample_fg_ratio > 0.0)) if self.sample_fg_ratio.size > 0 else 0.0
         desired_fg = 0.5 * empirical_fg + 0.5 * self.target_fg_ratio
         desired_fg = float(np.clip(desired_fg, self.min_fg_ratio, self.max_fg_ratio))
-        desired_bd = float(np.clip(self.target_boundary_ratio, 0.0, max(0.0, 1.0 - desired_fg)))
+        desired_bd = float(np.clip(self.target_boundary_ratio, 0.0, 1.0))
 
         m = self.adapt_momentum
         self._ratio_fg = float(np.clip(m * self._ratio_fg + (1.0 - m) * desired_fg,
                                        self.min_fg_ratio, self.max_fg_ratio))
         self._ratio_boundary = float(np.clip(m * self._ratio_boundary + (1.0 - m) * desired_bd,
-                                             0.0, max(0.0, 1.0 - self._ratio_fg)))
+                                             0.0, 1.0))
         self._refresh_quota()
+
+    @staticmethod
+    def _safe_norm(x: np.ndarray) -> np.ndarray:
+        if x.size == 0:
+            return x
+        mn = float(np.min(x))
+        mx = float(np.max(x))
+        if mx - mn < 1e-12:
+            return np.zeros_like(x, dtype=np.float64)
+        return (x - mn) / (mx - mn)
+
+    def _build_hsi_sample_scores(self) -> np.ndarray:
+        n = len(self.dataset.samples)
+        if n == 0:
+            return np.empty((0,), dtype=np.float64)
+
+        fg_norm = self._safe_norm(self.sample_fg_ratio.astype(np.float64))
+        bd_norm = self._safe_norm(self.sample_boundary_ratio.astype(np.float64))
+
+        # Rare-class score from per-sample class histogram (class-0 excluded).
+        rare_scores = np.zeros(n, dtype=np.float64)
+        if self.sample_class_hist:
+            max_cls = max((h.size for h in self.sample_class_hist), default=0)
+            if max_cls > 1:
+                global_hist = np.zeros(max_cls, dtype=np.float64)
+                for h in self.sample_class_hist:
+                    if h.size:
+                        global_hist[:h.size] += h.astype(np.float64)
+                inv = np.zeros_like(global_hist, dtype=np.float64)
+                valid = global_hist > 0
+                inv[valid] = 1.0 / np.sqrt(global_hist[valid])
+                inv[0] = 0.0
+                for i, h in enumerate(self.sample_class_hist):
+                    if h.size <= 1:
+                        continue
+                    w = inv[:h.size]
+                    cnt = h.astype(np.float64)
+                    denom = float(np.sum(cnt[1:]))
+                    if denom > 0:
+                        rare_scores[i] = float(np.sum(cnt[1:] * w[1:]) / denom)
+        rare_norm = self._safe_norm(rare_scores)
+
+        score = 0.45 * fg_norm + 0.30 * bd_norm + 0.25 * rare_norm
+        return np.clip(score, 1e-6, None)
+
+    def _draw_hsi_adaptive(self,
+                           pool: np.ndarray,
+                           n: int,
+                           rng: np.random.RandomState,
+                           pid_counts: Optional[Dict[str, int]] = None) -> np.ndarray:
+        if n <= 0 or pool.size == 0:
+            return np.empty(0, dtype=np.int64)
+
+        if pid_counts is None:
+            pid_counts = {}
+
+        replace = bool(pool.size < n)
+        selected: List[int] = []
+        available = pool.copy().astype(np.int64, copy=False)
+        local_counts = dict(pid_counts)
+
+        for _ in range(n):
+            if available.size == 0:
+                if not replace:
+                    break
+                available = pool.copy().astype(np.int64, copy=False)
+
+            base_w = self.sample_hsi_score[available]
+            pids = self.sample_patient_ids[available]
+            penalties = np.asarray([
+                1.0 / (1.0 + self.diversity_strength * float(local_counts.get(str(pid), 0)))
+                for pid in pids
+            ], dtype=np.float64)
+            probs = base_w * penalties
+            probs_sum = float(probs.sum())
+            if probs_sum <= 0:
+                probs = np.ones_like(probs) / max(len(probs), 1)
+            else:
+                probs = probs / probs_sum
+
+            pick_idx = int(rng.choice(len(available), size=1, replace=False, p=probs)[0])
+            sid = int(available[pick_idx])
+            selected.append(sid)
+            pid = str(self.sample_patient_ids[sid])
+            local_counts[pid] = int(local_counts.get(pid, 0) + 1)
+
+            if not replace:
+                available = np.delete(available, pick_idx)
+
+        for k, v in local_counts.items():
+            pid_counts[k] = int(v)
+        return np.asarray(selected, dtype=np.int64)
 
     @staticmethod
     def _draw(pool: np.ndarray, n: int, rng: np.random.RandomState) -> np.ndarray:
@@ -2325,15 +2542,17 @@ class _CachedSplitRatioBatchSampler(Sampler[List[int]]):
         all_samples = np.arange(len(self.dataset.samples), dtype=np.int64)
         for _ in range(self.steps_per_epoch):
             ids = []
-            fg = self._draw_fg_stratified(self.n_fg, rng)
-            bd = self._draw(self.boundary_sample_ids, self.n_boundary, rng)
-            bg = self._draw(self.bg_sample_ids, self.n_bg, rng)
+            if self.sampler_mode == 'hsi_adaptive':
+                pid_counts: Dict[str, int] = {}
+                fg = self._draw_hsi_adaptive(self.fg_sample_ids, self.n_fg, rng, pid_counts=pid_counts)
+                bd = self._draw_hsi_adaptive(self.boundary_sample_ids, self.n_boundary, rng, pid_counts=pid_counts)
+            else:
+                fg = self._draw_fg_stratified(self.n_fg, rng)
+                bd = self._draw(self.boundary_sample_ids, self.n_boundary, rng)
             if fg.size:
                 ids.append(fg)
             if bd.size:
                 ids.append(bd)
-            if bg.size:
-                ids.append(bg)
 
             if ids:
                 sample_batch = np.concatenate(ids)
@@ -2470,8 +2689,8 @@ class RGBDataset(AbstractHSDataset):
 
         strict_remap = bool(getattr(self.config.clsf, 'strict_label_remap', True))
         unknown_policy = str(getattr(self.config.clsf, 'unknown_label_policy', 'error')).strip().lower()
-        if unknown_policy not in {'error', 'map_to_bg'}:
-            raise ValueError("clsf.unknown_label_policy must be 'error' or 'map_to_bg'")
+        if unknown_policy not in {'error', 'map_to_class0'}:
+            raise ValueError("clsf.unknown_label_policy must be 'error' or 'map_to_class0'")
 
         if int(labels_raw.min()) < 0:
             raise ValueError(f"{os.path.basename(label_file)} has negative labels")
@@ -2486,7 +2705,7 @@ class RGBDataset(AbstractHSDataset):
 
         labels_clipped = np.clip(labels_raw, 0, len(remap) - 1)
         labels = remap[labels_clipped]
-        if unknown_count > 0 and unknown_policy == 'map_to_bg':
+        if unknown_count > 0 and unknown_policy == 'map_to_class0':
             labels[unknown_mask] = 0
         return labels.astype(np.int32, copy=False)
 
@@ -3006,14 +3225,13 @@ class _FixedRatioBatchSampler(Sampler[List[int]]):
     Each yielded batch is composed with the target ratio:
     - foreground centers
     - boundary hard examples
-    - background hard negatives
     """
 
     def __init__(self,
                  fg_positions: np.ndarray,
                  fg_class_positions: Optional[Dict[int, np.ndarray]],
                  boundary_positions: np.ndarray,
-                 bg_positions: np.ndarray,
+                 position_groups: Optional[np.ndarray],
                  batch_size: int,
                  ratio_fg: float = 0.4,
                  ratio_boundary: float = 0.4,
@@ -3026,6 +3244,7 @@ class _FixedRatioBatchSampler(Sampler[List[int]]):
                  empirical_fg_ratio: float = 0.18,
                  fg_inverse_pow: float = 1.0,
                  fg_min_per_class: int = 0,
+                 diversity_strength: float = 0.75,
                  steps_per_epoch: Optional[int] = None,
                  seed: int = 350234):
         self.fg_positions = np.asarray(fg_positions, dtype=np.int64)
@@ -3035,7 +3254,7 @@ class _FixedRatioBatchSampler(Sampler[List[int]]):
             if np.asarray(v).size > 0
         }
         self.boundary_positions = np.asarray(boundary_positions, dtype=np.int64)
-        self.bg_positions = np.asarray(bg_positions, dtype=np.int64)
+        self.position_groups = None if position_groups is None else np.asarray(position_groups, dtype=np.int64)
         self.batch_size = int(batch_size)
         self.seed = int(seed)
         self.sampler_mode = str(sampler_mode).lower()
@@ -3047,16 +3266,29 @@ class _FixedRatioBatchSampler(Sampler[List[int]]):
         self.empirical_fg_ratio = float(np.clip(empirical_fg_ratio, 0.0, 1.0))
         self.fg_inverse_pow = float(max(0.0, fg_inverse_pow))
         self.fg_min_per_class = int(max(0, fg_min_per_class))
+        self.diversity_strength = float(max(0.0, diversity_strength))
         self._epoch = 0
 
+        if self.position_groups is not None:
+            max_pos = 0
+            if self.fg_positions.size > 0:
+                max_pos = max(max_pos, int(self.fg_positions.max()))
+            if self.boundary_positions.size > 0:
+                max_pos = max(max_pos, int(self.boundary_positions.max()))
+            if max_pos >= self.position_groups.shape[0]:
+                raise ValueError("position_groups must align with subset positions used by sampler")
+
+        if self.fg_positions.size == 0 and self.boundary_positions.size == 0:
+            raise ValueError("Sampler received empty FG and boundary pools")
+
         ratio_fg = float(np.clip(ratio_fg, 0.0, 1.0))
-        ratio_boundary = float(np.clip(ratio_boundary, 0.0, 1.0 - ratio_fg))
+        ratio_boundary = float(np.clip(ratio_boundary, 0.0, 1.0))
         self._ratio_fg = ratio_fg
         self._ratio_boundary = ratio_boundary
         self._refresh_quota()
 
         if steps_per_epoch is None or steps_per_epoch <= 0:
-            max_pool = max(len(self.fg_positions), len(self.boundary_positions), len(self.bg_positions), 1)
+            max_pool = max(len(self.fg_positions), len(self.boundary_positions), 1)
             self.steps_per_epoch = max(1, max_pool // max(self.batch_size, 1))
         else:
             self.steps_per_epoch = int(steps_per_epoch)
@@ -3064,31 +3296,31 @@ class _FixedRatioBatchSampler(Sampler[List[int]]):
     def __len__(self) -> int:
         return self.steps_per_epoch
 
-    def get_current_ratios(self) -> Tuple[float, float, float]:
-        ratio_bg = float(max(0.0, 1.0 - self._ratio_fg - self._ratio_boundary))
-        return float(self._ratio_fg), float(self._ratio_boundary), ratio_bg
+    def get_current_ratios(self) -> Tuple[float, float]:
+        mix = float(max(self._ratio_fg + self._ratio_boundary, 1e-8))
+        return float(self._ratio_fg / mix), float(self._ratio_boundary / mix)
 
     def _refresh_quota(self) -> None:
-        self.n_fg = int(round(self.batch_size * self._ratio_fg))
-        self.n_boundary = int(round(self.batch_size * self._ratio_boundary))
-        self.n_bg = self.batch_size - self.n_fg - self.n_boundary
-        if self.n_fg <= 0 and self.n_boundary <= 0:
-            self.n_bg = self.batch_size
+        mix = float(max(self._ratio_fg + self._ratio_boundary, 1e-8))
+        fg_share = self._ratio_fg / mix
+        self.n_fg = int(round(self.batch_size * fg_share))
+        self.n_fg = int(np.clip(self.n_fg, 0, self.batch_size))
+        self.n_boundary = self.batch_size - self.n_fg
 
     def _adapt_ratios(self) -> None:
-        if self.sampler_mode != 'adaptive':
+        if self.sampler_mode not in {'adaptive', 'hsi_adaptive'}:
             return
 
         # Blend empirical FG prior with target ratio, then move smoothly.
         desired_fg = 0.5 * self.empirical_fg_ratio + 0.5 * self.target_fg_ratio
         desired_fg = float(np.clip(desired_fg, self.min_fg_ratio, self.max_fg_ratio))
-        desired_bd = float(np.clip(self.target_boundary_ratio, 0.0, max(0.0, 1.0 - desired_fg)))
+        desired_bd = float(np.clip(self.target_boundary_ratio, 0.0, 1.0))
 
         m = self.adapt_momentum
         self._ratio_fg = float(np.clip(m * self._ratio_fg + (1.0 - m) * desired_fg,
                                        self.min_fg_ratio, self.max_fg_ratio))
         self._ratio_boundary = float(np.clip(m * self._ratio_boundary + (1.0 - m) * desired_bd,
-                                             0.0, max(0.0, 1.0 - self._ratio_fg)))
+                                             0.0, 1.0))
         self._refresh_quota()
 
     @staticmethod
@@ -3099,8 +3331,56 @@ class _FixedRatioBatchSampler(Sampler[List[int]]):
             return np.empty(0, dtype=np.int64)
         if pool.size >= n:
             return rng.choice(pool, size=n, replace=False)
-        # Avoid repeatedly copying tiny pools (e.g. boundary positions) with replacement.
-        return rng.choice(pool, size=pool.size, replace=False)
+        # Keep batch size stable when pools are tiny.
+        return rng.choice(pool, size=n, replace=True)
+
+    def _draw_group_diverse(self, pool: np.ndarray, n: int,
+                            rng: np.random.RandomState,
+                            group_counts: Optional[Dict[int, int]] = None) -> np.ndarray:
+        if n <= 0:
+            return np.empty(0, dtype=np.int64)
+        if pool.size == 0 or self.position_groups is None:
+            return self._draw(pool, n, rng)
+
+        if group_counts is None:
+            group_counts = {}
+        replace = bool(pool.size < n)
+        selected = []
+        available = pool.copy().astype(np.int64, copy=False)
+
+        for _ in range(n):
+            if available.size == 0:
+                if not replace:
+                    break
+                available = pool.copy().astype(np.int64, copy=False)
+
+            groups = self.position_groups[available]
+            uniq, cnt = np.unique(groups, return_counts=True)
+            freq_map = {int(g): int(c) for g, c in zip(uniq, cnt)}
+            base = np.asarray([
+                1.0 / np.sqrt(float(freq_map.get(int(g), 1))) for g in groups
+            ], dtype=np.float64)
+            penalty = np.asarray([
+                1.0 / (1.0 + self.diversity_strength * float(group_counts.get(int(g), 0)))
+                for g in groups
+            ], dtype=np.float64)
+            probs = base * penalty
+            s = float(probs.sum())
+            if s <= 0:
+                probs = np.ones_like(probs) / max(len(probs), 1)
+            else:
+                probs = probs / s
+
+            pick_idx = int(rng.choice(len(available), size=1, replace=False, p=probs)[0])
+            pos = int(available[pick_idx])
+            selected.append(pos)
+            gid = int(self.position_groups[pos])
+            group_counts[gid] = int(group_counts.get(gid, 0) + 1)
+
+            if not replace:
+                available = np.delete(available, pick_idx)
+
+        return np.asarray(selected, dtype=np.int64)
 
     def _draw_fg_stratified(self, n: int, rng: np.random.RandomState) -> np.ndarray:
         if n <= 0:
@@ -3156,26 +3436,36 @@ class _FixedRatioBatchSampler(Sampler[List[int]]):
         self._epoch += 1
         for _ in range(self.steps_per_epoch):
             ids = []
-            fg = self._draw_fg_stratified(self.n_fg, rng)
-            bd = self._draw(self.boundary_positions, self.n_boundary, rng)
-            bg = self._draw(self.bg_positions, self.n_bg, rng)
+            if self.sampler_mode == 'hsi_adaptive':
+                group_counts: Dict[int, int] = {}
+                fg = self._draw_fg_stratified(self.n_fg, rng)
+                if fg.size > 0 and self.position_groups is not None:
+                    # Re-draw FG with patient diversity while keeping FG quota unchanged.
+                    fg = self._draw_group_diverse(fg, int(fg.size), rng, group_counts=group_counts)
+                bd = self._draw_group_diverse(self.boundary_positions, self.n_boundary, rng,
+                                              group_counts=group_counts)
+            else:
+                fg = self._draw_fg_stratified(self.n_fg, rng)
+                bd = self._draw(self.boundary_positions, self.n_boundary, rng)
 
             if fg.size:
                 ids.append(fg)
             if bd.size:
                 ids.append(bd)
-            if bg.size:
-                ids.append(bg)
 
             if not ids:
-                yield []
+                any_pool = np.concatenate([self.fg_positions, self.boundary_positions])
+                if any_pool.size == 0:
+                    continue
+                batch = self._draw(any_pool, self.batch_size, rng)
+                yield batch[:self.batch_size].tolist()
                 continue
 
             batch = np.concatenate(ids)
             if batch.size < self.batch_size:
-                # backfill from any available pool to keep batch shape stable
+                # Backfill from FG/Boundary pools only to keep batch shape stable.
                 any_pool = np.concatenate([
-                    self.fg_positions, self.boundary_positions, self.bg_positions
+                    self.fg_positions, self.boundary_positions
                 ])
                 extra = self._draw(any_pool, self.batch_size - batch.size, rng)
                 if extra.size:
@@ -3189,8 +3479,8 @@ class _AugmentedSubset(Dataset):
     """
     Training-only subset with on-the-fly spatial & spectral augmentations.
     
-    Augmentations applied (all random, each with 50% probability):
-      - Spatial: horizontal flip, vertical flip, 90/180/270 deg. rotation
+    Augmentations applied (all random, each with 0.5 possibility):
+      - Spatial: horizontal + vertical flip, 90/180/270 deg. rotation
       - Spectral: Gaussian noise, band-wise dropout (zero out random bands)
       - Mixup-style: CutOut (mask random spatial region)
     
@@ -3200,7 +3490,7 @@ class _AugmentedSubset(Dataset):
     def __init__(self, dataset: AbstractHSDataset, indices: np.ndarray,
                  noise_std: float = 0.01,
                  band_drop_rate: float = 0.02,
-                 cutout_ratio: float = 0.08,
+                 cutout_ratio: float = 0,
                  minority_threshold: float = 0.3,
                  minority_blend_prob: float = 0.10):
         """Augment subset with optional rare-class copy-paste blending.
