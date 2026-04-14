@@ -39,18 +39,18 @@ split:
   split_seed: 350234  # Patient-level split random seed; vary it for robust multi-seed evaluation.
   # Split ratios for patient-level split-first pipeline.
   train_ratio: 0.8
-  val_ratio: 0.1
-  test_ratio: 0.1
+  val_ratio: 0.15
+  test_ratio: 0.05
   # Legacy compatibility (analyzer/cv helper still reads these keys).
   test_rate: 0.1
   val_rate: 0.1
   n_folds: 5  # Number of folds for cross-validation (0 = disabled, use hold-out)
-  batch_size: 256  # This refers to the size on a single GPU.
+  batch_size: 1024  # This refers to the size on a single GPU.
   samples_per_step: 2  # Number of samples stacked per iteration; each sample contributes all its patches.
   target_patches_per_step: 1024  # Total patch target per optimization step (global across GPUs in cached mode).
   max_patches_per_sample_chunk: 0  # 0 => auto derive from target_patches_per_step and memory budget.
   patch_size: 31  # Pixel size of image patches.
-  eval_batch_size: 256  # Smaller eval batch size for CPU training
+  eval_batch_size: 1024  # Smaller eval batch size for CPU training
   sampler_mode: hsi_adaptive  # fixed | adaptive | hsi_adaptive
   sampler_mix_fg: 0.16  # FG vs boundary relative mix (renormalized, no BG pool)
   sampler_mix_boundary: 0.05  # FG vs boundary relative mix (renormalized, no BG pool)
@@ -75,11 +75,13 @@ preprocess:
   split_preprocess_workers: 4
 
   # Train-only fitting controls
-  pca_components: 48  # Number of PCA components to retain.
+  pca_components: 8  # Number of PCA components to retain.
+  max_fit_samples: 2000000
+  max_pca_samples: 2000000
+
+  # abandoned
   fit_on_foreground_only: false  # false => fit normalization/PCA on FG + sampled class-0 pixels.
   class0_sample_ratio: 1.0  # When fit_on_foreground_only=false, class-0 samples ~= fg_count * ratio.
-  max_fit_samples: 2000000
-  max_pca_samples: 500000
 
 memory:
   pin_memory: true  # true is faster but may cause memoleak in distant server.
@@ -112,8 +114,8 @@ rgb:
     val_rate: 0.1
     n_folds: 5
     patch_size: 31
-    batch_size: 128
-    eval_batch_size: 128
+    batch_size: 1024
+    eval_batch_size: 1024
     boundary_sampling_dilation: 1
 
 # hereby only declares front targets, except BG.
@@ -123,7 +125,7 @@ clsf:
     - 'PG'   # ⭐Parathyroid gland
     - 'Tra'  # Trachea (boundary hard example for PG)
     - 'TG'   # ⭐Thyroid gland
-  label_remap: [0, 1, 2, 3]  # raw(BG/PG/Tra/TG) -> remap(BG/PG/Tra/TG)
+  label_remap: [1, 2, 3]  # raw(PG/Tra/TG) -> remap(PG/Tra/TG)
   strict_label_remap: true
   unknown_label_policy: error  # error | map_to_class0
 

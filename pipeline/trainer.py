@@ -21,7 +21,7 @@ from tqdm import tqdm
 from munch import Munch
 from torch.nn import Module
 from datetime import datetime
-from typing import Tuple, Callable, Dict, Any, Iterable, Optional, List, Set
+from typing import Tuple, Callable, Dict, Any, Optional, List
 from contextlib import contextmanager
 from concurrent.futures import as_completed
 from pipeline.dataset import AbstractHSDataset
@@ -2977,23 +2977,6 @@ class hsTrainer(BaseEstimator):
             raise TypeError(f"batch must be list or tuple, got: {type(batch_data)}")
         
         return hsi, labels, batch_meta
-    
-    def _compute_miou(self, y_true: np.ndarray, y_pred: np.ndarray,
-                      num_classes: int) -> float:
-        """
-        Compute mean Intersection-over-Union (mIoU) for segmentation evaluation.
-        Ignores classes not present in both y_true and y_pred.
-        
-        Returns:
-            mIoU percentage (0-100).
-        """
-        ious = []
-        for cls in range(num_classes):
-            intersection = ((y_pred == cls) & (y_true == cls)).sum()
-            union = ((y_pred == cls) | (y_true == cls)).sum()
-            if union > 0:
-                ious.append(float(intersection) / float(union))
-        return float(np.mean(ious)) * 100.0 if ious else 0.0
     
     def _save_model(self) -> None:
         if self.best_model_state is None:

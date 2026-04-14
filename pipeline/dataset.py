@@ -15,7 +15,7 @@ from pathlib import Path
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.model_selection import train_test_split
 from sklearn.model_selection import StratifiedGroupKFold
-from torch.utils.data import Dataset, WeightedRandomSampler, Sampler
+from torch.utils.data import Dataset, Sampler
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources.*")
@@ -108,7 +108,7 @@ class HSPreprocessor(BaseEstimator, TransformerMixin):
 
         self.global_mean_ = fit_data.mean(axis=0).astype(np.float32)
         self.global_std_  = fit_data.std(axis=0).astype(np.float32) + 1e-8
-        tprint(f"  norm-fit on {len(fit_data):,} foreground(FG) pixels of {c} bands.")
+        tprint(f"  norm-fit on {len(fit_data):,} pixels of {c} bands.")
 
         # PCA fit on Z-score normed pixels, capped at max_pca_samples
         # time complexity = O(n * C^2) where n = num_pixels and C = num_bands
@@ -383,38 +383,6 @@ class AbstractHSDataset(ABC, Dataset):
             c - self.margin : c + self.margin + 1
         ]
         return label_patch.copy()
-
-    def _sampler_balance(self, indices: np.ndarray) -> WeightedRandomSampler:
-        """Build a weighted sampler with class balance + PG hard-example boosts.
-
-        Base weights are inverse class frequency. Optional boosts:
-        - PG center boost: increase PG patch sampling frequency.
-        - PG-TG boundary boost: focus on boundary-confusion hard samples.
-        """
-        labels = self.patch_labels[indices]
-        class_counts = np.bincount(labels, minlength=self.num).astype(np.float64)
-        class_counts = np.maximum(class_counts, 1)
-        sample_weight = 1.0 / class_counts
-        weights = sample_weight[labels].astype(np.float64)
-
-        # Optional PG-focused weighting knobs from config
-        pg_center_boost = float(getattr(self.config.split, 'pg_center_boost', 1.0))
-        pg_tg_boundary_boost = float(getattr(self.config.split, 'pg_tg_boundary_boost', 1.0))
-
-        if pg_center_boost > 1.0:
-            targets = list(getattr(self.config.clsf, 'targets', []))
-            pg_idx = targets.index('PG') if 'PG' in targets else 0
-            weights[labels == pg_idx] *= pg_center_boost
-
-        if pg_tg_boundary_boost > 1.0 and self.patch_pg_tg_boundary is not None:
-            boundary_flags = self.patch_pg_tg_boundary[indices]
-            weights[boundary_flags] *= pg_tg_boundary_boost
-
-        return WeightedRandomSampler(
-            weights=torch.from_numpy(weights).double(),
-            num_samples=len(indices),
-            replacement=True,
-        )
 
     # Magic methods.
     def __len__(self) -> int:
@@ -721,9 +689,9 @@ class NpyHSDataset(AbstractHSDataset):
 
             remap = remap.astype(np.int32, copy=False)
 
-        if np.max(remap) >= self.num:
+        if np.max(remap) > self.num:
             raise ValueError(
-                f"clsf.label_remap contains mapped label >= clsf.num ({self.num}): "
+                f"clsf.label_remap contains mapped label > clsf.num ({self.num}): "
                 f"max mapped is {int(np.max(remap))}"
             )
 
@@ -784,7 +752,7 @@ class NpyHSDataset(AbstractHSDataset):
                                          data: np.ndarray,
                                          labels: np.ndarray,
                                          rng: np.random.RandomState) -> np.ndarray:
-        """Collect pixels for norm/PCA fitting with configurable FG/class-0 mix."""
+        """Collect pixels for norm/PCA fitting."""
         flat_data = data.reshape(-1, data.shape[2])
         flat_labels = labels.reshape(-1)
 
@@ -974,8 +942,7 @@ class NpyHSDataset(AbstractHSDataset):
 
             tprint(f"  loaded {idx+1}/{len(pairs)}: "
                    f"{os.path.basename(data_file)} ({patient_id}), "
-                     f"shape {data.shape}, foreground pixels: {mask.sum():,}, "
-                   f"possesses labels: {np.unique(labels)}, "
+                   f"shape {data.shape}, possesses labels: {np.unique(labels)}, "
                    f"max label {labels.max()}, min label {labels.min()}"
                    )
 
@@ -1045,9 +1012,9 @@ class NpyHSDataset(AbstractHSDataset):
             'test': set(int(x) for x in np.asarray(test_patient_ids, dtype=np.int64).tolist()),
         }
 
-        # norm + pca on selected training pixels (via sklearn-compatible HSPreprocessor)
-        # excludes padding and supports configurable class-0 mix
-        tprint("fitting norm + pca on TRAIN patients only...")
+        # norm + pca on selected training pixels.
+        # select partial for fitting, speed up pca.
+        tprint("fitting norm + pca on train set...")
         all_real_pixels = []
         for pid in self._patient_split_plan['train']:
             all_real_pixels.extend(patient_fit_pixels.get(int(pid), []))
@@ -1060,9 +1027,9 @@ class NpyHSDataset(AbstractHSDataset):
         n_components = self.config.preprocess.pca_components
         self.preprocessor = HSPreprocessor(
             pca_components=n_components,
-            max_fit_samples=2_000_000,
-            max_pca_samples=500_000,
-            random_state=350234,
+            max_fit_samples=self.config.preprocess.max_fit_samples,
+            max_pca_samples=self.config.preprocess.max_pca_samples,
+            random_state=self.config.split.split_seed,
         )
         self.preprocessor.fit(all_real)
         del all_real
@@ -1783,13 +1750,6 @@ class NpyHSDataset(AbstractHSDataset):
             top = sorted(patient_counts, key=lambda x: x[1], reverse=True)[:top_k]
             print(f"  top-{top_k} patients by patch count: {top}")
 
-    def sample_batch(self, batch_size: int = 2) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample a tiny batch (no augmentation) for debugging shapes."""
-        idx = np.random.choice(len(self.patch_indices), size=min(batch_size, len(self.patch_indices)), replace=False)
-        subset = _IndexedSubset(self, idx)
-        loader = torch.utils.data.DataLoader(subset, batch_size=len(idx))
-        return next(iter(loader))
-
     def __len__(self) -> int:
         if getattr(self, '_use_cached_split_pipeline', False):
             return int(getattr(self, '_cached_total_patches', 0))
@@ -2068,7 +2028,7 @@ class _SplitPreprocessManager:
                     boundary_map = np.zeros_like(labels, dtype=bool)
                     
                     # consider 8-connected neighbors for boundary detection.
-                    # if a pixel of class A has a neighbor of class B,
+                    # if a pixel of class A has a 8-neighbor of class B,
                     # it's counted as a boundary pixel.
                     for dr, dc in [(-1, -1), (-1, 0), (-1, 1),
                                    (0, -1),           (0, 1),
@@ -2240,26 +2200,6 @@ class _SamplePatchChunkDataset(Dataset):
             'width': int(width),
         }
         return torch.from_numpy(patches), torch.from_numpy(label_patches), chunk_meta
-
-
-class _SampleChunkGroupSampler(Sampler[int]):
-    """Yield chunk indices grouped by sample to maximize cache locality."""
-
-    def __init__(self, dataset: _SamplePatchChunkDataset, shuffle_samples: bool = True):
-        self.dataset = dataset
-        self.shuffle_samples = bool(shuffle_samples)
-
-    def __iter__(self) -> Iterator[int]:
-        sample_ids = np.arange(len(self.dataset.samples), dtype=np.int64)
-        if self.shuffle_samples and sample_ids.size > 1:
-            np.random.shuffle(sample_ids)
-        for sid in sample_ids.tolist():
-            begin, finish = self.dataset._sample_chunk_ranges[sid]
-            for idx in range(begin, finish):
-                yield idx
-
-    def __len__(self) -> int:
-        return len(self.dataset)
 
 
 class _CachedSplitRatioBatchSampler(Sampler[List[int]]):
