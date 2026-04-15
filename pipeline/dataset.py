@@ -597,6 +597,60 @@ class NpyHSDataset(AbstractHSDataset):
 
         return x
 
+    def _augment_sample_pre_pca(self,
+                                data: np.ndarray,
+                                labels: np.ndarray,
+                                rng: np.random.RandomState) -> Tuple[np.ndarray, np.ndarray]:
+        """Apply merged train-time augmentation before PCA (spatial + spectral)."""
+        if data.size == 0:
+            return data, labels
+        if not bool(_preprocess_cfg(self.config, 'pre_pca_augment_train', True)):
+            return data, labels
+
+        x = data.astype(np.float32, copy=True)
+        y = labels.astype(np.int32, copy=True)
+
+        # Spatial transforms are moved before PCA to keep label-data alignment.
+        spatial_prob = float(_preprocess_cfg(self.config, 'pre_pca_spatial_prob', 0.5))
+        rotate_prob = float(_preprocess_cfg(self.config, 'pre_pca_rotate_prob', 0.35))
+        if rng.rand() < spatial_prob:
+            if rng.rand() > 0.5:
+                x = np.flip(x, axis=1).copy()
+                y = np.flip(y, axis=1).copy()
+            if rng.rand() > 0.5:
+                x = np.flip(x, axis=0).copy()
+                y = np.flip(y, axis=0).copy()
+        if rng.rand() < rotate_prob:
+            k = int(rng.choice([1, 2, 3]))
+            x = np.rot90(x, k, axes=(0, 1)).copy()
+            y = np.rot90(y, k, axes=(0, 1)).copy()
+
+        # Spectral transforms (same family as previous post-PCA augmentation).
+        flat = x.reshape(-1, x.shape[2])
+        flat = self._augment_pixels_for_pca_fit(flat, rng)
+        x = flat.reshape(x.shape).astype(np.float32, copy=False)
+
+        band_drop_rate = float(_preprocess_cfg(self.config, 'pre_pca_band_drop_rate', 0.02))
+        if band_drop_rate > 0 and rng.rand() > 0.5:
+            n_bands = x.shape[2]
+            n_mod = max(1, int(n_bands * band_drop_rate))
+            mod_idx = rng.choice(n_bands, n_mod, replace=False)
+            scales = rng.uniform(0.7, 1.0, size=(1, 1, n_mod)).astype(np.float32)
+            x[:, :, mod_idx] *= scales
+
+        # Cutout moved before PCA; keep labels unchanged to avoid class-hist distortion.
+        cutout_ratio = float(_preprocess_cfg(self.config, 'pre_pca_cutout_ratio', 0.08))
+        cutout_prob = float(_preprocess_cfg(self.config, 'pre_pca_cutout_prob', 0.15))
+        if cutout_ratio > 0 and rng.rand() < cutout_prob:
+            h, w = x.shape[:2]
+            ch = max(1, int(h * cutout_ratio))
+            cw = max(1, int(w * cutout_ratio))
+            y0 = int(rng.randint(0, h - ch + 1))
+            x0 = int(rng.randint(0, w - cw + 1))
+            x[y0:y0 + ch, x0:x0 + cw, :] = 0.0
+
+        return x, y
+
     @staticmethod
     def _compute_pair_boundary_map(labels: np.ndarray,
                                    cls_a: int,
@@ -650,8 +704,6 @@ class NpyHSDataset(AbstractHSDataset):
             'test_ratio': float(getattr(self.config.split, 'test_ratio', 0.1)),
             'patch_size': int(getattr(self.config.split, 'patch_size', 31)),
             'pca_components': int(getattr(self.config.preprocess, 'pca_components', 48)),
-            'fit_on_foreground_only': bool(_preprocess_cfg(self.config, 'fit_on_foreground_only', False)),
-            'class0_sample_ratio': float(_preprocess_cfg(self.config, 'class0_sample_ratio', 1.0)),
             'label_remap': list(getattr(self.config.clsf, 'label_remap', [])),
         }
         txt = json.dumps(tracked, sort_keys=True, ensure_ascii=True)
@@ -823,9 +875,9 @@ class NpyHSDataset(AbstractHSDataset):
         unknown_policy = str(
             getattr(self.config.clsf, 'unknown_label_policy', 'error')
         ).strip().lower()
-        if unknown_policy not in {'error', 'map_to_class0'}:
+        if unknown_policy not in {'error', 'map_to_bg'}:
             raise ValueError(
-                "clsf.unknown_label_policy must be 'error' or 'map_to_class0'"
+                "clsf.unknown_label_policy must be 'error' or 'map_to_bg'"
             )
 
         min_raw = int(labels_raw.min())
@@ -852,10 +904,10 @@ class NpyHSDataset(AbstractHSDataset):
         labels_clipped = np.clip(labels_raw, 0, len(remap) - 1)
         labels = remap[labels_clipped]
 
-        if unknown_count > 0 and unknown_policy == 'map_to_class0':
+        if unknown_count > 0 and unknown_policy == 'map_to_bg':
             labels[unknown_mask] = 0
 
-        if max_raw >= len(remap) and not (unknown_count > 0 and unknown_policy == 'map_to_class0'):
+        if max_raw >= len(remap) and not (unknown_count > 0 and unknown_policy == 'map_to_bg'):
             print(f"\t\tWARNING: {os.path.basename(label_file)} has max raw label {max_raw} "
                   f"over remap max {len(remap)-1}")
 
@@ -870,27 +922,19 @@ class NpyHSDataset(AbstractHSDataset):
         flat_labels = labels.reshape(-1)
 
         fg_pixels = flat_data[flat_labels > 0]
-        fit_on_foreground_only = bool(_preprocess_cfg(self.config, 'fit_on_foreground_only', False))
-        if fit_on_foreground_only:
-            return fg_pixels
-
-        class0_pixels = flat_data[flat_labels == 0]
-        if len(class0_pixels) == 0:
+        bg_pixels = flat_data[flat_labels == 0]
+        if len(bg_pixels) == 0:
             return fg_pixels
         if len(fg_pixels) == 0:
-            return class0_pixels
+            return bg_pixels
 
-        class0_ratio = float(_preprocess_cfg(self.config, 'class0_sample_ratio', 1.0))
-        if class0_ratio <= 0:
-            return fg_pixels
+        max_bg = int(max(1, round(len(fg_pixels))))
+        n_bg = min(len(bg_pixels), max_bg)
+        if n_bg < len(bg_pixels):
+            sel = rng.choice(len(bg_pixels), size=n_bg, replace=False)
+            bg_pixels = bg_pixels[sel]
 
-        max_class0 = int(max(1, round(len(fg_pixels) * class0_ratio)))
-        n_class0 = min(len(class0_pixels), max_class0)
-        if n_class0 < len(class0_pixels):
-            sel = rng.choice(len(class0_pixels), size=n_class0, replace=False)
-            class0_pixels = class0_pixels[sel]
-
-        return np.concatenate([fg_pixels, class0_pixels], axis=0)
+        return np.concatenate([fg_pixels, bg_pixels], axis=0)
 
     def _resolve_boundary_class_pair(self) -> Optional[Tuple[int, int]]:
         """
@@ -1186,6 +1230,10 @@ class NpyHSDataset(AbstractHSDataset):
 
         for data, labels, pid_idx in patient_records:
             h, w, c_raw = data.shape                     # per-patient: (h_i, w_i, c)
+
+            if int(pid_idx) in self._patient_split_plan['train']:
+                aug_rng = np.random.RandomState(split_seed + int(pid_idx) * 9973 + h * 31 + w)
+                data, labels = self._augment_sample_pre_pca(data, labels, aug_rng)
 
             # apply fitted preprocessor (Z-score + PCA) via sklearn transform API
             processed = self.preprocessor.transform(data) # shape: (h_i, w_i, c_out)
@@ -1487,20 +1535,11 @@ class NpyHSDataset(AbstractHSDataset):
             print(f"  {name} label distribution: {dict(zip(self.config.clsf.targets, pct))}")
         
         # create indexed subsets.
-        # subsets are lightweight wrappers around the main dataset,
-        # indexing into the global patch arrays.
-        # train subset with augmentation and fixed-ratio batch sampler;
-        # val/test subsets with simple indexing.
-        train_subset = _AugmentedSubset(
-            self, train_idx,
-            noise_std=0.01,
-            band_drop_rate=0.02,
-            cutout_ratio=0.08,
-            minority_blend_prob=0.10,
-        )
+        # post-PCA training augment is removed; train-time augmentation is merged pre-PCA.
+        train_subset = _IndexedSubset(self, train_idx)
         val_subset = _IndexedSubset(self, val_idx)
         test_subset = _IndexedSubset(self, test_idx)
-        print("Training augmentations enabled: flip, rotate, spectral noise, band dropout, cutout")
+        print("Training augmentation path: pre-PCA merged augmentation enabled (no post-PCA patch augment)")
 
         if batch_size is None:
             batch_size = getattr(self.config.split, 'batch_size',
@@ -1660,7 +1699,7 @@ class NpyHSDataset(AbstractHSDataset):
             samples=self._split_manifests['train'].get('samples', []),
             patch_size=self.patch_size,
             max_patches_per_chunk=max_patches_per_chunk,
-            augment=bool(getattr(self.config.preprocess, 'train_patch_augment', False)),
+            augment=False,
         )
         val_ds = _SamplePatchChunkDataset(
             samples=self._split_manifests['val'].get('samples', []),
@@ -1806,13 +1845,7 @@ class NpyHSDataset(AbstractHSDataset):
                   f"test={len(test_idx)} ({len(test_patients)} patients)")
 
             # subsets
-            train_subset = _AugmentedSubset(
-                self, train_idx,
-                noise_std=0.01,
-                band_drop_rate=0.02,
-                cutout_ratio=0.08,
-                minority_blend_prob=0.10,
-            )
+            train_subset = _IndexedSubset(self, train_idx)
             test_subset = _IndexedSubset(self, test_idx)
 
             train_loader = torch.utils.data.DataLoader(
@@ -2095,14 +2128,8 @@ class _SplitPreprocessManager:
             data = np.load(data_file).astype(np.float32)
             labels_raw = np.load(label_file).astype(np.int32)
             labels = self.dataset._apply_label_remap(labels_raw, label_remap, label_file)
-            data_fit = data
-            if bool(_preprocess_cfg(self.dataset.config, 'pre_pca_augment_train', True)):
-                flat_aug = self.dataset._augment_pixels_for_pca_fit(
-                    data.reshape(-1, data.shape[2]),
-                    rng_fit,
-                )
-                data_fit = flat_aug.reshape(data.shape).astype(np.float32, copy=False)
-            fit_pixels.append(self.dataset._collect_pixels_for_preprocessor(data_fit, labels, rng_fit))
+            data_fit, labels_fit = self.dataset._augment_sample_pre_pca(data, labels, rng_fit)
+            fit_pixels.append(self.dataset._collect_pixels_for_preprocessor(data_fit, labels_fit, rng_fit))
 
         if not fit_pixels:
             raise RuntimeError('No train pixels available to fit preprocessor')
@@ -2182,14 +2209,11 @@ class _SplitPreprocessManager:
 
                 if split_name == 'train' and bool(_preprocess_cfg(self.dataset.config, 'pre_pca_augment_train', True)):
                     file_seed = int(hashlib.md5(data_file.encode('utf-8')).hexdigest()[:8], 16)
-                    flat_aug = self.dataset._augment_pixels_for_pca_fit(
-                        data.reshape(-1, data.shape[2]),
-                        np.random.RandomState(
-                            int(getattr(self.dataset.config.split, 'split_seed', 350234))
-                            + int(file_seed % 100000)
-                        ),
+                    aug_rng = np.random.RandomState(
+                        int(getattr(self.dataset.config.split, 'split_seed', 350234))
+                        + int(file_seed % 100000)
                     )
-                    data = flat_aug.reshape(data.shape).astype(np.float32, copy=False)
+                    data, labels = self.dataset._augment_sample_pre_pca(data, labels, aug_rng)
                 processed = preprocessor.transform(data).astype(np.float32)
 
                 boundary_map = self.dataset._compute_multiclass_boundary_map(labels)
@@ -2840,8 +2864,8 @@ class RGBDataset(AbstractHSDataset):
 
         strict_remap = bool(getattr(self.config.clsf, 'strict_label_remap', True))
         unknown_policy = str(getattr(self.config.clsf, 'unknown_label_policy', 'error')).strip().lower()
-        if unknown_policy not in {'error', 'map_to_class0'}:
-            raise ValueError("clsf.unknown_label_policy must be 'error' or 'map_to_class0'")
+        if unknown_policy not in {'error', 'map_to_bg'}:
+            raise ValueError("clsf.unknown_label_policy must be 'error' or 'map_to_bg'")
 
         if int(labels_raw.min()) < 0:
             raise ValueError(f"{os.path.basename(label_file)} has negative labels")
@@ -2853,7 +2877,7 @@ class RGBDataset(AbstractHSDataset):
             raise ValueError(
                 f"{os.path.basename(label_file)} has unknown labels {unknown_values}, remap_max={len(remap)-1}"
             )
-        if unknown_count > 0 and unknown_policy == 'map_to_class0':
+        if unknown_count > 0 and unknown_policy == 'map_to_bg':
             unknown_values = np.unique(labels_raw[unknown_mask])[:10].tolist()
             print(
                 f"\t\tWARNING: {os.path.basename(label_file)} maps unknown labels "
@@ -2862,7 +2886,7 @@ class RGBDataset(AbstractHSDataset):
 
         labels_clipped = np.clip(labels_raw, 0, len(remap) - 1)
         labels = remap[labels_clipped]
-        if unknown_count > 0 and unknown_policy == 'map_to_class0':
+        if unknown_count > 0 and unknown_policy == 'map_to_bg':
             labels[unknown_mask] = 0
         return labels.astype(np.int32, copy=False)
 
@@ -3096,14 +3120,7 @@ class RGBDataset(AbstractHSDataset):
                              prefetch_factor=2, persistent_workers=False):
         train_idx, val_idx, test_idx = self._patient_level_split()
 
-        train_subset = _AugmentedSubset(
-            self,
-            train_idx,
-            noise_std=0.01,
-            band_drop_rate=0.0,
-            cutout_ratio=0.10,
-            minority_blend_prob=0.10,
-        )
+        train_subset = _IndexedSubset(self, train_idx)
         val_subset = _IndexedSubset(self, val_idx)
         test_subset = _IndexedSubset(self, test_idx)
 
@@ -3159,14 +3176,7 @@ class RGBDataset(AbstractHSDataset):
 
         fold_loaders = []
         for train_idx, test_idx in sgkf.split(total_indices, self.patch_labels, groups=self.patch_patient_groups):
-            train_subset = _AugmentedSubset(
-                self,
-                train_idx,
-                noise_std=0.01,
-                band_drop_rate=0.0,
-                cutout_ratio=0.10,
-                minority_blend_prob=0.10,
-            )
+            train_subset = _IndexedSubset(self, train_idx)
             test_subset = _IndexedSubset(self, test_idx)
 
             train_loader = torch.utils.data.DataLoader(
@@ -3676,131 +3686,3 @@ class _FixedRatioBatchSampler(Sampler[List[int]]):
             yield batch[:self.batch_size].tolist()
 
 
-class _AugmentedSubset(Dataset):
-    """
-    Training-only subset with on-the-fly spatial & spectral augmentations.
-    
-    Augmentations applied (all random, each with 0.5 possibility):
-      - Spatial: horizontal + vertical flip, 90/180/270 deg. rotation
-      - Spectral: Gaussian noise, band-wise dropout (zero out random bands)
-      - Mixup-style: CutOut (mask random spatial region)
-    
-    Returns:
-    Augmented patch and label shapes of (C, H, W) and (H, W).
-    """
-    def __init__(self, dataset: AbstractHSDataset, indices: np.ndarray,
-                 noise_std: float = 0.01,
-                 band_drop_rate: float = 0.02,
-                 cutout_ratio: float = 0,
-                 minority_threshold: float = 0.3,
-                 minority_blend_prob: float = 0.10):
-        """Augment subset with optional rare-class copy-paste blending.
-
-        Args:
-            minority_threshold: classes with < threshold * max_count as rare.
-            minority_blend_prob: prob to apply rare-class blend on rare-class samples.
-        """
-        self.dataset = dataset
-        self.indices = indices
-        self.noise_std = noise_std
-        self.band_drop_rate = band_drop_rate
-        self.cutout_ratio = cutout_ratio
-        self.minority_threshold = minority_threshold
-        self.minority_blend_prob = minority_blend_prob
-
-        # pre-compute rare classes over subset
-        labels = dataset.patch_labels[indices]
-        class_counts = np.bincount(labels, minlength=dataset.num)
-        self.class_counts = class_counts
-        self.max_count = max(1, class_counts.max())
-        rare_mask = class_counts < (self.max_count * minority_threshold)
-        self.minority_classes = set(np.where(rare_mask)[0].tolist())
-
-        # map class
-        # make indices for fast sampling
-        self.class_to_indices: Dict[int, np.ndarray] = {}
-        for cls_idx in np.where(class_counts > 0)[0]:
-            self.class_to_indices[int(cls_idx)] = indices[labels == cls_idx]
-    
-    def __len__(self):
-        return len(self.indices)
-    
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        original_idx = self.indices[idx]
-        
-        # Get raw numpy patch (H, W, C) and label (H, W)
-        patch = self.dataset._get_patch_(original_idx)      # (H, W, C)
-        label = self.dataset._get_label_patch_(original_idx) # (H, W)
-        
-        # horizontal flip
-        if np.random.rand() > 0.5:
-            patch = np.flip(patch, axis=1)
-            label = np.flip(label, axis=1)
-        
-        # vertical flip
-        if np.random.rand() > 0.5:
-            patch = np.flip(patch, axis=0)
-            label = np.flip(label, axis=0)
-        
-        # random 90 rotation
-        if np.random.rand() > 0.5:
-            k = np.random.choice([1, 2, 3])
-            patch = np.rot90(patch, k, axes=(0, 1))
-            label = np.rot90(label, k, axes=(0, 1))
-        
-        # gaussian noise
-        if self.noise_std > 0 and np.random.rand() > 0.5:
-            noise = np.random.normal(0, self.noise_std, patch.shape).astype(patch.dtype)
-            patch = patch + noise
-        
-        # Soft spectral attenuation (instead of hard zero-drop on PCA components).
-        if self.band_drop_rate > 0 and np.random.rand() > 0.5:
-            n_bands = patch.shape[2]
-            n_mod = max(1, int(n_bands * self.band_drop_rate))
-            mod_idx = np.random.choice(n_bands, n_mod, replace=False)
-            scales = np.random.uniform(0.7, 1.0, size=(1, 1, n_mod)).astype(patch.dtype)
-            patch[:, :, mod_idx] *= scales
-        
-        # spatial cutout — reduced from 70% to 30% to preserve more supervision signal
-        if self.cutout_ratio > 0 and np.random.rand() > 0.85:
-            h, w = patch.shape[:2]
-            ch = max(1, int(h * self.cutout_ratio))
-            cw = max(1, int(w * self.cutout_ratio))
-            y0 = np.random.randint(0, h - ch + 1)
-            x0 = np.random.randint(0, w - cw + 1)
-            patch[y0:y0+ch, x0:x0+cw, :] = 0.0
-            # Mark cutout region as ignore in labels
-            label[y0:y0+ch, x0:x0+cw] = 255
-
-        # rare-class copy-paste: enrich minority classes with a same-class donor patch
-        center_cls = int(self.dataset.patch_labels[original_idx])
-        if (
-            self.minority_classes
-            and center_cls in self.minority_classes
-            and np.random.rand() < self.minority_blend_prob
-        ):
-            donor_pool = self.class_to_indices.get(center_cls)
-            if donor_pool is not None and len(donor_pool) > 1:
-                donor_idx = int(np.random.choice(donor_pool))
-                if donor_idx != original_idx:
-                    donor_patch = self.dataset._get_patch_(donor_idx).copy()
-                    donor_label = self.dataset._get_label_patch_(donor_idx).copy()
-
-                    h, w = patch.shape[:2]
-                    # Paste a moderate region (20%~50% side length) to avoid overpowering
-                    rh = np.random.randint(max(1, int(0.2 * h)), max(2, int(0.5 * h)))
-                    rw = np.random.randint(max(1, int(0.2 * w)), max(2, int(0.5 * w)))
-                    y0 = np.random.randint(0, h - rh + 1)
-                    x0 = np.random.randint(0, w - rw + 1)
-
-                    patch[y0:y0+rh, x0:x0+rw, :] = donor_patch[y0:y0+rh, x0:x0+rw, :]
-                    label[y0:y0+rh, x0:x0+rw] = donor_label[y0:y0+rh, x0:x0+rw]
-        
-        # convert to (C, H, W) tensor
-        patch = np.ascontiguousarray(np.transpose(patch, (2, 0, 1)))
-        label = np.ascontiguousarray(label)
-        
-        if self.dataset.transform:
-            patch = self.dataset.transform(patch)
-        
-        return torch.FloatTensor(patch), torch.LongTensor(label)

@@ -30,7 +30,7 @@ common:
   class_weight_sample_seed: 350234
 
 lora:
-  lora_dropout: 0.2
+  lora_dropout: 0.1
   lora_rank: 16
   lora_alpha: 32
   merge_lora_for_inference: false
@@ -71,17 +71,12 @@ preprocess:
   # Cache/split pipeline controls
   enable_split_cache_pipeline: true
   force_rebuild_split_cache: false
-  train_patch_augment: true
   split_preprocess_workers: 4
 
   # Train-only fitting controls
   pca_components: 8  # Number of PCA components to retain.
   max_fit_samples: 2000000
   max_pca_samples: 2000000
-
-  # abandoned
-  fit_on_foreground_only: false  # false => fit normalization/PCA on FG + sampled class-0 pixels.
-  class0_sample_ratio: 1.0  # When fit_on_foreground_only=false, class-0 samples ~= fg_count * ratio.
 
 memory:
   pin_memory: true  # true is faster but may cause memoleak in distant server.
@@ -98,25 +93,6 @@ path:
   data: /data/chenhaoran/bishe/fisher
   label: /data/chenhaoran/bishe/fisher
   output: /home/chenhaoran/LoLA_hsViT/output
-
-rgb:
-  path:
-    data: /data/chenhaoran/bishe/rgb
-    label: /data/chenhaoran/bishe/fisher
-  preprocess:
-    in_channels: 3
-  split:
-    split_seed: 350234
-    train_ratio: 0.8
-    val_ratio: 0.1
-    test_ratio: 0.1
-    test_rate: 0.1
-    val_rate: 0.1
-    n_folds: 5
-    patch_size: 31
-    batch_size: 1024
-    eval_batch_size: 1024
-    boundary_sampling_dilation: 1
 
 # hereby only declares front targets, except BG.
 clsf:

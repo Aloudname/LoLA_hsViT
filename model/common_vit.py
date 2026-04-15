@@ -113,27 +113,143 @@ class SpectralSpatialFusionPool(nn.Module):
         return x * gate
 
 
-class SpectralContinuityMixer(nn.Module):
-    """Inject local spectral continuity prior along the channel axis."""
-
-    def __init__(self):
+class PCAMultiBranchFusion(nn.Module):
+    """
+    Multi-branch PCA feature fusion tower.
+    
+    Replaces SpectralContinuityMixer which assumes spectral continuity in the
+    original 96-band space. Since input is PCA-projected to 8-15 bands,
+    "spectral continuity" becomes meaningless (PC_i and PC_j are orthogonal).
+    
+    This module instead uses multi-scale fusion + global context to leverage
+    the structure within PCA-compressed features WITHOUT false spectral priors.
+    
+    Architecture:
+        Input [B, C_pca, H, W]
+            ↓
+        [1x1 projection] → [B, 64, H, W]
+            ↓
+        ┌─────────────┬─────────────┬──────────────┐
+        │ Branch A    │ Branch B    │ Branch C     │
+        │ Local SE    │ Multi-scale │ Global Pool  │
+        │ (3x3+SE)    │ (Dilated)   │ (Reweight)   │
+        └─────────────┴─────────────┴──────────────┘
+            ↓
+        [Fused Merge] → [B, 64, H, W]
+            ↓
+        [Upscale to 96] → [B, 96, H, W]
+    """
+    
+    def __init__(self, in_channels: int, base_channels: int = 64):
         super().__init__()
-        self.smooth = nn.Sequential(
-            nn.Conv1d(1, 4, kernel_size=3, padding=1, bias=False),
-            nn.GELU(),
-            nn.Conv1d(4, 1, kernel_size=3, padding=1, bias=False),
+        
+        # Initial projection: PCA -> base_channels
+        self.proj = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True),
         )
-        self.mix_logit = nn.Parameter(torch.tensor(-1.0))
-
+        
+        # ===== Branch A: Local fusion + channel reweighting =====
+        self.branch_a = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True),
+            # SE-Block: channel attention
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(base_channels, max(base_channels // 4, 8), kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(max(base_channels // 4, 8), base_channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        
+        # ===== Branch B: Multi-scale difference capture =====
+        # Dilated convs capture features at different receptive fields
+        self.branch_b_1 = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels // 2, kernel_size=3, 
+                     dilation=1, padding=1, bias=False),
+            nn.BatchNorm2d(base_channels // 2),
+            nn.ReLU(inplace=True),
+        )
+        self.branch_b_2 = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels // 2, kernel_size=3, 
+                     dilation=2, padding=2, bias=False),
+            nn.BatchNorm2d(base_channels // 2),
+            nn.ReLU(inplace=True),
+        )
+        self.branch_b_merge = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True),
+        )
+        
+        # ===== Branch C: Global context modeling =====
+        # Captures global spectral statistics via adaptive pooling
+        self.branch_c = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(base_channels, base_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(base_channels),
+            nn.Sigmoid(),  # as reweighting mask
+        )
+        
+        # Fusion weights for branches (learnable)
+        self.fusion_weights = nn.Parameter(
+            torch.tensor([1.0, 0.8, 0.6], dtype=torch.float32),
+            requires_grad=True
+        )
+        
+        # Final upscaling: base_channels -> 96
+        self.final_upscale = nn.Sequential(
+            nn.Conv2d(base_channels, 96, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(96),
+            nn.ReLU(inplace=True),
+        )
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() != 4:
-            raise ValueError(f"Expected [B, C, H, W], got shape={tuple(x.shape)}")
-        b, c, h, w = x.shape
-        seq = x.permute(0, 2, 3, 1).reshape(-1, 1, c)
-        seq_smooth = self.smooth(seq)
-        x_smooth = seq_smooth.reshape(b, h, w, c).permute(0, 3, 1, 2)
-        mix = torch.sigmoid(self.mix_logit)
-        return (1.0 - mix) * x + mix * x_smooth
+        """
+        Args:
+            x: [B, C_pca, H, W] PCA features (8-15 dims)
+        
+        Returns:
+            [B, 96, H, W] expanded to main backbone dim
+        """
+        B, C, H, W = x.shape
+        
+        # Initial projection
+        x_proj = self.proj(x)  # [B, 64, H, W]
+        
+        # ===== Branch A =====
+        # 3x3 local feature extraction
+        x_a_local = self.branch_a[:3](x_proj)  # [B, 64, H, W]
+        # SE-gating
+        x_a_gate = self.branch_a[3:](x_a_local)  # [B, 64, 1, 1]
+        x_a_out = x_a_local * x_a_gate  # [B, 64, H, W]
+        
+        # ===== Branch B =====
+        # Multi-scale convolutions
+        x_b_1 = self.branch_b_1(x_proj)  # [B, 32, H, W]
+        x_b_2 = self.branch_b_2(x_proj)  # [B, 32, H, W]
+        x_b_cat = torch.cat([x_b_1, x_b_2], dim=1)  # [B, 64, H, W]
+        x_b_out = self.branch_b_merge(x_b_cat)  # [B, 64, H, W]
+        
+        # ===== Branch C =====
+        # Global statistics
+        x_c_pool = self.branch_c(x_proj)  # [B, 64, 1, 1]
+        x_c_out = x_proj * x_c_pool  # [B, 64, H, W]
+        
+        # ===== Fusion =====
+        # Normalize fusion weights
+        w_norm = torch.softmax(self.fusion_weights, dim=0)  # [3]
+        x_fused = (
+            w_norm[0] * x_a_out +
+            w_norm[1] * x_b_out +
+            w_norm[2] * x_c_out
+        )  # [B, 64, H, W]
+        
+        # Upscale to 96
+        x_out = self.final_upscale(x_fused)  # [B, 96, H, W]
+        
+        return x_out
 
 
 class StandardMultiHeadAttention(nn.Module):
@@ -247,15 +363,16 @@ class CommonViT(nn.Module):
               f"{num_classes} classes, depths {depths}, {patch_size} patch_size.")
         
         # Preprocessing in true 2D HSI format: [B, spectral_channels, H, W].
+        # Input is PCA-projected to 8-15 bands; "spectral continuity" is lost.
+        # Use multi-branch PCA fusion instead of fake spectral priors.
         stem_in = int(in_channels) if in_channels is not None else dim
-        self.input_spectral_prior = SpectralContinuityMixer()
+        self.input_spectral_prior = PCAMultiBranchFusion(
+            in_channels=stem_in,
+            base_channels=64
+        )
+        # PCAMultiBranchFusion already outputs 96-dim features;
+        # minimal additional processing for consistency
         self.spectral_conv = nn.Sequential(
-            nn.Conv2d(stem_in, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 96, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(96),
-            nn.ReLU(inplace=True),
             nn.Conv2d(96, dim, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(dim),
             nn.ReLU(inplace=True)

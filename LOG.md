@@ -439,4 +439,124 @@ $$
 
 ### 4.7
 
-对模型架构和训练指标做重构，去除背景（BG）：
+- 对模型架构和训练指标做重构，去除背景（BG）：
+- `SpectralContinuityMixer` 在 PCA 后的特征空间中失效，需重设计前处理层架构。
+
+
+### 4.12
+
+- 在传入Transformer Block前做处理：
+
+```
+输入 [B, C_pca, H, W]
+  ↓
+[1×1 投影] -> [B, 64, H, W]
+  ↓
+[三分支] -> [B, 64, H, W]
+  ↓
+[分支融合] -> [B, 64, H, W]
+  x_fused = w_A * x_a + w_B * x_b + w_C * x_c
+  其中 w_A, w_B, w_C 可学习且归一化
+  ↓
+[升维到 96] -> [B, 96, H, W]
+  ↓
+[进入 ViT Backbone]
+```
+
+**分支 A：Conv + SE Block**
+
+```python
+# 3×3 捕捉空间邻域
+x_a = Conv2d(64, 64, 3×3, padding=1)(x_proj)
+
+# SE-Block 通道注意力
+# Squeeze: GlobalAvePooling [B, 64, H, W] -> [B, 64, 1, 1]
+# Excitation: FC(64 -> 16 -> 64) + Sigmoid -> [B, 64]
+x_a = SE_Block(x_a)
+```
+
+**分支 B：Conv + Conv**
+```python
+# 不同感受野，捕捉尺度差异
+x_b_1 = Conv2d(64, 32, 3×3, dilation=1, padding=1)
+x_b_2 = Conv2d(64, 32, 3×3, dilation=2, padding=2)
+
+# 拼接
+x_b = Merge([x_b_1, x_b_2]) -> Conv(64 -> 64)
+```
+
+**分支 C：GlobalAvePooling + w*x**
+```python
+# GlobalAvePooling -> 1×1 Conv -> Sigmoid
+x_c_pool = AdaptiveAvgPool2d(1)(x_proj)  # [B, 64, 1, 1]
+x_c_gate = Conv2d(64, 64, 1×1) + Sigmoid()
+x_c = x_proj * x_c_gate  # 全局加权
+
+提取全局光谱统计特性作为调制器
+```
+
+| 分支 | 作用 | 操作 |
+|-----|------|------|
+| **A** | 局部融合+通道重加权 | Conv 3×3 + SE-Block |
+| **B** | 多感受野特征差异捕捉 | Dilated Conv (r=1,2) |
+| **C** | 全局光谱特征统计 | AdaptiveAvgPool + Sigmoid |
+
+**输入输出**
+
+| 维度 | 形状 | 说明 |
+|------|------|------|
+| **输入** | `[B, 8-15, H, W]` | PCA 降维后的 HSI 特征 |
+| **中间** | `[B, 64, H, W]` | 三分支处理后融合 |
+| **输出** | `[B, 96, H, W]` | 升维后进入 ViT 主干 |
+
+### 4.15
+
+采用密集分割任务的复合损失函数`SegmentationLoss`，由三个互补的损失分量组成：
+
+$$
+\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{focal}} + \lambda_{\text{dice}} \cdot \mathcal{L}_{\text{dice}} + \lambda_{\text{boundary}} \cdot \mathcal{L}_{\text{boundary}}
+$$
+
+**1. Focal Loss - 类别偏倚**
+
+$$
+\mathcal{L}_{\text{focal}}(p_t) = -\alpha_t \cdot (1 - p_t)^\gamma \cdot \log(p_t)
+$$
+
+- 通过焦点项 $(1-p_t)^\gamma$ 对易分样本降权
+- 优先训练难分样本，增强对前景类的关注
+- 支持 label smoothing 防止过度自信
+- 支持 ignore index 掩膜，处理边界和背景
+
+**2. Soft Dice Loss - 区域匹配**
+
+$$
+\mathcal{L}_{\text{dice}} = 1 - \frac{2 \sum_{c} w_c \cdot \text{Dice}_c}{\sum_{c} w_c}
+$$
+
+- 多类 Dice
+- 利好难分类的权重 $w_c$
+- 与 Focal Loss 互补，更关注区域整体性
+
+**3. Boundary CE Loss - 边界约束**
+
+$$
+\mathcal{L}_{\text{boundary}} = \frac{\sum_{(i,j) \in B} \text{CE}_{ij}}{\sum_{(i,j) \in B} 1}
+$$
+
+其中 $B$ 为膨胀后的边界区域（Sobel 检测 + 膨胀操作）
+
+- 对类别边界区域应用额外的交叉熵约束
+- 增强FG/BG边界的清晰度
+- 形态学处理 (dilation) 扩大边界影响
+
+配置参数
+
+| 配置参数 | 默认值 | 说明 |
+| :--: | :--: | :--: |
+|`gamma`|2.0|Focal Loss 的聚焦指数|
+|`dice_weight`|0.35|Dice Loss 权重$\lambda_{\text{dice}}$|
+|`boundary_weight`|0.20|Boundary Loss 权重$\lambda_{\text{boundary}}$|
+|`boundary_dilation`|1|边界膨胀核大小|
+|`dice_absent_prior`|0.05|缺失类的先验权重|
+|`label_smoothing`|0.0|Label smoothing 系数（0-1）|

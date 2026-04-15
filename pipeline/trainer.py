@@ -626,10 +626,15 @@ class hsTrainer(BaseEstimator):
 
     def fit_cv(self, n_folds=None, **kwargs):
         """
-        Cross-validation fit. Follows sklearn convention, returns ``self``.
+        [DEPRECATED] Cross-validation fit disabled in current config (cv_folds=1).
+        Preserved for backward compatibility;
+        may be re-enabled in future.
+        
+        Follows sklearn convention, returns ``self``.
 
         Args:
             n_folds : int or None (defaults to config.common.cv_folds).
+    # WARNING: CV training currently disabled by config (cv_folds: 1).
 
         Returns:
             self
