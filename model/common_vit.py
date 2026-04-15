@@ -84,29 +84,56 @@ class BandDropout(nn.Module):
 
 
 class SpectralSpatialFusionPool(nn.Module):
-    """Learnable spectral pooling with spatial-aware band reweighting."""
+    """Channel-spatial fusion gate for 2D HSI features [B, C, H, W]."""
 
-    def __init__(self):
+    def __init__(self, channels: int):
         super().__init__()
-        self.band_score = nn.Sequential(
-            nn.Conv1d(1, 8, kernel_size=3, padding=1, bias=False),
+        hidden = max(channels // 8, 8)
+        self.channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, hidden, kernel_size=1, bias=False),
             nn.GELU(),
-            nn.Conv1d(8, 1, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(hidden, channels, kernel_size=1, bias=False),
+            nn.Sigmoid(),
+        )
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(channels, 1, kernel_size=3, padding=1, bias=False),
+            nn.Sigmoid(),
         )
         self.mix_logit = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() != 5:
-            raise ValueError(f"Expected [B, C, D, H, W], got shape={tuple(x.shape)}")
+        if x.dim() != 4:
+            raise ValueError(f"Expected [B, C, H, W], got shape={tuple(x.shape)}")
 
-        spectral_desc = x.mean(dim=(1, 3, 4))
-        spatial_desc = x.abs().mean(dim=1).mean(dim=(2, 3))
+        c_gate = self.channel_gate(x)        # [B, C, 1, 1]
+        s_gate = self.spatial_gate(x)        # [B, 1, H, W]
         mix = torch.sigmoid(self.mix_logit)
-        descriptor = (1.0 - mix) * spectral_desc + mix * spatial_desc
+        gate = (1.0 - mix) * c_gate + mix * s_gate
+        return x * gate
 
-        scores = self.band_score(descriptor.unsqueeze(1)).squeeze(1)
-        weights = torch.softmax(scores, dim=-1).view(x.shape[0], 1, x.shape[2], 1, 1)
-        return (x * weights).sum(dim=2)
+
+class SpectralContinuityMixer(nn.Module):
+    """Inject local spectral continuity prior along the channel axis."""
+
+    def __init__(self):
+        super().__init__()
+        self.smooth = nn.Sequential(
+            nn.Conv1d(1, 4, kernel_size=3, padding=1, bias=False),
+            nn.GELU(),
+            nn.Conv1d(4, 1, kernel_size=3, padding=1, bias=False),
+        )
+        self.mix_logit = nn.Parameter(torch.tensor(-1.0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 4:
+            raise ValueError(f"Expected [B, C, H, W], got shape={tuple(x.shape)}")
+        b, c, h, w = x.shape
+        seq = x.permute(0, 2, 3, 1).reshape(-1, 1, c)
+        seq_smooth = self.smooth(seq)
+        x_smooth = seq_smooth.reshape(b, h, w, c).permute(0, 3, 1, 2)
+        mix = torch.sigmoid(self.mix_logit)
+        return (1.0 - mix) * x + mix * x_smooth
 
 
 class StandardMultiHeadAttention(nn.Module):
@@ -219,22 +246,24 @@ class CommonViT(nn.Module):
         print(f"StandardHSITransformer initialized with {in_channels} input channels, "
               f"{num_classes} classes, depths {depths}, {patch_size} patch_size.")
         
-        # preprocessing layers.
+        # Preprocessing in true 2D HSI format: [B, spectral_channels, H, W].
+        stem_in = int(in_channels) if in_channels is not None else dim
+        self.input_spectral_prior = SpectralContinuityMixer()
         self.spectral_conv = nn.Sequential(
-            nn.Conv3d(1, 32, kernel_size=(7, 3, 3), padding=(3, 1, 1)),
-            nn.BatchNorm3d(32),
+            nn.Conv2d(stem_in, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.Conv3d(32, 64, kernel_size=(5, 3, 3), padding=(2, 1, 1)),
-            nn.BatchNorm3d(64),
+            nn.Conv2d(64, 96, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(96),
             nn.ReLU(inplace=True),
-            nn.Conv3d(64, dim, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
-            nn.BatchNorm3d(dim),
+            nn.Conv2d(96, dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(dim),
             nn.ReLU(inplace=True)
         )
         
         self.band_dropout = BandDropout(drop_rate=0.1)
         self.spectral_attention = AdaptiveSqueezeExcitation(dim)
-        self.spectral_pool = SpectralSpatialFusionPool()
+        self.spectral_pool = SpectralSpatialFusionPool(dim)
         
         
         # patch & pos embedding
@@ -359,25 +388,31 @@ class CommonViT(nn.Module):
         
         return cam
 
-    def forward_features(self, x):
+    def _resize_pos_embed(self, h: int, w: int) -> torch.Tensor:
+        """Interpolate absolute position embedding to current token grid."""
+        if self.pos_embed.shape[1] == h and self.pos_embed.shape[2] == w:
+            return self.pos_embed
+        pos = self.pos_embed.permute(0, 3, 1, 2)  # [1, C, H0, W0]
+        pos = F.interpolate(pos, size=(h, w), mode='bicubic', align_corners=False)
+        return pos.permute(0, 2, 3, 1)
+
+    def forward_features(self, x, detach_cam_feature: bool = False):
         """        
         input shape: [B, C, H, W]
         """
-        if x.dim() == 4:  # [B, C, H, W]
-            B, C, H, W = x.shape
-            x = x.unsqueeze(1)  # [B, 1, C, H, W]
+        if x.dim() != 4:
+            raise ValueError(f"Expected 4D input [B, C, H, W], got {x.dim()}D tensor")
         
-        x = self.spectral_conv(x)  # [B, dim, D, H, W]
+        x = self.input_spectral_prior(x)
+        x = self.spectral_conv(x)  # [B, dim, H, W]
         x = self.band_dropout(x)
         x = self.spectral_attention(x)
-        
-        # Learnable spectral-space fusion pooling -> [B, dim, H, W]
         x = self.spectral_pool(x)
         
         x = self.patch_embed(x)  # [B, dim, H/2, W/2]
         x = x.permute(0, 2, 3, 1)  # [B, H/2, W/2, dim]
         
-        x = x + self.pos_embed
+        x = x + self._resize_pos_embed(x.shape[1], x.shape[2])
         x = self.pos_drop(x)
         
         for level_idx, blocks in enumerate(self.transformer_levels):
@@ -408,7 +443,8 @@ class CommonViT(nn.Module):
         x = x.view(B, H * W, C)
         x = self.norm(x)
 
-        self.final_feature_map = x.view(B, H, W, C).permute(0, 3, 1, 2).detach()
+        feat_map = x.view(B, H, W, C).permute(0, 3, 1, 2)
+        self.final_feature_map = feat_map.detach() if detach_cam_feature else feat_map
         
         return x
 
@@ -434,7 +470,7 @@ class CommonViT(nn.Module):
             print(f"\nWARNING: Input has {C} channels, but model expects {self.in_channels}.\n"
                   "This usually caused by incorrect data shape, which requires [B, C, H, W]. \n")
         
-        x = self.forward_features(x)  # [B, N, C_final]
+        x = self.forward_features(x, detach_cam_feature=bool(return_cam))  # [B, N, C_final]
 
         # Reshape to spatial for gradient flow: [B, C_final, H_feat, W_feat]
         H_feat, W_feat = self.final_feature_map.shape[2], self.final_feature_map.shape[3]

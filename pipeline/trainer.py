@@ -114,13 +114,15 @@ class SegmentationLoss(nn.Module):
                  label_smoothing: float = 0.0,
                  dice_weight: float = 0.35,
                  boundary_weight: float = 0.20,
-                 boundary_dilation: int = 1):
+                 boundary_dilation: int = 1,
+                 dice_absent_prior: float = 0.05):
         super().__init__()
         self.class_weight = class_weight
         self.ignore_index = int(ignore_index)
         self.dice_weight = float(dice_weight)
         self.boundary_weight = float(boundary_weight)
         self.boundary_dilation = int(max(0, boundary_dilation))
+        self.dice_absent_prior = float(max(0.0, dice_absent_prior))
         self.loss = FocalLoss(
             weight=class_weight,
             gamma=gamma,
@@ -148,11 +150,22 @@ class SegmentationLoss(nn.Module):
         denom = probs.sum(dim=reduce_dims) + one_hot.sum(dim=reduce_dims)
         dice = (2.0 * inter + 1e-6) / (denom + 1e-6)
 
-        # Only classes present in current batch contribute.
         present = one_hot.sum(dim=reduce_dims) > 0
-        if present.any():
-            return 1.0 - dice[present].mean()
-        return logits.sum() * 0.0
+        if self.class_weight is not None:
+            w = self.class_weight.to(logits.device, dtype=dice.dtype)
+            if w.numel() != dice.numel():
+                w = torch.ones_like(dice)
+        else:
+            w = torch.ones_like(dice)
+
+        presence_weight = present.float() + self.dice_absent_prior
+        weights = (w * presence_weight).clamp_min(0.0)
+        norm = weights.sum()
+        if norm <= 0:
+            return logits.sum() * 0.0
+
+        weights = weights / norm
+        return 1.0 - torch.sum(dice * weights)
 
     def _boundary_mask(self, targets: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         boundary = torch.zeros_like(valid)
@@ -376,20 +389,30 @@ class ModelEMA:
     At evaluation time, swap in shadow weights for improved test accuracy.
     """
     def __init__(self, model: nn.Module, decay: float = 0.999):
-        self.decay = decay
-        # Deep copy the model parameters (detached, no grad)
-        self.shadow = copy.deepcopy(model)
+        self.decay = float(decay)
+        raw_model = model.module if isinstance(model, nn.DataParallel) else model
+        # Keep EMA shadow as the raw module.
+        self.shadow = copy.deepcopy(raw_model)
         self.shadow.eval()
         for p in self.shadow.parameters():
             p.requires_grad_(False)
+
+    @staticmethod
+    def _unwrap(model: nn.Module) -> nn.Module:
+        return model.module if isinstance(model, nn.DataParallel) else model
     
     @torch.no_grad()
-    def update(self, model: nn.Module):
+    def update(self, model: nn.Module, decay_override: Optional[float] = None):
         """Update shadow weights with current model weights."""
-        for ema_p, model_p in zip(self.shadow.parameters(), model.parameters()):
-            ema_p.data.lerp_(model_p.data, 1.0 - self.decay)
-        # Also update buffers (e.g., BatchNorm running stats)
-        for ema_b, model_b in zip(self.shadow.buffers(), model.buffers()):
+        raw_model = self._unwrap(model)
+        decay = self.decay if decay_override is None else float(np.clip(decay_override, 0.0, 0.99999))
+
+        for ema_p, model_p in zip(self.shadow.parameters(), raw_model.parameters()):
+            ema_p.data.lerp_(model_p.data, 1.0 - decay)
+
+        # Copy buffers directly;
+        # for BN buffers under DataParallel this tracks the master copy.
+        for ema_b, model_b in zip(self.shadow.buffers(), raw_model.buffers()):
             ema_b.data.copy_(model_b.data)
     
     def state_dict(self):
@@ -409,7 +432,7 @@ class ModelEMA:
 
         Handles ``nn.DataParallel`` by unwrapping to the inner module first.
         """
-        raw_model = model.module if isinstance(model, nn.DataParallel) else model
+        raw_model = self._unwrap(model)
         for p_m, p_s in zip(raw_model.parameters(), self.shadow.parameters()):
             # Swap storage pointers — no data copied, O(num_params) pointer assigns
             tmp        = p_m.data
@@ -624,7 +647,7 @@ class hsTrainer(BaseEstimator):
     @staticmethod
     def _metric_labels_from_config(config: Munch, num_classes: int):
         """Return class indices used for metrics (optionally exclude class-0)."""
-        exclude_class0 = bool(getattr(config.common, 'exclude_class0_in_metrics', True))
+        exclude_class0 = bool(getattr(config.common, 'exclude_class0_in_metrics', False))
         if exclude_class0 and num_classes > 1:
             labels = list(range(1, num_classes))
         else:
@@ -635,13 +658,18 @@ class hsTrainer(BaseEstimator):
         return hsTrainer._metric_labels_from_config(self.config, num_classes)
 
     def _select_eval_batch_indices(self, total_batches: int, eval_cap: int) -> Optional[List[int]]:
-        """Random stratified selection of validation batches when capped.
+        """Select validation batches when capped.
 
-        Splits [0, total_batches) into ``eval_cap`` contiguous strata and samples
-        one index from each stratum to avoid front-slice bias.
+        Default mode is deterministic (fixed stratified picks) to keep curves stable.
         """
         if eval_cap <= 0 or total_batches <= eval_cap:
             return None
+
+        deterministic = bool(getattr(self.config.common, 'eval_cap_deterministic', True))
+        if deterministic:
+            picked = np.linspace(0, total_batches - 1, num=eval_cap, dtype=np.int64)
+            picked = sorted(set(int(x) for x in picked.tolist()))
+            return picked if picked else None
 
         base_seed = int(getattr(self.config.common, 'eval_sample_seed', 350234))
         call_id = int(getattr(self, '_eval_call_counter', 0))
@@ -766,9 +794,52 @@ class hsTrainer(BaseEstimator):
         miou = float(np.mean(miou_vals)) * 100 if miou_vals else 0.0
         return ba, kappa, miou
 
+    @staticmethod
+    def _class_iou_from_confusion(cm_np: np.ndarray, class_idx: int) -> float:
+        if class_idx < 0 or class_idx >= cm_np.shape[0]:
+            return 0.0
+        row_sums = cm_np.sum(axis=1)
+        col_sums = cm_np.sum(axis=0)
+        tp = int(cm_np[class_idx, class_idx])
+        fp = int(col_sums[class_idx]) - tp
+        fn = int(row_sums[class_idx]) - tp
+        denom = tp + fp + fn
+        if denom <= 0:
+            return 0.0
+        return float(tp) / float(denom) * 100.0
+
+    @staticmethod
+    def _mean_dice_from_confusion(cm_np: np.ndarray, labels: List[int]) -> float:
+        if not labels:
+            return 0.0
+        row_sums = cm_np.sum(axis=1)
+        col_sums = cm_np.sum(axis=0)
+        dice_vals = []
+        for c in labels:
+            if c < 0 or c >= cm_np.shape[0]:
+                continue
+            tp = int(cm_np[c, c])
+            fp = int(col_sums[c]) - tp
+            fn = int(row_sums[c]) - tp
+            denom = 2 * tp + fp + fn
+            if denom > 0:
+                dice_vals.append((2.0 * tp) / float(denom))
+        if not dice_vals:
+            return 0.0
+        return float(np.mean(dice_vals)) * 100.0
+
     def _select_early_stop_score(self) -> float:
         """Choose scalar score for early stopping."""
-        return float(getattr(self, '_last_ba', 0.0))
+        metric = str(getattr(self.config.common, 'early_stop_metric', 'composite')).strip().lower()
+        if metric in {'ba', 'eval'}:
+            return float(getattr(self, '_last_ba', 0.0))
+        if metric in {'miou', 'miou_all'}:
+            return float(getattr(self, '_last_miou_all', getattr(self, '_last_miou_metric', 0.0)))
+        if metric in {'fg_dice', 'dice'}:
+            return float(getattr(self, '_last_fg_dice', 0.0))
+        if metric in {'bg_iou', 'background_iou'}:
+            return float(getattr(self, '_last_bg_iou', 0.0))
+        return float(getattr(self, '_last_composite_score', getattr(self, '_last_miou_metric', 0.0)))
 
     def _parse_model_outputs(self, outputs):
         """Parse model outputs and return dense class logits [B, C, H, W]."""
@@ -1026,13 +1097,17 @@ class hsTrainer(BaseEstimator):
         # Stable cosine decay without warm restarts.
         sc = self.config.common.scheduler
         eta_min = getattr(sc, 'eta_min', 1e-6)
+        self.gradient_accumulation_steps = int(max(1, getattr(self.config.common, 'gradient_accumulation_steps', 1)))
         full_train_batches = len(self.train_loader) if self.train_loader is not None else 1
         sched_batches = max(1, min(full_train_batches, int(getattr(self.config.common, 'max_train_batches_per_epoch', 0) or full_train_batches)))
-        self.total_sched_steps = max(1, self.epochs * sched_batches)
+        sched_updates_per_epoch = int(max(1, np.ceil(float(sched_batches) / float(self.gradient_accumulation_steps))))
+        self.total_sched_steps = max(1, self.epochs * sched_updates_per_epoch)
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=self.total_sched_steps, eta_min=eta_min)
 
         print(f"\tAdamW(backbone_lr={lr*0.5:.2e}, head_lr={lr:.2e}, wd={weight_decay}) + CosineDecay")
+        if self.gradient_accumulation_steps > 1:
+            print(f"\tGradient accumulation: {self.gradient_accumulation_steps} steps")
         
         # Class-weighted loss from dense pixel labels (ignore padding=255)
         focal_gamma = self.config.common.focal_gamma
@@ -1131,7 +1206,7 @@ class hsTrainer(BaseEstimator):
         except Exception as e:
             print(f"  Warning: uniform class weights ({e})")
 
-        self.early_stop_metric = str(getattr(self.config.common, 'early_stop_metric', 'eval')).lower()
+        self.early_stop_metric = str(getattr(self.config.common, 'early_stop_metric', 'composite')).lower()
         self.save_topk = int(max(1, getattr(self.config.common, 'save_topk_models', 3)))
         self.topk_models = []
 
@@ -1146,6 +1221,7 @@ class hsTrainer(BaseEstimator):
             dice_weight=float(getattr(self.config.common, 'loss_dice_weight', 0.35)),
             boundary_weight=float(getattr(self.config.common, 'loss_boundary_weight', 0.20)),
             boundary_dilation=int(getattr(self.config.common, 'loss_boundary_dilation', 1)),
+            dice_absent_prior=float(getattr(self.config.common, 'loss_dice_absent_prior', 0.05)),
         )
         print(
             f"  SegmentationLoss(gamma={focal_gamma}, "
@@ -1167,14 +1243,19 @@ class hsTrainer(BaseEstimator):
         self.max_val_batches_per_epoch = int(
             getattr(self.config.common, 'max_val_batches_per_epoch', 0)
         )
+        self.eval_use_batch_cap = bool(getattr(self.config.common, 'eval_use_batch_cap', False))
         self.eval_boundary_band_dilation = int(max(0, getattr(self.config.common, 'eval_boundary_band_dilation', 2)))
-        if self.max_val_batches_per_epoch <= 0 and self.max_train_batches_per_epoch > 0:
+        if self.eval_use_batch_cap and self.max_val_batches_per_epoch <= 0 and self.max_train_batches_per_epoch > 0:
             # Keep validation affordable by default; can be overridden explicitly.
             self.max_val_batches_per_epoch = max(1, self.max_train_batches_per_epoch // 2)
 
         # EMA
         ema_decay = getattr(self.config.common, 'ema_decay', 0.999)
         self.ema = ModelEMA(self.model, decay=ema_decay)
+        self.ema_skip_warmup = bool(getattr(self.config.common, 'ema_skip_warmup', True))
+        self.ema_warmup_decay = float(getattr(self.config.common, 'ema_warmup_decay', min(0.95, ema_decay)))
+        self.amp_skip_step_counter = 0
+        self.nan_or_inf_skip_counter = 0
         
         if use_amp:
             print(f"  AMP enabled, EMA(decay={ema_decay}), patience={self.patience}")
@@ -1184,6 +1265,8 @@ class hsTrainer(BaseEstimator):
             print(f"  Train epoch cap: {self.max_train_batches_per_epoch} batches/epoch")
         if self.max_val_batches_per_epoch > 0:
             print(f"  Val eval cap: {self.max_val_batches_per_epoch} batches/eval")
+        if not self.eval_use_batch_cap:
+            print("  Val eval uses full validation set (deterministic metrics)")
 
     def train_epoch(self, epoch: int) -> Tuple[float, float]:
         """
@@ -1213,6 +1296,9 @@ class hsTrainer(BaseEstimator):
         if self.max_train_batches_per_epoch > 0:
             effective_train_batches = min(full_train_batches, self.max_train_batches_per_epoch)
 
+        self.optimizer.zero_grad(set_to_none=True)
+        last_grad_norm = 0.0
+
         with self._batch_stream_manager(self.train_loader) as batch_iter:
             pbar = tqdm(batch_iter, total=effective_train_batches,
                         desc=f'Epoch {epoch+1}/{self.epochs}', leave=False)
@@ -1231,32 +1317,67 @@ class hsTrainer(BaseEstimator):
                 if hsi.dim() == 4 and hsi.shape[-1] <= 16:
                     hsi = hsi.permute(0, 3, 1, 2)
 
-                self.optimizer.zero_grad()
                 if self.use_amp:
                     with autocast():
                         outputs = self.model(hsi)
                         logits = self._parse_model_outputs(outputs)
-                        loss = self.criterion(logits, labels)
+                        loss_raw = self.criterion(logits, labels)
+                    if not torch.isfinite(loss_raw):
+                        self.nan_or_inf_skip_counter += 1
+                        self.optimizer.zero_grad(set_to_none=True)
+                        pbar.set_postfix({'loss': 'nan/inf-skip'})
+                        continue
+
+                    loss = loss_raw / float(self.gradient_accumulation_steps)
                     self.scaler.scale(loss).backward()
-                    if self.grad_clip > 0:
-                        self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
                 else:
                     outputs = self.model(hsi)
                     logits = self._parse_model_outputs(outputs)
-                    loss = self.criterion(logits, labels)
+                    loss_raw = self.criterion(logits, labels)
+                    if not torch.isfinite(loss_raw):
+                        self.nan_or_inf_skip_counter += 1
+                        self.optimizer.zero_grad(set_to_none=True)
+                        pbar.set_postfix({'loss': 'nan/inf-skip'})
+                        continue
+
+                    loss = loss_raw / float(self.gradient_accumulation_steps)
                     loss.backward()
-                    if self.grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                    self.optimizer.step()
 
-                self.ema.update(self.model)
-                if epoch >= self.warmup_epochs:
-                    self.scheduler.step()
+                should_step = (
+                    ((batch_idx + 1) % self.gradient_accumulation_steps == 0)
+                    or ((batch_idx + 1) == effective_train_batches)
+                )
 
-                total_loss += float(loss.item())
+                if should_step:
+                    optimizer_stepped = True
+                    if self.use_amp:
+                        prev_scale = float(self.scaler.get_scale())
+                        if self.grad_clip > 0:
+                            self.scaler.unscale_(self.optimizer)
+                            grad_norm_val = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                            last_grad_norm = float(grad_norm_val)
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        new_scale = float(self.scaler.get_scale())
+                        if new_scale < prev_scale:
+                            optimizer_stepped = False
+                            self.amp_skip_step_counter += 1
+                    else:
+                        if self.grad_clip > 0:
+                            grad_norm_val = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                            last_grad_norm = float(grad_norm_val)
+                        self.optimizer.step()
+
+                    self.optimizer.zero_grad(set_to_none=True)
+
+                    if optimizer_stepped:
+                        if not (self.ema_skip_warmup and epoch < self.warmup_epochs):
+                            decay_override = self.ema_warmup_decay if epoch < self.warmup_epochs else None
+                            self.ema.update(self.model, decay_override=decay_override)
+                        if epoch >= self.warmup_epochs:
+                            self.scheduler.step()
+
+                total_loss += float(loss_raw.item())
                 with torch.no_grad():
                     predicted = torch.argmax(logits.detach(), dim=1)
                     valid_mask = (labels != 255)
@@ -1265,7 +1386,7 @@ class hsTrainer(BaseEstimator):
 
                 acc = 100.0 * correct / total if total > 0 else 0.0
                 pbar.set_postfix({
-                    'loss': f'{loss.item():.4f}',
+                    'loss': f'{loss_raw.item():.4f}',
                     'acc': f'{acc:.2f}%',
                     'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
                 })
@@ -1278,11 +1399,7 @@ class hsTrainer(BaseEstimator):
         self.lr_history.append(self.optimizer.param_groups[0]['lr'])
         
         # record gradient L2 norm
-        total_norm = 0.0
-        for p in self.model.parameters():
-            if p.grad is not None:
-                total_norm += p.grad.data.norm(2).item() ** 2
-        self.grad_norms.append(total_norm ** 0.5)
+        self.grad_norms.append(float(last_grad_norm))
         
         return epoch_loss, epoch_acc
 
@@ -1346,7 +1463,7 @@ class hsTrainer(BaseEstimator):
         eval_cap = 0
         if not collect_extra:
             using_val_loader = (eval_loader is self.val_loader)
-            if using_val_loader:
+            if using_val_loader and self.eval_use_batch_cap:
                 eval_cap = self.max_val_batches_per_epoch
         if uncapped:
             eval_cap = 0
@@ -1359,7 +1476,7 @@ class hsTrainer(BaseEstimator):
             eval_iter_loader = self._build_capped_eval_loader(eval_loader, selected_eval_batches)
             effective_eval_batches = len(eval_iter_loader)
             tprint(
-                f"  Eval cap active: randomly stratified {effective_eval_batches}/{total_eval_batches} batches"
+                f"  Eval cap active: deterministic stratified {effective_eval_batches}/{total_eval_batches} batches"
             )
 
         recon_state = self._init_reconstruction_state(eval_iter_loader) if need_reconstruction else None
@@ -1444,6 +1561,19 @@ class hsTrainer(BaseEstimator):
 
         cm_np = cm_gpu.cpu().numpy().astype(np.int64)
         ba_metric, kappa_metric, miou_metric = self._metrics_from_confusion(cm_np, metric_labels_eval)
+        all_labels = list(range(num_classes))
+        _, _, miou_all = self._metrics_from_confusion(cm_np, all_labels)
+        bg_iou = self._class_iou_from_confusion(cm_np, 0)
+        fg_labels = [c for c in all_labels if c != 0]
+        fg_dice = self._mean_dice_from_confusion(cm_np, fg_labels if fg_labels else all_labels)
+
+        w_miou = float(getattr(self.config.common, 'early_stop_weight_miou', 0.60))
+        w_fg_dice = float(getattr(self.config.common, 'early_stop_weight_fg_dice', 0.30))
+        w_bg_iou = float(getattr(self.config.common, 'early_stop_weight_bg_iou', 0.10))
+        w_sum = max(1e-8, w_miou + w_fg_dice + w_bg_iou)
+        w_miou, w_fg_dice, w_bg_iou = w_miou / w_sum, w_fg_dice / w_sum, w_bg_iou / w_sum
+        composite_score = w_miou * miou_all + w_fg_dice * fg_dice + w_bg_iou * bg_iou
+
         acc = ba_metric
         kappa = kappa_metric
         miou = miou_metric
@@ -1455,6 +1585,10 @@ class hsTrainer(BaseEstimator):
         self._last_kappa = kappa_metric
         self._last_miou_metric = miou_metric
         self._last_miou = miou
+        self._last_miou_all = miou_all
+        self._last_bg_iou = bg_iou
+        self._last_fg_dice = fg_dice
+        self._last_composite_score = composite_score
         if cm_np.shape[0] > 1:
             eval_rows = cm_np[1:, :]
             eval_row_sums = eval_rows.sum(axis=1).astype(np.float64)
@@ -1521,6 +1655,9 @@ class hsTrainer(BaseEstimator):
             'eval_ba',
             'eval_kappa',
             'eval_miou',
+            'eval_miou_all',
+            'eval_fg_dice',
+            'eval_bg_iou',
             'eval_min_recall',
             'eval_mean_recall',
         ]
@@ -1565,7 +1702,8 @@ class hsTrainer(BaseEstimator):
         best_eval_score = -1e18
         try:
             for entry in self.topk_models:
-                self.model.load_state_dict(entry['model_state'])
+                raw_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+                raw_model.load_state_dict(entry['model_state'])
                 _ = self.evaluate(collect_extra=False, use_ema=False, loader=self.val_loader)
                 eval_score = self._select_early_stop_score()
                 if eval_score > best_eval_score:
@@ -1638,13 +1776,19 @@ class hsTrainer(BaseEstimator):
                         'eval_ba': float(getattr(self, '_last_ba', eval_acc)),
                         'eval_kappa': float(getattr(self, '_last_kappa', kappa)),
                         'eval_miou': float(getattr(self, '_last_miou_metric', 0.0)),
+                        'eval_miou_all': float(getattr(self, '_last_miou_all', 0.0)),
+                        'eval_fg_dice': float(getattr(self, '_last_fg_dice', 0.0)),
+                        'eval_bg_iou': float(getattr(self, '_last_bg_iou', 0.0)),
                         'eval_min_recall': float(getattr(self, '_last_min_recall', 0.0)),
                         'eval_mean_recall': float(getattr(self, '_last_mean_recall', 0.0)),
                     })
 
-                    miou_str = ''
-                    if hasattr(self, '_last_miou'):
-                        miou_str = f" mIoU(eval): {getattr(self, '_last_miou_metric', self._last_miou):6.2f}%"
+                    miou_str = (
+                        f" mIoU(eval): {getattr(self, '_last_miou_metric', 0.0):6.2f}%"
+                        f" mIoU(all): {getattr(self, '_last_miou_all', 0.0):6.2f}%"
+                        f" FG-Dice: {getattr(self, '_last_fg_dice', 0.0):6.2f}%"
+                        f" BG-IoU: {getattr(self, '_last_bg_iou', 0.0):6.2f}%"
+                    )
 
                     eval_set_name = 'Val' if self.val_loader else 'Test'
                     tprint(f"\n[Epoch {epoch+1:3d}] "
@@ -1668,7 +1812,7 @@ class hsTrainer(BaseEstimator):
                             'kappa': kappa
                         }
                         self._save_model()
-                        tprint(f"  Best model saved (score: {eval_score:.2f}%) at {os.path.join(self.output, 'models', f'{self.model_name}_best.onnx')}")
+                        tprint(f"  Best model saved (composite score: {eval_score:.2f}%) at {os.path.join(self.output, 'models', f'{self.model_name}_best.onnx')}")
                     else:
                         # early stopping check
                         if epoch - self.best_epoch > self.patience:
@@ -1685,6 +1829,9 @@ class hsTrainer(BaseEstimator):
                         'eval_ba': None,
                         'eval_kappa': None,
                         'eval_miou': None,
+                        'eval_miou_all': None,
+                        'eval_fg_dice': None,
+                        'eval_bg_iou': None,
                         'eval_min_recall': None,
                         'eval_mean_recall': None,
                     })
@@ -1703,7 +1850,7 @@ class hsTrainer(BaseEstimator):
         
         print("\n")
         tprint(f"Training completed with:")
-        print(f"  Best epoch: {self.best_epoch + 1} (BA: {self.best_acc:.2f}%)")
+        print(f"  Best epoch: {self.best_epoch + 1} (Score: {self.best_acc:.2f}%)")
         print(f"  Total time: {training_time:.2f}s")
         print("\n")
         
@@ -1711,7 +1858,8 @@ class hsTrainer(BaseEstimator):
         if self.best_model_state is not None:
             self._reselect_best_from_topk()
             tprint(f"Loading model from epoch {self.best_epoch + 1} for final eval...")
-            self.model.load_state_dict(self.best_model_state['model_state'])
+            raw_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+            raw_model.load_state_dict(self.best_model_state['model_state'])
         else:
             # Fallback when stage-C did not run long enough to produce a checkpoint.
             self.best_epoch = max(0, len(self.train_losses) - 1)
@@ -1744,6 +1892,7 @@ class hsTrainer(BaseEstimator):
         results = {
             'best_epoch': self.best_epoch + 1,
             'best_accuracy': self.best_acc,
+            'best_score': self.best_acc,
             'final_accuracy': final_acc,
             'final_kappa': final_kappa,
             'training_time': training_time,
@@ -1752,6 +1901,10 @@ class hsTrainer(BaseEstimator):
         results['final_accuracy_eval'] = float(getattr(self, '_last_ba', final_acc))
         results['final_kappa_eval'] = float(getattr(self, '_last_kappa', final_kappa))
         results['final_miou_eval'] = float(getattr(self, '_last_miou_metric', 0.0))
+        results['final_miou_all'] = float(getattr(self, '_last_miou_all', 0.0))
+        results['final_fg_dice'] = float(getattr(self, '_last_fg_dice', 0.0))
+        results['final_bg_iou'] = float(getattr(self, '_last_bg_iou', 0.0))
+        results['final_score'] = float(getattr(self, '_last_composite_score', 0.0))
         # Always include mIoU
         if hasattr(self, '_last_miou'):
             results['final_miou'] = self._last_miou
@@ -2608,7 +2761,7 @@ class hsTrainer(BaseEstimator):
 
         num_classes = int(self.config.clsf.num)
         class_names = list(self.config.clsf.targets[:num_classes])
-        score = float(getattr(self, '_last_ba', self.best_acc))
+        score = float(getattr(self, '_last_composite_score', self.best_acc))
         ba_eval = float(getattr(self, '_last_ba', score))
         miou = float(getattr(self, '_last_miou', 0.0))
         timestamp = time.strftime('%Y%m%d_%H%M%S')
