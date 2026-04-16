@@ -233,6 +233,7 @@ def main():
 
             for seed in seed_list:
                 run_cfg = copy.deepcopy(config)
+                run_cfg.split.seed = int(seed)
                 run_cfg.split.split_seed = int(seed)
                 dataset.config = run_cfg
 

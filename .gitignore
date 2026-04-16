@@ -10,6 +10,7 @@ output/
 
 # test file
 test.ipynb
+augmentation_compare.ipynb
 
 # C extensions
 *.so

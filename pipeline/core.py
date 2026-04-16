@@ -198,13 +198,13 @@ class ModelFactory:
             base_kwargs = {
                 'in_channels': int(getattr(rgb_pre, 'in_channels', 3)),
                 'num_classes': config.clsf.num,
-                'patch_size': int(getattr(rgb_split, 'patch_size', config.split.patch_size)),
+                'patch_size': int(getattr(rgb_split, 'patch_size', getattr(getattr(config.split, 'patch', Munch()), 'size', config.split.patch_size))),
             }
         else:
             base_kwargs = {
                 'in_channels': config.preprocess.pca_components,
                 'num_classes': config.clsf.num,
-                'patch_size': config.split.patch_size,
+                'patch_size': int(getattr(getattr(config.split, 'patch', Munch()), 'size', config.split.patch_size)),
             }
         
         # LoRA params for lola variants
@@ -482,7 +482,8 @@ class TrainPipeline(BaseEstimator):
         print(f"TrainPipeline: {self._name}")
         print(f"  Dataset: {len(self._dataset)} patches")
         print(f"  Classes: {self._config.clsf.num} ({', '.join(self._config.clsf.targets)})")
-        print(f"  Patch size: {self._config.split.patch_size}")
+        patch_size = int(getattr(getattr(self._config.split, 'patch', Munch()), 'size', self._config.split.patch_size))
+        print(f"  Patch size: {patch_size}")
         print(f"  Input channels: {self._config.preprocess.pca_components}")
         print(f"  GPUs: {self._num_gpus}")
         print(f"  Output: {self._output_dir}")

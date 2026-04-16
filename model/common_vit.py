@@ -113,44 +113,37 @@ class SpectralSpatialFusionPool(nn.Module):
         return x * gate
 
 
-class PCAMultiBranchFusion(nn.Module):
+class MultiBranchFusion(nn.Module):
     """
-    Multi-branch PCA feature fusion tower.
+    Multi-branch PCA feature fusion layer.
+
+    This module uses multi-scale fusion + global context to leverage
+    the structure within PCA-compressed features without false spectral priors.
     
-    Replaces SpectralContinuityMixer which assumes spectral continuity in the
-    original 96-band space. Since input is PCA-projected to 8-15 bands,
-    "spectral continuity" becomes meaningless (PC_i and PC_j are orthogonal).
+    Input: [B, C, H, W]
+    Output: [B, 96, H, W]
     
-    This module instead uses multi-scale fusion + global context to leverage
-    the structure within PCA-compressed features WITHOUT false spectral priors.
-    
-    Architecture:
-        Input [B, C_pca, H, W]
-            ↓
-        [1x1 projection] → [B, 64, H, W]
-            ↓
-        ┌─────────────┬─────────────┬──────────────┐
-        │ Branch A    │ Branch B    │ Branch C     │
-        │ Local SE    │ Multi-scale │ Global Pool  │
-        │ (3x3+SE)    │ (Dilated)   │ (Reweight)   │
-        └─────────────┴─────────────┴──────────────┘
-            ↓
-        [Fused Merge] → [B, 64, H, W]
-            ↓
-        [Upscale to 96] → [B, 96, H, W]
+    Pre-block before ViTBlock.
     """
     
     def __init__(self, in_channels: int, base_channels: int = 64):
+        """
+        Args:
+            in_channels (int): C.
+            base_channels (int, optional): Num of channels that project C into.
+        """
         super().__init__()
         
-        # Initial projection: PCA -> base_channels
+        # spectral projection
+        # C -> base_channels
         self.proj = nn.Sequential(
             nn.Conv2d(in_channels, base_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(base_channels),
             nn.ReLU(inplace=True),
         )
         
-        # ===== Branch A: Local fusion + channel reweighting =====
+        # branch A
+        # local fusion + channel reweighting
         self.branch_a = nn.Sequential(
             nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(base_channels),
@@ -163,8 +156,9 @@ class PCAMultiBranchFusion(nn.Module):
             nn.Sigmoid(),
         )
         
-        # ===== Branch B: Multi-scale difference capture =====
-        # Dilated convs capture features at different receptive fields
+        # branch B
+        # Multi-scale difference capture,
+        # dilated convs capture features at different receptive fields
         self.branch_b_1 = nn.Sequential(
             nn.Conv2d(base_channels, base_channels // 2, kernel_size=3, 
                      dilation=1, padding=1, bias=False),
@@ -183,8 +177,8 @@ class PCAMultiBranchFusion(nn.Module):
             nn.ReLU(inplace=True),
         )
         
-        # ===== Branch C: Global context modeling =====
-        # Captures global spectral statistics via adaptive pooling
+        # branch C
+        # captures global spectral statistics via adaptive pooling
         self.branch_c = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(base_channels, base_channels, kernel_size=1, bias=False),
@@ -192,13 +186,14 @@ class PCAMultiBranchFusion(nn.Module):
             nn.Sigmoid(),  # as reweighting mask
         )
         
-        # Fusion weights for branches (learnable)
+        # merge weights of branches,
+        # learnable to adaptively balance contributions
         self.fusion_weights = nn.Parameter(
             torch.tensor([1.0, 0.8, 0.6], dtype=torch.float32),
             requires_grad=True
         )
         
-        # Final upscaling: base_channels -> 96
+        # upscaling
         self.final_upscale = nn.Sequential(
             nn.Conv2d(base_channels, 96, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(96),
@@ -215,30 +210,30 @@ class PCAMultiBranchFusion(nn.Module):
         """
         B, C, H, W = x.shape
         
-        # Initial projection
+        # projection
         x_proj = self.proj(x)  # [B, 64, H, W]
         
-        # ===== Branch A =====
+        # A
         # 3x3 local feature extraction
         x_a_local = self.branch_a[:3](x_proj)  # [B, 64, H, W]
         # SE-gating
         x_a_gate = self.branch_a[3:](x_a_local)  # [B, 64, 1, 1]
         x_a_out = x_a_local * x_a_gate  # [B, 64, H, W]
         
-        # ===== Branch B =====
-        # Multi-scale convolutions
+        # B
+        # multi-scale convolutions
         x_b_1 = self.branch_b_1(x_proj)  # [B, 32, H, W]
         x_b_2 = self.branch_b_2(x_proj)  # [B, 32, H, W]
         x_b_cat = torch.cat([x_b_1, x_b_2], dim=1)  # [B, 64, H, W]
         x_b_out = self.branch_b_merge(x_b_cat)  # [B, 64, H, W]
         
-        # ===== Branch C =====
-        # Global statistics
+        # C
+        # global statistics
         x_c_pool = self.branch_c(x_proj)  # [B, 64, 1, 1]
         x_c_out = x_proj * x_c_pool  # [B, 64, H, W]
         
-        # ===== Fusion =====
-        # Normalize fusion weights
+        # merge
+        # norm fusion weights
         w_norm = torch.softmax(self.fusion_weights, dim=0)  # [3]
         x_fused = (
             w_norm[0] * x_a_out +
@@ -246,7 +241,7 @@ class PCAMultiBranchFusion(nn.Module):
             w_norm[2] * x_c_out
         )  # [B, 64, H, W]
         
-        # Upscale to 96
+        # upscale
         x_out = self.final_upscale(x_fused)  # [B, 96, H, W]
         
         return x_out
@@ -321,23 +316,23 @@ class TransformerBlock(nn.Module):
 
 class CommonViT(nn.Module):
     """
-    Standard, common ViT for hyperspectral image pixel-level segmentation.
+    Common ViT for HSI pixel-level segmentation.
     Same API and params with LoLA are remaining.
     """
     
-    def __init__(self, in_channels=None, num_classes=None, patch_size=None, dim=96, depths=[3, 4, 5],
+    def __init__(self, in_channels=None, num_classes=None, patch_size=None, dim=128, depths=[3, 4, 5],
                  num_heads=[4, 8, 16], mlp_ratio=4., drop_path_rate=0.2,
                  window_size=None, r=None, lora_alpha=None,
                  hierarchical_head=True,
                  eval_fg_gate_threshold: float = -1.0):
         """
-        Standard, common ViT for hyperspectral image pixel-level segmentation.
-        in_channel num_classes and patch_size are necessary.
+        Common ViT for HSI pixel-level segmentation.
+        `in_channel`, `num_classes`, and `patch_size` are necessary.
         
         params:
             in_channels (int): 15 default.
             num_classes (int): 8 default.
-            dim (int): dim of feature maps, 96 default.
+            dim (int): dim of feature maps, 128 default.
             depths (list): num of transformer blocks, [3, 4, 5] default.
             num_heads (list): attention head for layers, [4, 8, 16] default.
             window_size (list): only for compatibility, ignored.
@@ -358,19 +353,21 @@ class CommonViT(nn.Module):
         self.mode = 'segmentation'  # pixel-level only
         self.hierarchical_head = True
         self.eval_fg_gate_threshold = float(eval_fg_gate_threshold)
+        self._decoder_skip = None
+        self._input_size_warning_emitted = False
         
-        print(f"StandardHSITransformer initialized with {in_channels} input channels, "
+        print(f"CommonViT initialized with {in_channels} input channels, "
               f"{num_classes} classes, depths {depths}, {patch_size} patch_size.")
         
-        # Preprocessing in true 2D HSI format: [B, spectral_channels, H, W].
-        # Input is PCA-projected to 8-15 bands; "spectral continuity" is lost.
-        # Use multi-branch PCA fusion instead of fake spectral priors.
+        # encoder parts
+        # x = [B, C, H, W]
+        
         stem_in = int(in_channels) if in_channels is not None else dim
-        self.input_spectral_prior = PCAMultiBranchFusion(
+        self.input_spectral_prior = MultiBranchFusion(
             in_channels=stem_in,
             base_channels=64
         )
-        # PCAMultiBranchFusion already outputs 96-dim features;
+        # MultiBranchFusion outputs 96-dim features;
         # minimal additional processing for consistency
         self.spectral_conv = nn.Sequential(
             nn.Conv2d(96, dim, kernel_size=3, padding=1, bias=False),
@@ -378,10 +375,10 @@ class CommonViT(nn.Module):
             nn.ReLU(inplace=True)
         )
         
+        # spectral dropout and attention
         self.band_dropout = BandDropout(drop_rate=0.1)
         self.spectral_attention = AdaptiveSqueezeExcitation(dim)
         self.spectral_pool = SpectralSpatialFusionPool(dim)
-        
         
         # patch & pos embedding
         self.patch_embed = nn.Sequential(
@@ -389,12 +386,15 @@ class CommonViT(nn.Module):
             nn.BatchNorm2d(dim),
             nn.ReLU(inplace=True)
         )
-        
-        self.patch_resolution = patch_size // 2
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_resolution,
-                                                   self.patch_resolution, dim))
         self.pos_drop = nn.Dropout(p=0.1)
-        
+
+        # decoder skip connection,
+        # to fuse with decoder features
+        self.decoder_skip_proj = nn.Sequential(
+            nn.Conv2d(dim, 128, kernel_size=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
         
         # transformer main blocks
         self.dims = [dim * (2 ** i) for i in range(len(depths))]
@@ -441,13 +441,16 @@ class CommonViT(nn.Module):
                     )
                 )
         
-        # Kept for CAM generation compatibility
+        # for CAM generation compatibility
         self.final_feature_map = None  # for CAM
         self.norm = nn.LayerNorm(self.dims[-1])
         self.avgpool = nn.AdaptiveAvgPool1d(1)
         self.head = nn.Linear(self.dims[-1], num_classes)
         
-        # Segmentation decoder: upsample from final feature map to input resolution
+        # decoder parts
+        # upsample from final feature map to input resolution
+        
+        # decoder for final feature map
         self.seg_decoder = nn.Sequential(
             nn.Conv2d(self.dims[-1], 256, kernel_size=1),
             nn.BatchNorm2d(256),
@@ -456,12 +459,24 @@ class CommonViT(nn.Module):
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
         )
+        
+        # final fusion concating skip connection and decoder output
+        # to produce segmentation feature map
+        self.seg_fusion = nn.Sequential(
+            nn.Conv2d(256, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        
+        # segmentation head
         self.seg_head = nn.Conv2d(128, num_classes, kernel_size=1)
         
+        # init weights
         self.apply(self._init_weights)
-        trunc_normal_(self.pos_embed, std=.02)
-        
-        print(f"StandardHSITransformer initialized successfully.")
+        print(f"CommonViT initialized successfully.")
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -505,13 +520,56 @@ class CommonViT(nn.Module):
         
         return cam
 
-    def _resize_pos_embed(self, h: int, w: int) -> torch.Tensor:
-        """Interpolate absolute position embedding to current token grid."""
-        if self.pos_embed.shape[1] == h and self.pos_embed.shape[2] == w:
-            return self.pos_embed
-        pos = self.pos_embed.permute(0, 3, 1, 2)  # [1, C, H0, W0]
-        pos = F.interpolate(pos, size=(h, w), mode='bicubic', align_corners=False)
-        return pos.permute(0, 2, 3, 1)
+    @staticmethod
+    def _sincos_pos_embedding(positions: torch.Tensor, dim: int) -> torch.Tensor:
+        """Build 1D sin/cos positional embedding for a coordinate vector."""
+        dim = max(int(dim), 2)
+        if dim % 2 == 1:
+            dim -= 1
+        half_dim = max(dim // 2, 1)
+
+        omega = torch.arange(half_dim, device=positions.device, dtype=positions.dtype)
+        omega = 1.0 / (10000 ** (omega / max(float(half_dim), 1.0)))
+        out = positions.reshape(-1, 1) * omega.reshape(1, -1)
+        emb = torch.cat([torch.sin(out), torch.cos(out)], dim=1)
+        if emb.shape[1] < dim:
+            pad = torch.zeros(emb.shape[0], dim - emb.shape[1], device=emb.device, dtype=emb.dtype)
+            emb = torch.cat([emb, pad], dim=1)
+        elif emb.shape[1] > dim:
+            emb = emb[:, :dim]
+        return emb
+
+    def _pos_embed(self, h: int, w: int) -> torch.Tensor:
+        """
+        Generate 2D sin/cos position embedding for the current token grid.
+        
+        Pipeline:
+        - Create normalized coord-grid for token centers.
+        - Apply separate 1D sin/cos embedding to x and y coords.
+        - Concatenate x and y embeddings into a pos-embedding.
+        """
+        if h <= 0 or w <= 0:
+            raise ValueError(f"Invalid token grid size: h={h}, w={w}")
+
+        device = self.norm.weight.device
+        dtype = self.norm.weight.dtype
+
+        y_pos = torch.linspace(-1.0, 1.0, steps=h, device=device, dtype=dtype)
+        x_pos = torch.linspace(-1.0, 1.0, steps=w, device=device, dtype=dtype)
+        grid_y, grid_x = torch.meshgrid(y_pos, x_pos, indexing='ij')
+
+        dim_y = int(self.dim // 2)
+        dim_x = int(self.dim - dim_y)
+        pos_y = self._sincos_pos_embedding(grid_y.reshape(-1), dim_y)
+        pos_x = self._sincos_pos_embedding(grid_x.reshape(-1), dim_x)
+        pos = torch.cat([pos_y, pos_x], dim=1)
+        if pos.shape[1] < self.dim:
+            pad = torch.zeros(pos.shape[0], self.dim - pos.shape[1], device=device, dtype=dtype)
+            pos = torch.cat([pos, pad], dim=1)
+        elif pos.shape[1] > self.dim:
+            pos = pos[:, :self.dim]
+
+        return pos.view(1, h, w, self.dim)
 
     def forward_features(self, x, detach_cam_feature: bool = False):
         """        
@@ -520,16 +578,18 @@ class CommonViT(nn.Module):
         if x.dim() != 4:
             raise ValueError(f"Expected 4D input [B, C, H, W], got {x.dim()}D tensor")
         
+        # encoders
         x = self.input_spectral_prior(x)
         x = self.spectral_conv(x)  # [B, dim, H, W]
         x = self.band_dropout(x)
         x = self.spectral_attention(x)
         x = self.spectral_pool(x)
+        self._decoder_skip = x
         
         x = self.patch_embed(x)  # [B, dim, H/2, W/2]
         x = x.permute(0, 2, 3, 1)  # [B, H/2, W/2, dim]
         
-        x = x + self._resize_pos_embed(x.shape[1], x.shape[2])
+        x = x + self._pos_embed(x.shape[1], x.shape[2])
         x = self.pos_drop(x)
         
         for level_idx, blocks in enumerate(self.transformer_levels):
@@ -586,28 +646,51 @@ class CommonViT(nn.Module):
         if C != self.in_channels:
             print(f"\nWARNING: Input has {C} channels, but model expects {self.in_channels}.\n"
                   "This usually caused by incorrect data shape, which requires [B, C, H, W]. \n")
+
+        token_count = max(1, (H // 2) * (W // 2))
+        if not self._input_size_warning_emitted and token_count > 1024:
+            print(
+                f"WARNING: input patch {H}x{W} produces {token_count} tokens after patch_embed; "
+                "global attention cost grows quadratically. For larger inputs, prefer <=64x64 patches "
+                "or a windowed/sparse attention variant."
+            )
+            self._input_size_warning_emitted = True
         
         x = self.forward_features(x, detach_cam_feature=bool(return_cam))  # [B, N, C_final]
 
-        # Reshape to spatial for gradient flow: [B, C_final, H_feat, W_feat]
+        # reshape to spatial for gradient flow: [B, C_final, H_feat, W_feat]
         H_feat, W_feat = self.final_feature_map.shape[2], self.final_feature_map.shape[3]
         # .contiguous() required to avoid CUDA misaligned address under AMP + DataParallel
         x = x.permute(0, 2, 1).contiguous().view(B, -1, H_feat, W_feat)
 
+        # decoders
+        
+        # upsample to input resolution
         x = self.seg_decoder(x)
         x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
+
+        # fuse with skip connection from encoder
+        skip = self._decoder_skip
+        if skip is None:
+            raise RuntimeError("decoder skip feature is missing; forward_features must run before decoding")
+        skip = self.decoder_skip_proj(skip)
+
+        # final fusion and segmentation head
+        x = self.seg_fusion(torch.cat([x, skip], dim=1))
         output = self.seg_head(x)
         
+        # only return CAM in classification
+        # when decoder + clsf_head works.
         if return_cam:
             cam = self.generate_cam()
             return output, cam
-        
         return output
 
 
 class CommonViT_reduced(CommonViT):
     """Reduced CommonViT: dim=64, depths=[2,3,3]."""
-    _defaults = dict(dim=64, depths=[2, 3, 3], num_heads=[4, 8, 16], mlp_ratio=4., drop_path_rate=0.2)
+    _defaults = dict(dim=128, depths=[2, 3, 3],
+                     num_heads=[4, 8, 16], mlp_ratio=4., drop_path_rate=0.2)
 
     def __init__(self, **kwargs):
         merged = {**self._defaults, **kwargs}
@@ -616,7 +699,8 @@ class CommonViT_reduced(CommonViT):
 
 class CommonViT_tiny(CommonViT):
     """Tiny CommonViT: dim=64, depths=[2,2,2]."""
-    _defaults = dict(dim=64, depths=[2, 2, 2], num_heads=[4, 8, 16], mlp_ratio=4., drop_path_rate=0.2)
+    _defaults = dict(dim=128, depths=[2, 2, 2],
+                     num_heads=[4, 8, 16], mlp_ratio=4., drop_path_rate=0.2)
 
     def __init__(self, **kwargs):
         merged = {**self._defaults, **kwargs}
@@ -625,7 +709,8 @@ class CommonViT_tiny(CommonViT):
 
 class CommonViT_mini(CommonViT):
     """Mini CommonViT: dim=48, depths=[1,1,2]."""
-    _defaults = dict(dim=48, depths=[1, 1, 2], num_heads=[2, 4, 8], mlp_ratio=4., drop_path_rate=0.2)
+    _defaults = dict(dim=128, depths=[1, 1, 2],
+                     num_heads=[4, 8, 16], mlp_ratio=4., drop_path_rate=0.2)
 
     def __init__(self, **kwargs):
         merged = {**self._defaults, **kwargs}
@@ -634,15 +719,17 @@ class CommonViT_mini(CommonViT):
 
 class CommonViT_2layer(CommonViT):
     """2-layer CommonViT: dim=32, depths=[1,1]."""
-    _defaults = dict(dim=32, depths=[1, 1], num_heads=[2, 4], mlp_ratio=4., drop_path_rate=0.2)
+    _defaults = dict(dim=128, depths=[1, 1],
+                     num_heads=[4, 8], mlp_ratio=4., drop_path_rate=0.2)
 
     def __init__(self, **kwargs):
         merged = {**self._defaults, **kwargs}
         super().__init__(**merged)
 
+
 if __name__ == "__main__":
     model = CommonViT(
-        in_channels=15, num_classes=8, dim=96, depths=[3, 4, 5],
+        in_channels=15, num_classes=8, dim=128, depths=[3, 4, 5],
         num_heads=[4, 8, 16], window_size=[7, 7, 7], mlp_ratio=4.,
         drop_path_rate=0.2, patch_size=15, r=16, lora_alpha=32
     )

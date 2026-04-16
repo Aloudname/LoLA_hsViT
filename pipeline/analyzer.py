@@ -2,6 +2,7 @@ import os, numpy as np, warnings
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from typing import Dict, List, Optional, Tuple
+from munch import Munch
 
 from pipeline.dataset import NpyHSDataset, tprint
 from typing import Dict, List, Optional, Tuple
@@ -334,7 +335,13 @@ class DatasetAnalyzer:
         trainval_idx, test_idx = next(
             sgkf.split(total_indices, self.dataset.patch_labels, self.dataset.patch_patient_groups)
         )
-        val_rate = self.dataset.config.split.val_rate
+        val_rate = float(
+            getattr(
+                getattr(getattr(self.dataset.config.split, 'ratio', Munch()), 'legacy', Munch()),
+                'val_rate',
+                getattr(self.dataset.config.split, 'val_rate', 0.1),
+            )
+        )
         gss = GroupShuffleSplit(n_splits=1, test_size=val_rate, random_state=350234)
         train_rel, val_rel = next(
             gss.split(

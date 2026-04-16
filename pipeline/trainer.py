@@ -36,6 +36,32 @@ from sklearn.metrics import (confusion_matrix as _cm, roc_curve,
 warnings.filterwarnings("ignore")
 
 
+def _nested_get(obj, path: str, default=None):
+    cur = obj
+    for part in path.split('.'):
+        if isinstance(cur, (dict, Munch)) and part in cur:
+            cur = cur[part]
+        else:
+            return default
+    return cur
+
+
+def _common_cfg(config: Munch, nested_path: str, legacy_key: str, default=None):
+    common = getattr(config, 'common', Munch())
+    val = _nested_get(common, nested_path, None)
+    if val is not None:
+        return val
+    return getattr(common, legacy_key, default)
+
+
+def _split_cfg(config: Munch, nested_path: str, legacy_key: str, default=None):
+    split = getattr(config, 'split', Munch())
+    val = _nested_get(split, nested_path, None)
+    if val is not None:
+        return val
+    return getattr(split, legacy_key, default)
+
+
 class FocalLoss(nn.Module):
     """Focal Loss for class-imbalanced classification.
 
@@ -640,7 +666,7 @@ class hsTrainer(BaseEstimator):
             self
         """
         if n_folds is None:
-            n_folds = self.config.common.cv_folds
+            n_folds = int(_common_cfg(self.config, 'cv.folds', 'cv_folds', 1))
         self.cv_results_ = hsTrainer.cross_validate(
             self.config, self.dataLoader,
             n_folds, self.epochs, self.model,
@@ -652,7 +678,7 @@ class hsTrainer(BaseEstimator):
     @staticmethod
     def _metric_labels_from_config(config: Munch, num_classes: int):
         """Return class indices used for metrics (optionally exclude class-0)."""
-        exclude_class0 = bool(getattr(config.common, 'exclude_class0_in_metrics', False))
+        exclude_class0 = bool(_common_cfg(config, 'eval.exclude_class0_in_metrics', 'exclude_class0_in_metrics', False))
         if exclude_class0 and num_classes > 1:
             labels = list(range(1, num_classes))
         else:
@@ -665,18 +691,18 @@ class hsTrainer(BaseEstimator):
     def _select_eval_batch_indices(self, total_batches: int, eval_cap: int) -> Optional[List[int]]:
         """Select validation batches when capped.
 
-        Default mode is deterministic (fixed stratified picks) to keep curves stable.
+        fixed stratified picks to keep curves stable.
         """
         if eval_cap <= 0 or total_batches <= eval_cap:
             return None
 
-        deterministic = bool(getattr(self.config.common, 'eval_cap_deterministic', True))
+        deterministic = bool(_common_cfg(self.config, 'eval.fixed_batch_cap', 'fixed_eval_cap', True))
         if deterministic:
             picked = np.linspace(0, total_batches - 1, num=eval_cap, dtype=np.int64)
             picked = sorted(set(int(x) for x in picked.tolist()))
             return picked if picked else None
 
-        base_seed = int(getattr(self.config.common, 'eval_sample_seed', 350234))
+        base_seed = int(_common_cfg(self.config, 'eval.sample_seed', 'eval_sample_seed', 350234))
         call_id = int(getattr(self, '_eval_call_counter', 0))
         self._eval_call_counter = call_id + 1
         rng = np.random.RandomState(base_seed + call_id)
@@ -949,7 +975,7 @@ class hsTrainer(BaseEstimator):
         try:
             # Optimize data loading for multi-GPU
             num_workers = self.config.memory.num_workers
-            batch_size = self.config.split.batch_size
+            batch_size = int(_split_cfg(self.config, 'batch.train_batch_size', 'batch_size', 64))
             prefetch_factor = 2
             persistent_workers = False
             
@@ -961,7 +987,7 @@ class hsTrainer(BaseEstimator):
                 num_workers = min(available_cpus // 2, 8, self.num_gpus * 2)
                 
                 # Increase batch size for multi-GPU to improve GPU utilization
-                batch_size = self.config.split.batch_size * self.num_gpus
+                batch_size = int(_split_cfg(self.config, 'batch.train_batch_size', 'batch_size', 64)) * self.num_gpus
                 
                 # prefetch_factor=2: preload 2 batches per worker.
                 # persistent_workers=True: avoid frequent worker del.
@@ -970,7 +996,7 @@ class hsTrainer(BaseEstimator):
                 
                 print(f"  [Multi-GPU Optimization] Scaling for {self.num_gpus} GPUs:")
                 print(f"    num_workers: {self.config.memory.num_workers} -> {num_workers}")
-                print(f"    batch_size: {self.config.split.batch_size} -> {batch_size} "
+                    print(f"    batch_size: {int(_split_cfg(self.config, 'batch.train_batch_size', 'batch_size', 64))} -> {batch_size} "
                       f"({batch_size // self.num_gpus} per GPU)")
                 print(f"    prefetch_factor: {prefetch_factor}, persistent_workers: {persistent_workers}")
 
@@ -1072,8 +1098,8 @@ class hsTrainer(BaseEstimator):
                ))
         
         # Optimizer with decoupled learning rates: backbone lower, heads higher.
-        lr = self.config.common.lr
-        weight_decay = self.config.common.weight_decay
+        lr = float(_common_cfg(self.config, 'optim.lr', 'lr', 1e-4))
+        weight_decay = float(_common_cfg(self.config, 'optim.weight_decay', 'weight_decay', 0.0))
         head_keys = ('seg_decoder', 'seg_head')
         backbone_params, head_params = [], []
         for name, p in self.model.named_parameters():
@@ -1100,11 +1126,11 @@ class hsTrainer(BaseEstimator):
         self.base_lrs = [pg['lr'] for pg in self.optimizer.param_groups]
 
         # Stable cosine decay without warm restarts.
-        sc = self.config.common.scheduler
+        sc = _common_cfg(self.config, 'optim.scheduler', 'scheduler', Munch())
         eta_min = getattr(sc, 'eta_min', 1e-6)
-        self.gradient_accumulation_steps = int(max(1, getattr(self.config.common, 'gradient_accumulation_steps', 1)))
+        self.gradient_accumulation_steps = int(max(1, _common_cfg(self.config, 'optim.gradient_accumulation_steps', 'gradient_accumulation_steps', 1)))
         full_train_batches = len(self.train_loader) if self.train_loader is not None else 1
-        sched_batches = max(1, min(full_train_batches, int(getattr(self.config.common, 'max_train_batches_per_epoch', 0) or full_train_batches)))
+        sched_batches = max(1, min(full_train_batches, int(_common_cfg(self.config, 'train.max_train_batches_per_epoch', 'max_train_batches_per_epoch', 0) or full_train_batches)))
         sched_updates_per_epoch = int(max(1, np.ceil(float(sched_batches) / float(self.gradient_accumulation_steps))))
         self.total_sched_steps = max(1, self.epochs * sched_updates_per_epoch)
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -1115,7 +1141,7 @@ class hsTrainer(BaseEstimator):
             print(f"\tGradient accumulation: {self.gradient_accumulation_steps} steps")
         
         # Class-weighted loss from dense pixel labels (ignore padding=255)
-        focal_gamma = self.config.common.focal_gamma
+        focal_gamma = float(_common_cfg(self.config, 'loss.focal_gamma', 'focal_gamma', 2.0))
         class_weights = None
         
         tprint(f"  Computing class weights with focal_gamma={focal_gamma}...")
@@ -1146,7 +1172,7 @@ class hsTrainer(BaseEstimator):
 
             if not used_cached_manifest:
                 class_counts = np.zeros(num_cls, dtype=np.float64)
-                rng = np.random.RandomState(int(getattr(self.config.common, 'class_weight_sample_seed', 350234)))
+                rng = np.random.RandomState(int(_common_cfg(self.config, 'class_weight.sample_seed', 'class_weight_sample_seed', 350234)))
 
                 train_indices = getattr(self.train_loader.dataset, 'indices', None)
                 if train_indices is None:
@@ -1157,8 +1183,8 @@ class hsTrainer(BaseEstimator):
                 if total_train_patches <= 0:
                     raise RuntimeError("empty train indices for class weighting")
 
-                max_sample_patches = int(getattr(self.config.common, 'class_weight_max_sample_patches', 20000))
-                max_sample_pixels = int(getattr(self.config.common, 'class_weight_max_sample_pixels', 2_000_000))
+                max_sample_patches = int(_common_cfg(self.config, 'class_weight.max_sample_patches', 'class_weight_max_sample_patches', 20000))
+                max_sample_pixels = int(_common_cfg(self.config, 'class_weight.max_sample_pixels', 'class_weight_max_sample_pixels', 2_000_000))
 
                 if max_sample_patches > 0 and total_train_patches > max_sample_patches:
                     sampled_pos = rng.choice(total_train_patches, size=max_sample_patches, replace=False)
@@ -1167,7 +1193,8 @@ class hsTrainer(BaseEstimator):
                     sampled_indices = train_indices
 
                 sampled_patch_count = int(sampled_indices.shape[0])
-                patch_area = int(self.config.split.patch_size) * int(self.config.split.patch_size)
+                patch_size = int(_split_cfg(self.config, 'patch.size', 'patch_size', 31))
+                patch_area = patch_size * patch_size
                 est_valid_pixels = sampled_patch_count * patch_area
                 pixel_keep_prob = 1.0
                 if max_sample_pixels > 0 and est_valid_pixels > max_sample_pixels:
@@ -1211,8 +1238,8 @@ class hsTrainer(BaseEstimator):
         except Exception as e:
             print(f"  Warning: uniform class weights ({e})")
 
-        self.early_stop_metric = str(getattr(self.config.common, 'early_stop_metric', 'composite')).lower()
-        self.save_topk = int(max(1, getattr(self.config.common, 'save_topk_models', 3)))
+        self.early_stop_metric = str(_common_cfg(self.config, 'eval.early_stop_metric', 'early_stop_metric', 'composite')).lower()
+        self.save_topk = int(max(1, _common_cfg(self.config, 'checkpoint.save_topk_models', 'save_topk_models', 3)))
         self.topk_models = []
 
         if self.config.clsf.num <= 1:
@@ -1222,43 +1249,43 @@ class hsTrainer(BaseEstimator):
             class_weight=class_weights,
             gamma=focal_gamma,
             ignore_index=255,
-            label_smoothing=getattr(self.config.common, 'label_smoothing', 0.0),
-            dice_weight=float(getattr(self.config.common, 'loss_dice_weight', 0.35)),
-            boundary_weight=float(getattr(self.config.common, 'loss_boundary_weight', 0.20)),
-            boundary_dilation=int(getattr(self.config.common, 'loss_boundary_dilation', 1)),
-            dice_absent_prior=float(getattr(self.config.common, 'loss_dice_absent_prior', 0.05)),
+            label_smoothing=float(_common_cfg(self.config, 'loss.label_smoothing', 'label_smoothing', 0.0)),
+            dice_weight=float(_common_cfg(self.config, 'loss.dice_weight', 'loss_dice_weight', 0.35)),
+            boundary_weight=float(_common_cfg(self.config, 'loss.boundary_weight', 'loss_boundary_weight', 0.20)),
+            boundary_dilation=int(_common_cfg(self.config, 'loss.boundary_dilation', 'loss_boundary_dilation', 1)),
+            dice_absent_prior=float(_common_cfg(self.config, 'loss.dice_absent_prior', 'loss_dice_absent_prior', 0.05)),
         )
         print(
             f"  SegmentationLoss(gamma={focal_gamma}, "
-            f"dice_w={getattr(self.config.common, 'loss_dice_weight', 0.35)}, "
-            f"boundary_w={getattr(self.config.common, 'loss_boundary_weight', 0.20)})"
+            f"dice_w={_common_cfg(self.config, 'loss.dice_weight', 'loss_dice_weight', 0.35)}, "
+            f"boundary_w={_common_cfg(self.config, 'loss.boundary_weight', 'loss_boundary_weight', 0.20)})"
         )
         
         # Mixed precision
-        use_amp = self.config.common.use_amp and self.device.type == 'cuda'
+        use_amp = bool(_common_cfg(self.config, 'train.use_amp', 'use_amp', True)) and self.device.type == 'cuda'
         self.scaler = GradScaler() if use_amp else None
         self.use_amp = use_amp
         
         # Hyperparameters
-        self.grad_clip = getattr(self.config.common, 'grad_clip', 1.0)
-        self.warmup_epochs = getattr(self.config.common, 'warmup_epochs', 5)
-        self.patience = getattr(self.config.common, 'patience', 20)
-        self.eval_interval = getattr(self.config.common, 'eval_interval', 1)
-        self.max_train_batches_per_epoch = int(getattr(self.config.common, 'max_train_batches_per_epoch', 0))
+        self.grad_clip = float(_common_cfg(self.config, 'optim.grad_clip', 'grad_clip', 1.0))
+        self.warmup_epochs = int(_common_cfg(self.config, 'optim.warmup_epochs', 'warmup_epochs', 5))
+        self.patience = int(_common_cfg(self.config, 'train.patience', 'patience', 20))
+        self.eval_interval = int(_common_cfg(self.config, 'train.eval_interval', 'eval_interval', 1))
+        self.max_train_batches_per_epoch = int(_common_cfg(self.config, 'train.max_train_batches_per_epoch', 'max_train_batches_per_epoch', 0))
         self.max_val_batches_per_epoch = int(
-            getattr(self.config.common, 'max_val_batches_per_epoch', 0)
+            _common_cfg(self.config, 'eval.max_val_batches_per_epoch', 'max_val_batches_per_epoch', 0)
         )
-        self.eval_use_batch_cap = bool(getattr(self.config.common, 'eval_use_batch_cap', False))
-        self.eval_boundary_band_dilation = int(max(0, getattr(self.config.common, 'eval_boundary_band_dilation', 2)))
+        self.eval_use_batch_cap = bool(_common_cfg(self.config, 'eval.use_batch_cap', 'eval_use_batch_cap', False))
+        self.eval_boundary_band_dilation = int(max(0, _common_cfg(self.config, 'eval.boundary_band_dilation', 'eval_boundary_band_dilation', 2)))
         if self.eval_use_batch_cap and self.max_val_batches_per_epoch <= 0 and self.max_train_batches_per_epoch > 0:
             # Keep validation affordable by default; can be overridden explicitly.
             self.max_val_batches_per_epoch = max(1, self.max_train_batches_per_epoch // 2)
 
         # EMA
-        ema_decay = getattr(self.config.common, 'ema_decay', 0.999)
+        ema_decay = float(_common_cfg(self.config, 'ema.decay', 'ema_decay', 0.999))
         self.ema = ModelEMA(self.model, decay=ema_decay)
-        self.ema_skip_warmup = bool(getattr(self.config.common, 'ema_skip_warmup', True))
-        self.ema_warmup_decay = float(getattr(self.config.common, 'ema_warmup_decay', min(0.95, ema_decay)))
+        self.ema_skip_warmup = bool(_common_cfg(self.config, 'ema.skip_warmup', 'ema_skip_warmup', True))
+        self.ema_warmup_decay = float(_common_cfg(self.config, 'ema.warmup_decay', 'ema_warmup_decay', min(0.95, ema_decay)))
         self.amp_skip_step_counter = 0
         self.nan_or_inf_skip_counter = 0
         
@@ -1271,7 +1298,7 @@ class hsTrainer(BaseEstimator):
         if self.max_val_batches_per_epoch > 0:
             print(f"  Val eval cap: {self.max_val_batches_per_epoch} batches/eval")
         if not self.eval_use_batch_cap:
-            print("  Val eval uses full validation set (deterministic metrics)")
+            print("  Val eval uses full validation set")
 
     def train_epoch(self, epoch: int) -> Tuple[float, float]:
         """
@@ -1481,13 +1508,13 @@ class hsTrainer(BaseEstimator):
             eval_iter_loader = self._build_capped_eval_loader(eval_loader, selected_eval_batches)
             effective_eval_batches = len(eval_iter_loader)
             tprint(
-                f"  Eval cap active: deterministic stratified {effective_eval_batches}/{total_eval_batches} batches"
+                f"  Eval cap active: stratified {effective_eval_batches}/{total_eval_batches} batches"
             )
 
         recon_state = self._init_reconstruction_state(eval_iter_loader) if need_reconstruction else None
         roc_per_batch = max(256, 2_000_000 // max(len(eval_iter_loader), 1)) if collect_extra else 0
         plot_per_batch = max(256, 1_000_000 // max(len(eval_iter_loader), 1)) if collect_extra else 0
-        max_vis_samples = self.config.common.vis_samples
+        max_vis_samples = int(_common_cfg(self.config, 'eval.vis_samples', 'vis_samples', 8))
 
         processed_eval_batches = 0
         with self._batch_stream_manager(eval_iter_loader) as batch_iter:
@@ -1956,14 +1983,14 @@ class hsTrainer(BaseEstimator):
         os.makedirs(cv_output, exist_ok=True)
 
         num_workers = config.memory.num_workers
-        batch_size = config.split.batch_size
+        batch_size = int(_split_cfg(config, 'batch.train_batch_size', 'batch_size', 64))
         prefetch_factor = 2
         persistent_workers = False
 
         if num_gpus > 1:
             available_cpus = os.cpu_count() or 4
             num_workers = min(available_cpus // 2, 8, num_gpus * 2)
-            batch_size = config.split.batch_size * num_gpus
+            batch_size = int(_split_cfg(config, 'batch.train_batch_size', 'batch_size', 64)) * num_gpus
             prefetch_factor = config.memory.prefetch_factor
             persistent_workers = True
 
@@ -3146,7 +3173,7 @@ class hsTrainer(BaseEstimator):
         # Save as ONNX
         onnx_path = os.path.join(self.output, 'models', f'{self.model_name}_best.onnx')
         input_channels = int(getattr(raw_model, 'in_channels', self.config.preprocess.pca_components))
-        input_patch = int(getattr(raw_model, 'patch_size', self.config.split.patch_size))
+        input_patch = int(getattr(raw_model, 'patch_size', _split_cfg(self.config, 'patch.size', 'patch_size', 31)))
         dummy_input = torch.randn(
             1, input_channels,
             input_patch,

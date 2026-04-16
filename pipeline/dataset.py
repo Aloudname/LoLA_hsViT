@@ -40,10 +40,25 @@ def _ensure_background_class(config: Munch) -> None:
     config.clsf.num = len(config.clsf.targets)
 
 
-def _split_cfg(config: Munch, key: str, default):
-    """Read split config with strict key usage."""
+def _split_cfg(config: Munch, key: str, default, legacy_key: Optional[str] = None):
+    """Read split config with nested-path support and legacy fallback."""
     split_cfg = getattr(config, 'split', Munch())
-    return getattr(split_cfg, key, default)
+    if '.' in key:
+        cur = split_cfg
+        for part in key.split('.'):
+            if isinstance(cur, (dict, Munch)) and part in cur:
+                cur = cur[part]
+            else:
+                cur = None
+                break
+        if cur is not None:
+            return cur
+    elif hasattr(split_cfg, key):
+        return getattr(split_cfg, key)
+
+    if legacy_key and hasattr(split_cfg, legacy_key):
+        return getattr(split_cfg, legacy_key)
+    return default
 
 
 def _preprocess_cfg(config: Munch, key: str, default):
@@ -257,11 +272,11 @@ class AbstractHSDataset(ABC, Dataset):
         self.label_path = config.path.label
         self.num = config.clsf.num
         self.targets = config.clsf.targets
-        self.patch_size = config.split.patch_size
-        self.margin = (config.split.patch_size - 1) // 2
+        self.patch_size = int(_split_cfg(config, 'patch.size', 31, legacy_key='patch_size'))
+        self.margin = (self.patch_size - 1) // 2
         self.transform = transform
         self.kwargs = kwargs
-        self.test_rate = config.split.test_rate
+        self.test_rate = float(_split_cfg(config, 'ratio.legacy.test_rate', 0.2, legacy_key='test_rate'))
 
         # Core data structures
         self.raw_data: np.ndarray = None
@@ -496,11 +511,11 @@ class NpyHSDataset(AbstractHSDataset):
         self.label_path = config.path.label
         self.num = config.clsf.num
         self.targets = config.clsf.targets
-        self.patch_size = config.split.patch_size
-        self.margin = (config.split.patch_size - 1) // 2
+        self.patch_size = int(_split_cfg(config, 'patch.size', 31, legacy_key='patch_size'))
+        self.margin = (self.patch_size - 1) // 2
         self.transform = transform
         self.kwargs = kwargs
-        self.test_rate = config.split.test_rate
+        self.test_rate = float(_split_cfg(config, 'ratio.legacy.test_rate', 0.2, legacy_key='test_rate'))
         
         # Debug-friendly controls
         self.limit_pairs = limit_pairs  # only load first N pairs when set
@@ -563,22 +578,22 @@ class NpyHSDataset(AbstractHSDataset):
         # Fallback: use basename without extension
         return os.path.splitext(basename)[0].lower()
 
-    def _augment_pixels_for_pca_fit(self,
+    def _augment_pixels(self,
                                     pixels: np.ndarray,
                                     rng: np.random.RandomState) -> np.ndarray:
-        """Apply light raw-space spectral augmentation before PCA fitting."""
+        """Apply space spectral augmentation on pixels."""
         if pixels.size == 0:
             return pixels
-        if not bool(_preprocess_cfg(self.config, 'pre_pca_augment_train', True)):
+        if not bool(_preprocess_cfg(self.config.augment, 'augment_train', True)):
             return pixels
 
         x = pixels.astype(np.float32, copy=True)
         n_bands = x.shape[1]
 
-        scale_prob = float(_preprocess_cfg(self.config, 'pre_pca_scale_prob', 0.6))
-        noise_prob = float(_preprocess_cfg(self.config, 'pre_pca_noise_prob', 0.5))
-        band_jitter_prob = float(_preprocess_cfg(self.config, 'pre_pca_band_jitter_prob', 0.35))
-        noise_std = float(_preprocess_cfg(self.config, 'pre_pca_noise_std', 0.01))
+        scale_prob = float(_preprocess_cfg(self.config.augment.spectral, 'scale_prob', 0.2))
+        noise_prob = float(_preprocess_cfg(self.config.augment.spectral, 'noise_prob', 0.2))
+        band_jitter_prob = float(_preprocess_cfg(self.config.augment.spectral, 'band_jitter_prob', 0.2))
+        noise_std = float(_preprocess_cfg(self.config.augment.spectral, 'noise_std', 0.01))
 
         if rng.rand() < scale_prob:
             gain = rng.uniform(0.92, 1.08, size=(1, n_bands)).astype(np.float32)
@@ -587,9 +602,9 @@ class NpyHSDataset(AbstractHSDataset):
         if rng.rand() < noise_prob and noise_std > 0:
             x += rng.normal(0.0, noise_std, size=x.shape).astype(np.float32)
 
-        # Apply smooth jitter to contiguous bands instead of zeroing PCA components.
+        # Apply smooth jitter to contiguous bands.
         if rng.rand() < band_jitter_prob and n_bands >= 4:
-            width = int(max(2, round(n_bands * float(_preprocess_cfg(self.config, 'pre_pca_band_jitter_width', 0.15)))))
+            width = int(max(2, round(n_bands * float(_preprocess_cfg(self.config.augment.spectral, 'band_jitter_width', 0.15)))))
             width = min(width, n_bands)
             start = int(rng.randint(0, n_bands - width + 1))
             scale = float(rng.uniform(0.85, 1.15))
@@ -597,22 +612,22 @@ class NpyHSDataset(AbstractHSDataset):
 
         return x
 
-    def _augment_sample_pre_pca(self,
+    def _augment_sample(self,
                                 data: np.ndarray,
                                 labels: np.ndarray,
                                 rng: np.random.RandomState) -> Tuple[np.ndarray, np.ndarray]:
-        """Apply merged train-time augmentation before PCA (spatial + spectral)."""
+        """Apply spatial + spectral augmentation."""
         if data.size == 0:
             return data, labels
-        if not bool(_preprocess_cfg(self.config, 'pre_pca_augment_train', True)):
+        if not bool(_preprocess_cfg(self.config.augment, 'augment_train', True)):
             return data, labels
 
         x = data.astype(np.float32, copy=True)
         y = labels.astype(np.int32, copy=True)
 
         # Spatial transforms are moved before PCA to keep label-data alignment.
-        spatial_prob = float(_preprocess_cfg(self.config, 'pre_pca_spatial_prob', 0.5))
-        rotate_prob = float(_preprocess_cfg(self.config, 'pre_pca_rotate_prob', 0.35))
+        spatial_prob = float(_preprocess_cfg(self.config.augment.spatial, 'spatial_prob', 0.5))
+        rotate_prob = float(_preprocess_cfg(self.config.augment.spatial, 'rotate_prob', 0.35))
         if rng.rand() < spatial_prob:
             if rng.rand() > 0.5:
                 x = np.flip(x, axis=1).copy()
@@ -625,12 +640,13 @@ class NpyHSDataset(AbstractHSDataset):
             x = np.rot90(x, k, axes=(0, 1)).copy()
             y = np.rot90(y, k, axes=(0, 1)).copy()
 
-        # Spectral transforms (same family as previous post-PCA augmentation).
+        # spectral transforms
         flat = x.reshape(-1, x.shape[2])
-        flat = self._augment_pixels_for_pca_fit(flat, rng)
+        flat = self._augment_pixels(flat, rng)
         x = flat.reshape(x.shape).astype(np.float32, copy=False)
 
-        band_drop_rate = float(_preprocess_cfg(self.config, 'pre_pca_band_drop_rate', 0.02))
+        # spectral band drop
+        band_drop_rate = float(_preprocess_cfg(self.config.augment.spectral, 'band_drop_rate', 0.02))
         if band_drop_rate > 0 and rng.rand() > 0.5:
             n_bands = x.shape[2]
             n_mod = max(1, int(n_bands * band_drop_rate))
@@ -638,9 +654,9 @@ class NpyHSDataset(AbstractHSDataset):
             scales = rng.uniform(0.7, 1.0, size=(1, 1, n_mod)).astype(np.float32)
             x[:, :, mod_idx] *= scales
 
-        # Cutout moved before PCA; keep labels unchanged to avoid class-hist distortion.
-        cutout_ratio = float(_preprocess_cfg(self.config, 'pre_pca_cutout_ratio', 0.08))
-        cutout_prob = float(_preprocess_cfg(self.config, 'pre_pca_cutout_prob', 0.15))
+        # spatial random cutout
+        cutout_ratio = float(_preprocess_cfg(self.config.augment.spatial, 'cutout_ratio', 0.08))
+        cutout_prob = float(_preprocess_cfg(self.config.augment.spatial, 'cutout_prob', 0.05))
         if cutout_ratio > 0 and rng.rand() < cutout_prob:
             h, w = x.shape[:2]
             ch = max(1, int(h * cutout_ratio))
@@ -803,9 +819,11 @@ class NpyHSDataset(AbstractHSDataset):
     def _build_label_remap(self) -> np.ndarray:
         """Build label remap table from config, defaulting to identity mapping.
 
-        Supported config forms under clsf.label_remap:
-        - list form: [0, 1, 2, 3] where index is raw label and value is mapped label
-        - dict form: {0: 0, 1: 1, 2: 2, 3: 3}
+                Supported config forms under clsf.label_remap:
+                - list form: [0, 1, 2, 3] where index is raw label and value is mapped label.
+                    If the list only covers foreground classes, e.g. [1, 2, 3], a BG=0
+                    slot is prepended automatically.
+                - dict form: {0: 0, 1: 1, 2: 2, 3: 3}
 
         If unset, defaults to identity for labels [0, clsf.num - 1].
         """
@@ -853,6 +871,8 @@ class NpyHSDataset(AbstractHSDataset):
                 raise ValueError("clsf.label_remap values must be non-negative")
 
             remap = remap.astype(np.int32, copy=False)
+            if remap.size == max(int(self.num) - 1, 0):
+                remap = np.concatenate([np.array([0], dtype=np.int32), remap])
 
         if np.max(remap) > self.num:
             raise ValueError(
@@ -907,7 +927,7 @@ class NpyHSDataset(AbstractHSDataset):
         if unknown_count > 0 and unknown_policy == 'map_to_bg':
             labels[unknown_mask] = 0
 
-        if max_raw >= len(remap) and not (unknown_count > 0 and unknown_policy == 'map_to_bg'):
+        if max_raw > len(remap) and not (unknown_count > 0 and unknown_policy == 'map_to_bg'):
             print(f"\t\tWARNING: {os.path.basename(label_file)} has max raw label {max_raw} "
                   f"over remap max {len(remap)-1}")
 
@@ -1081,7 +1101,7 @@ class NpyHSDataset(AbstractHSDataset):
             if not np.isfinite(data).all():
                 raise ValueError(f"non-finite values in {data_file}")
 
-            unknown_mask = labels_raw >= len(_label_remap)
+            unknown_mask = labels_raw > len(_label_remap)
             unknown_pixels_total += int(unknown_mask.sum())
             unknown_pixels_all += int(labels_raw.size)
             labels = self._apply_label_remap(labels_raw, _label_remap, label_file)
@@ -1194,15 +1214,15 @@ class NpyHSDataset(AbstractHSDataset):
         del all_real_pixels, patient_fit_pixels
         c = all_real.shape[1]
 
-        rng_pre_pca = np.random.RandomState(split_seed + 17)
-        all_real = self._augment_pixels_for_pca_fit(all_real, rng_pre_pca)
+        rng = np.random.RandomState(split_seed + 17)
+        all_real = self._augment_pixels(all_real, rng)
 
         n_components = self.config.preprocess.pca_components
         self.preprocessor = HSPreprocessor(
             pca_components=n_components,
             max_fit_samples=self.config.preprocess.max_fit_samples,
             max_pca_samples=self.config.preprocess.max_pca_samples,
-            random_state=self.config.split.split_seed,
+            random_state=int(_split_cfg(self.config, 'seed', 350234, legacy_key='split_seed')),
         )
         self.preprocessor.fit(all_real)
         del all_real
@@ -1233,7 +1253,7 @@ class NpyHSDataset(AbstractHSDataset):
 
             if int(pid_idx) in self._patient_split_plan['train']:
                 aug_rng = np.random.RandomState(split_seed + int(pid_idx) * 9973 + h * 31 + w)
-                data, labels = self._augment_sample_pre_pca(data, labels, aug_rng)
+                data, labels = self._augment_sample(data, labels, aug_rng)
 
             # apply fitted preprocessor (Z-score + PCA) via sklearn transform API
             processed = self.preprocessor.transform(data) # shape: (h_i, w_i, c_out)
@@ -1441,9 +1461,9 @@ class NpyHSDataset(AbstractHSDataset):
         total_indices = np.arange(len(self.patch_indices))
         all_classes = set(np.unique(self.patch_labels))
 
-        split_seed = int(self.config.split.split_seed)
-        test_rate = float(getattr(self.config.split, 'test_rate', 0.2))
-        val_rate = float(getattr(self.config.split, 'val_rate', 0.1))
+        split_seed = int(_split_cfg(self.config, 'seed', 350234, legacy_key='split_seed'))
+        test_rate = float(_split_cfg(self.config, 'ratio.legacy.test_rate', 0.2, legacy_key='test_rate'))
+        val_rate = float(_split_cfg(self.config, 'ratio.legacy.val_rate', 0.1, legacy_key='val_rate'))
 
         # Reuse split plan from preprocessor fitting when available to avoid mismatch.
         if hasattr(self, '_patient_split_plan') and isinstance(self._patient_split_plan, dict):
@@ -1534,19 +1554,18 @@ class NpyHSDataset(AbstractHSDataset):
             pct = (dist / dist.sum() * 100).round(1)
             print(f"  {name} label distribution: {dict(zip(self.config.clsf.targets, pct))}")
         
-        # create indexed subsets.
-        # post-PCA training augment is removed; train-time augmentation is merged pre-PCA.
+        # create indexed subsets for augmentation
         train_subset = _IndexedSubset(self, train_idx)
         val_subset = _IndexedSubset(self, val_idx)
         test_subset = _IndexedSubset(self, test_idx)
-        print("Training augmentation path: pre-PCA merged augmentation enabled (no post-PCA patch augment)")
+        print("Training augmentation enabled")
 
         if batch_size is None:
             batch_size = getattr(self.config.split, 'batch_size',
                          getattr(self, 'batch_size', 32))
         actual_pin_memory = pin_memory and torch.cuda.is_available()
 
-        # build tri-route pools on subset positions (not global indices).
+        # build tri-route pools on subset positions
         train_labels = self.patch_labels[train_idx]
         train_boundary = self.patch_pg_tg_boundary[train_idx] if self.patch_pg_tg_boundary is not None else np.zeros_like(train_labels, dtype=np.bool_)
         fg_positions = np.where(train_labels > 0)[0]
@@ -1807,7 +1826,7 @@ class NpyHSDataset(AbstractHSDataset):
         total_indices = np.arange(len(self.patch_indices))
         all_classes = set(np.unique(self.patch_labels))
 
-        split_seed = self.config.split.split_seed
+        split_seed = int(_split_cfg(self.config, 'seed', 350234, legacy_key='split_seed'))
         sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True,
                         random_state=split_seed)
 
@@ -2128,7 +2147,7 @@ class _SplitPreprocessManager:
             data = np.load(data_file).astype(np.float32)
             labels_raw = np.load(label_file).astype(np.int32)
             labels = self.dataset._apply_label_remap(labels_raw, label_remap, label_file)
-            data_fit, labels_fit = self.dataset._augment_sample_pre_pca(data, labels, rng_fit)
+            data_fit, labels_fit = self.dataset._augment_sample(data, labels, rng_fit)
             fit_pixels.append(self.dataset._collect_pixels_for_preprocessor(data_fit, labels_fit, rng_fit))
 
         if not fit_pixels:
@@ -2207,13 +2226,13 @@ class _SplitPreprocessManager:
                 unknown_count = int(unknown_mask.sum())
                 labels = self.dataset._apply_label_remap(labels_raw, label_remap, label_file)
 
-                if split_name == 'train' and bool(_preprocess_cfg(self.dataset.config, 'pre_pca_augment_train', True)):
+                if split_name == 'train' and bool(_preprocess_cfg(self.dataset.config.augment, 'augment_train', True)):
                     file_seed = int(hashlib.md5(data_file.encode('utf-8')).hexdigest()[:8], 16)
                     aug_rng = np.random.RandomState(
                         int(getattr(self.dataset.config.split, 'split_seed', 350234))
                         + int(file_seed % 100000)
                     )
-                    data, labels = self.dataset._augment_sample_pre_pca(data, labels, aug_rng)
+                    data, labels = self.dataset._augment_sample(data, labels, aug_rng)
                 processed = preprocessor.transform(data).astype(np.float32)
 
                 boundary_map = self.dataset._compute_multiclass_boundary_map(labels)
@@ -2775,11 +2794,11 @@ class RGBDataset(AbstractHSDataset):
         self.label_path = config.path.label
         self.num = config.clsf.num
         self.targets = config.clsf.targets
-        self.patch_size = config.split.patch_size
+        self.patch_size = int(_split_cfg(config, 'patch.size', 31, legacy_key='patch_size'))
         self.margin = (self.patch_size - 1) // 2
         self.transform = transform
         self.kwargs = kwargs
-        self.test_rate = config.split.test_rate
+        self.test_rate = float(_split_cfg(config, 'ratio.legacy.test_rate', 0.2, legacy_key='test_rate'))
 
         self.limit_pairs = limit_pairs
         self.max_patches_per_patient = max_patches_per_patient
@@ -2849,6 +2868,8 @@ class RGBDataset(AbstractHSDataset):
                 raise ValueError('clsf.label_remap cannot be empty')
             if np.any(remap < 0):
                 raise ValueError('clsf.label_remap values must be non-negative')
+            if remap.size == max(int(self.num) - 1, 0):
+                remap = np.concatenate([np.array([0], dtype=np.int32), remap])
 
         if np.max(remap) >= self.num:
             raise ValueError(f"clsf.label_remap contains mapped label >= clsf.num ({self.num})")
@@ -3243,7 +3264,7 @@ class MatHSDataset(AbstractHSDataset):
         
         self.data_key = config.key.data
         self.label_key = config.key.label
-        self.batch_size = config.split.batch_size
+        self.batch_size = int(_split_cfg(config, 'batch.train_batch_size', 64, legacy_key='batch_size'))
         self.pin_memory = config.memory.pin_memory
         self.pca_components = config.preprocess.pca_components
         super().__init__(config, transform, **kwargs)
