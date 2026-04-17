@@ -2,7 +2,6 @@
 augment:
   augment_train: true     # if enable aug on train.
   spatial:
-    
     spatial_prob: 0.5     # Comparison factor with random.
     rotate_prob: 0.35     # likewise.
     cutout_prob: 0.05     # likewise.
@@ -30,17 +29,17 @@ common:
       eta_min: 0.000005     # Lower floor LR
   loss:
     focal_gamma: 2.0        # Focal Loss focusing parameter (0 = CE, higher = more focus on hard samples)
-    dice_weight: 0.35       # Composite loss: soft Dice term weight
+    dice_weight: 0.20       # Composite loss: soft Dice term weight
     boundary_weight: 0.20   # Composite loss: boundary CE term weight
     boundary_dilation: 1    # Boundary mask dilation radius for boundary term
     label_smoothing: 0.1    # Label smoothing to prevent overconfident predictions
   train:
     use_amp: true           # Enable mixed precision (will auto-disable on CPU)
-    eval_interval: 1        # Evaluate every x epoch
+    eval_interval: 10        # Evaluate every x epoch
     patience: 25            # Slightly more patience to let slower LR explore
     max_train_batches_per_epoch: 1280  # 0 -> full batch in a epoch
   eval:
-    vis_samples: 8          # Number of samples to visualize in final eval
+    vis_samples: 4          # Number of samples to visualize in final eval
     early_stop_metric: eval  # evaluation-class-only
     exclude_class0_in_metrics: true  # Compute metrics/plots on foreground classes only
     use_batch_cap: true     # true -> sample a subset of eval_loader each epoch
@@ -68,21 +67,21 @@ split:
   ratio:
     # Split ratios for patient-level split-first pipeline.
     train: 0.8
-    val: 0.15
-    test: 0.05
+    val: 0.18
+    test: 0.02
     legacy:
-      # Legacy compatibility (analyzer/cv helper still reads these keys).
+      # For compatibility, analyzer/cv still reads these keys.
       test_rate: 0.1
       val_rate: 0.1
   cv:
     n_folds: 5  # Number of folds for cross-validation (0 = disabled, use hold-out)
   patch:
-    size: 47  # Pixel size of image patches.
+    size: 47  # 47, Pixel size of image patches.
   batch:
-    train_batch_size: 128  # This refers to the size on a single GPU.
-    eval_batch_size: 128   # Smaller eval batch size for CPU training
-    samples_per_step: 8  # Number of samples stacked per iteration; each sample contributes all its patches.
-    target_patches_per_step: 128  # Total patch target per optimization step (global across GPUs in cached mode).
+    train_batch_size: 128  # 1024, This refers to the size on a single GPU.
+    eval_batch_size: 128   # 1024, Smaller eval batch size for CPU training
+    samples_per_step: 8  # 8, Number of samples stacked per iteration; each sample contributes all its patches.
+    target_patches_per_step: 128  # 128, Total patch target per optimization step (global across GPUs in cached mode).
     max_patches_per_sample_chunk: 0  # 0 => auto derive from target_patches_per_step and memory budget.
   sampler:
     mode: hsi_adaptive  # fixed | adaptive | hsi_adaptive
@@ -108,7 +107,7 @@ split:
 
 preprocess:
   # Cache/split pipeline controls
-  enable_split_cache_pipeline: true
+  enable_split_cache_pipeline: true # true
   force_rebuild_split_cache: false
   split_preprocess_workers: 4
 

@@ -996,7 +996,7 @@ class hsTrainer(BaseEstimator):
                 
                 print(f"  [Multi-GPU Optimization] Scaling for {self.num_gpus} GPUs:")
                 print(f"    num_workers: {self.config.memory.num_workers} -> {num_workers}")
-                    print(f"    batch_size: {int(_split_cfg(self.config, 'batch.train_batch_size', 'batch_size', 64))} -> {batch_size} "
+                print(f"    batch_size: {int(_split_cfg(self.config, 'batch.train_batch_size', 'batch_size', 64))} -> {batch_size} "
                       f"({batch_size // self.num_gpus} per GPU)")
                 print(f"    prefetch_factor: {prefetch_factor}, persistent_workers: {persistent_workers}")
 

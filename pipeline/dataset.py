@@ -1625,6 +1625,11 @@ class NpyHSDataset(AbstractHSDataset):
             f"bg={cur_bg_ratio:.2f}, random={cur_rd_ratio:.2f}, "
             f"empirical_fg={empirical_fg_ratio:.2f} | mode={sampler_mode}"
         )
+        print(
+            f"Train sampler quotas/step(init): fg={train_batch_sampler.n_fg}, "
+            f"boundary={train_batch_sampler.n_boundary}, bg={train_batch_sampler.n_background}, "
+            f"random={train_batch_sampler.n_random}, batch_size={int(batch_size)}"
+        )
         
         train_loader = torch.utils.data.DataLoader(
             train_subset,
@@ -1795,6 +1800,11 @@ class NpyHSDataset(AbstractHSDataset):
             f"  cached train sampler mode={sampler_mode}, samples_per_step={samples_per_step}, "
             f"ratio_fg={ratio_fg:.2f}, ratio_boundary={ratio_boundary:.2f}, "
             f"ratio_bg={ratio_background:.2f}, ratio_random={ratio_random if ratio_random is not None else 'auto'}"
+        )
+        print(
+            f"  cached train sampler quotas/step(init): fg={train_batch_sampler.n_fg}, "
+            f"boundary={train_batch_sampler.n_boundary}, bg={train_batch_sampler.n_background}, "
+            f"random={train_batch_sampler.n_random}, samples_per_step={samples_per_step}"
         )
         print(
             f"  samples_per_step={samples_per_step}, patch_size={self.patch_size}, channels={self.feature_dim}, "
@@ -2533,6 +2543,29 @@ class _CachedSplitRatioBatchSampler(Sampler[List[int]]):
         self.n_boundary = int(quotas[1])
         self.n_background = int(quotas[2])
         self.n_random = int(quotas[3])
+
+        # Guard against ratio quantization collapse on tiny samples_per_step.
+        # Example: samples_per_step=2 with fg_ratio=0.10 can produce n_fg=0 after floor/round.
+        self._enforce_minimum_quota()
+
+    def _borrow_one_from_other_routes(self, candidates: List[str]) -> bool:
+        for name in candidates:
+            cur = int(getattr(self, name, 0))
+            if cur > 0:
+                setattr(self, name, cur - 1)
+                return True
+        return False
+
+    def _enforce_minimum_quota(self) -> None:
+        # Keep at least one FG sample when FG route is enabled and pool exists.
+        if self.samples_per_step >= 2 and self.fg_sample_ids.size > 0 and self._ratio_fg > 0.0 and self.n_fg <= 0:
+            if self._borrow_one_from_other_routes(['n_random', 'n_background', 'n_boundary']):
+                self.n_fg = 1
+
+        # Keep at least one boundary sample when boundary route is enabled and pool exists.
+        if self.samples_per_step >= 2 and self.boundary_sample_ids.size > 0 and self._ratio_boundary > 0.0 and self.n_boundary <= 0:
+            if self._borrow_one_from_other_routes(['n_random', 'n_background', 'n_fg']):
+                self.n_boundary = 1
 
     def _adapt_ratios(self) -> None:
         if self.sampler_mode not in {'adaptive', 'hsi_adaptive'}:
@@ -3537,6 +3570,28 @@ class _FixedRatioBatchSampler(Sampler[List[int]]):
         self.n_boundary = int(quotas[1])
         self.n_background = int(quotas[2])
         self.n_random = int(quotas[3])
+
+        # Guard against ratio quantization collapse on small batch sizes.
+        self._enforce_minimum_quota()
+
+    def _borrow_one_from_other_routes(self, candidates: List[str]) -> bool:
+        for name in candidates:
+            cur = int(getattr(self, name, 0))
+            if cur > 0:
+                setattr(self, name, cur - 1)
+                return True
+        return False
+
+    def _enforce_minimum_quota(self) -> None:
+        # Keep at least one FG sample when FG route is enabled and pool exists.
+        if self.batch_size >= 2 and self.fg_positions.size > 0 and self._ratio_fg > 0.0 and self.n_fg <= 0:
+            if self._borrow_one_from_other_routes(['n_random', 'n_background', 'n_boundary']):
+                self.n_fg = 1
+
+        # Keep at least one boundary sample when boundary route is enabled and pool exists.
+        if self.batch_size >= 2 and self.boundary_positions.size > 0 and self._ratio_boundary > 0.0 and self.n_boundary <= 0:
+            if self._borrow_one_from_other_routes(['n_random', 'n_background', 'n_fg']):
+                self.n_boundary = 1
 
     def _adapt_ratios(self) -> None:
         if self.sampler_mode not in {'adaptive', 'hsi_adaptive'}:

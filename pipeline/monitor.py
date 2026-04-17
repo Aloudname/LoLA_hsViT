@@ -429,7 +429,7 @@ class Monitor:
 
 def monitor():
     parser = argparse.ArgumentParser(description='GPU and memory monitor')
-    parser.add_argument('--interval', '-i', type=float, default=2.0, help='monitor interval (seconds)')
+    parser.add_argument('--interval', '-i', type=float, default=0.2, help='monitor interval (seconds)')
     parser.add_argument('--log', '-l', action='store_true', help='enable logging')
     parser.add_argument('--gpus', type=str, default='all', help='gpu ids to monitor, separated by commas')
     parser.add_argument('--no-gpu', action='store_true', help='disable gpu monitoring')
