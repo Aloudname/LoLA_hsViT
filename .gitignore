@@ -9,6 +9,7 @@ output/
 .vscode/
 
 # test file
+state.md
 test.ipynb
 augmentation_compare.ipynb
 
