@@ -473,6 +473,9 @@ class Trainer:
 
     def save_checkpoint(self, path: str, epoch: int, metric: float) -> None:
         """save checkpoint with model and optimizer state."""
+        ckpt_path = Path(path)
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
         payload = {
             "epoch": int(epoch),
             "metric": float(metric),
@@ -481,7 +484,7 @@ class Trainer:
         }
         if self.ema is not None:
             payload["ema_model"] = self.ema.ema_model.state_dict()
-        torch.save(payload, path)
+        torch.save(payload, str(ckpt_path))
 
     def load_checkpoint(self, path: str) -> None:
         """load checkpoint into model and ema."""

@@ -6,6 +6,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import Patch
 from sklearn.manifold import TSNE
 
 from pipeline.analyzer import MetricsBundle
@@ -138,11 +139,9 @@ class Visualizer:
         ax.set_title("foreground ROC curves")
         ax.grid(alpha=0.3)
 
-        has_legend = self._apply_external_legend(fig, ax, anchor=(1.02, 0.5), fontsize=9)
-        if has_legend:
-            fig.tight_layout(rect=(0.0, 0.0, 0.78, 1.0))
-        else:
-            fig.tight_layout()
+        # Keep ROC legend inside the plot at lower-right as requested.
+        ax.legend(loc="lower right", frameon=False, fontsize=9)
+        fig.tight_layout()
         self._save_fig(fig, "metrics/roc_auc.png")
 
     def plot_distribution(self, stats: Mapping[str, Any]) -> None:
@@ -262,6 +261,12 @@ class Visualizer:
         if n <= 0:
             return
 
+        cmap = plt.get_cmap("tab10", len(self.class_names))
+        legend_handles = [
+            Patch(facecolor=cmap(cls_idx), edgecolor="none", label=f"{cls_idx}: {name}")
+            for cls_idx, name in enumerate(self.class_names)
+        ]
+
         for i in range(n):
             img = np.asarray(images[i])
             pred = np.asarray(preds[i])
@@ -281,13 +286,23 @@ class Visualizer:
             fig, axes = plt.subplots(1, 3, figsize=(10, 3.5))
             axes[0].imshow(disp)
             axes[0].set_title("image")
-            axes[1].imshow(pred, vmin=0, vmax=len(self.class_names) - 1, cmap="tab10")
+            axes[1].imshow(pred, vmin=0, vmax=len(self.class_names) - 1, cmap=cmap)
             axes[1].set_title("prediction")
-            axes[2].imshow(gt, vmin=0, vmax=len(self.class_names) - 1, cmap="tab10")
+            axes[2].imshow(gt, vmin=0, vmax=len(self.class_names) - 1, cmap=cmap)
             axes[2].set_title("ground truth")
             for ax in axes:
                 ax.axis("off")
-            fig.tight_layout()
+
+            fig.legend(
+                handles=legend_handles,
+                loc="lower center",
+                ncol=min(4, len(legend_handles)),
+                frameon=False,
+                fontsize=8,
+                title="labels",
+                title_fontsize=8,
+            )
+            fig.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
             self._save_fig(fig, f"results/{prefix}_sample_{i+1}.png")
 
     def plot_attention_map(self, attention: Optional[np.ndarray]) -> None:

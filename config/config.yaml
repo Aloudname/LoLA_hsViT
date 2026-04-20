@@ -29,6 +29,11 @@ data:
     mode: "lda_pca" # used in pipeline.dataset.SpectralReducer; options: none, supervised_pca, lda_pca.
     output_dim: 32 # used in spectral reducer and hsi model input channels for method b.
     max_fit_pixels: 500000 # used in reducer fit sampling budget.
+  synthetic:
+    domain_shift_strength: 0.08 # medium difficulty: patient/sample spectral domain shift close to clinical acquisition variability.
+    noise_std: 0.02 # medium difficulty: moderate sensor and per-pixel noise.
+    boundary_mix_sigma: 0.90 # medium difficulty: tissue transition blur near boundaries.
+    label_noise_prob: 0.004 # medium difficulty: slight boundary label uncertainty.
 
 augment:
   enable_train_aug: true # used in pipeline.dataset.BasePatchDataset.__getitem__.

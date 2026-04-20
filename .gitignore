@@ -7,12 +7,12 @@ __pycache__/
 outputs/
 .github/
 .vscode/
-synthetic_data
+synthetic_data/
+pretrained/
+docs/
 
 # test file
-state.md
-test.ipynb
-augmentation_compare.ipynb
+
 
 # C extensions
 *.so

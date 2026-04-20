@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # dataset and preprocessing pipeline for hsi/rgb segmentation.
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -832,20 +833,36 @@ def generate_synthetic_dataset(
     image_size: int = 128,
     num_bands: int = 96,
     seed: int = 3407,
+    domain_shift_strength: float = 0.12,
+    noise_std: float = 0.03,
+    boundary_mix_sigma: float = 1.2,
+    label_noise_prob: float = 0.01,
 ) -> Dict[str, str]:
-    """generate synthetic hsi/rgb paired dataset for end-to-end validation."""
+    """generate synthetic hsi/rgb paired dataset for end-to-end validation.
+
+    Compared with the previous synthetic generator, this version intentionally
+    introduces stronger variability and domain shift so the task is no longer
+    trivially solved by memorizing class spectral templates.
+    """
     root = Path(root_dir)
     fisher_dir = root / "fisher"
     rgb_dir = root / "rgb"
+
+    # Ensure each generation run produces an isolated batch instead of accumulating stale samples.
+    if fisher_dir.exists():
+        shutil.rmtree(fisher_dir)
+    if rgb_dir.exists():
+        shutil.rmtree(rgb_dir)
+
     fisher_dir.mkdir(parents=True, exist_ok=True)
     rgb_dir.mkdir(parents=True, exist_ok=True)
 
     rng = np.random.default_rng(seed)
     directions = ["LU", "RU", "LD", "RD", "CF", "AX"]
 
-    # class-specific spectral templates.
+    # Class-specific spectral templates.
     grid = np.linspace(0.0, 1.0, num_bands, dtype=np.float32)
-    templates = np.stack(
+    base_templates = np.stack(
         [
             0.15 + 0.05 * np.sin(grid * 2.0 * np.pi),
             0.45 + 0.10 * np.cos(grid * 3.0 * np.pi + 0.2),
@@ -855,9 +872,122 @@ def generate_synthetic_dataset(
         axis=0,
     ).astype(np.float32)
 
+    # Slightly reduce deterministic separability at initialization.
+    base_templates += rng.normal(0.0, 0.01, size=base_templates.shape).astype(np.float32)
+
+    num_classes = 4
+
+    def _sample_variant_templates(patient_rng: np.random.Generator) -> np.ndarray:
+        """Sample per-class spectral templates with patient/sample-specific shifts."""
+        patient_bias = patient_rng.normal(
+            0.0,
+            domain_shift_strength * 0.25,
+            size=(num_bands,),
+        ).astype(np.float32)
+        patient_gain = float(np.clip(1.0 + patient_rng.normal(0.0, domain_shift_strength * 0.30), 0.75, 1.25))
+
+        var = np.zeros((num_classes, num_bands), dtype=np.float32)
+        for cls_idx in range(num_classes):
+            phase = float(patient_rng.uniform(0.0, 2.0 * np.pi))
+            freq = float(1.0 + 3.0 * patient_rng.random())
+            harmonic = 0.03 * np.sin(grid * freq * 2.0 * np.pi + phase)
+            band_scale = 1.0 + patient_rng.normal(0.0, 0.05, size=(num_bands,)).astype(np.float32)
+            band_bias = patient_rng.normal(0.0, 0.015, size=(num_bands,)).astype(np.float32)
+
+            tmpl = base_templates[cls_idx] * band_scale
+            tmpl = tmpl + harmonic.astype(np.float32)
+            tmpl = tmpl + band_bias + patient_bias
+            tmpl = tmpl * patient_gain
+            var[cls_idx] = np.clip(tmpl, 0.0, 1.0)
+
+        # Add mild class overlap by linear mixing.
+        mix = np.eye(num_classes, dtype=np.float32) * 0.84 + 0.16 / float(num_classes)
+        mix += patient_rng.normal(0.0, 0.025, size=(num_classes, num_classes)).astype(np.float32)
+        mix = np.clip(mix, 0.01, None)
+        mix = mix / np.maximum(mix.sum(axis=1, keepdims=True), 1e-6)
+        var = mix @ var
+        return np.clip(var, 0.0, 1.0)
+
+    def _soft_labels(mask_2d: np.ndarray, sigma: float) -> np.ndarray:
+        """Build soft class weights to simulate spectral mixing near boundaries."""
+        one_hot = np.stack([(mask_2d == c).astype(np.float32) for c in range(num_classes)], axis=0)
+        soft = np.empty_like(one_hot)
+        for c in range(num_classes):
+            soft[c] = cv2.GaussianBlur(one_hot[c], (0, 0), sigmaX=sigma, sigmaY=sigma)
+        soft_sum = np.maximum(soft.sum(axis=0, keepdims=True), 1e-6)
+        return soft / soft_sum
+
+    def _add_artifacts(cube: np.ndarray, sample_rng: np.random.Generator) -> np.ndarray:
+        """Add realistic illumination and sensor artifacts."""
+        _, h, w = cube.shape
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        yy /= max(1.0, float(h - 1))
+        xx /= max(1.0, float(w - 1))
+
+        grad_x = float(sample_rng.normal(0.0, 0.10))
+        grad_y = float(sample_rng.normal(0.0, 0.10))
+        wave_amp = float(sample_rng.uniform(0.03, 0.10))
+        wave_fx = float(sample_rng.uniform(0.4, 1.6))
+        wave_fy = float(sample_rng.uniform(0.4, 1.6))
+        wave_phase = float(sample_rng.uniform(0.0, 2.0 * np.pi))
+
+        illum = 1.0 + grad_x * (xx - 0.5) + grad_y * (yy - 0.5)
+        illum += wave_amp * np.sin(2.0 * np.pi * (wave_fx * xx + wave_fy * yy) + wave_phase)
+        cube = cube * illum[None, :, :]
+
+        # Correlated band noise + per-pixel noise.
+        band_noise = sample_rng.normal(0.0, noise_std, size=(cube.shape[0], 1, 1)).astype(np.float32)
+        pixel_noise = sample_rng.normal(0.0, noise_std * 0.40, size=cube.shape).astype(np.float32)
+        cube = cube + band_noise + pixel_noise
+
+        # Random bright spots (specular-like artifacts).
+        n_spots = int(sample_rng.integers(0, 3))
+        for _ in range(n_spots):
+            cx = float(sample_rng.uniform(0.0, w - 1))
+            cy = float(sample_rng.uniform(0.0, h - 1))
+            rad = float(sample_rng.uniform(max(2.0, image_size * 0.04), max(3.0, image_size * 0.12)))
+            dist2 = (xx - cx) ** 2 + (yy - cy) ** 2
+            spot = np.exp(-dist2 / max(1e-6, 2.0 * (rad ** 2))).astype(np.float32)
+            spec_gain = sample_rng.uniform(0.01, 0.08, size=(cube.shape[0], 1, 1)).astype(np.float32)
+            cube = cube + spec_gain * spot[None, :, :]
+
+        # Column stripe artifact.
+        if sample_rng.random() < 0.35:
+            col = int(sample_rng.integers(0, w))
+            half_width = int(sample_rng.integers(1, 4))
+            lo = max(0, col - half_width)
+            hi = min(w, col + half_width + 1)
+            stripe = sample_rng.normal(0.0, noise_std * 1.2, size=(cube.shape[0], 1, 1)).astype(np.float32)
+            cube[:, :, lo:hi] += stripe
+
+        return np.clip(cube, 0.0, 1.0)
+
+    def _inject_boundary_label_noise(mask_2d: np.ndarray, sample_rng: np.random.Generator) -> np.ndarray:
+        """Apply tiny boundary-only label flips to avoid unrealistically clean labels."""
+        if label_noise_prob <= 0.0:
+            return mask_2d
+
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        boundary = cv2.morphologyEx(mask_2d.astype(np.uint8), cv2.MORPH_GRADIENT, kernel) > 0
+        random_flip = sample_rng.random(size=mask_2d.shape) < float(label_noise_prob)
+        flip_mask = boundary & random_flip
+        if not np.any(flip_mask):
+            return mask_2d
+
+        out = mask_2d.copy()
+        old = out[flip_mask]
+        rnd = sample_rng.integers(0, num_classes, size=old.shape[0], dtype=np.int64)
+        rnd = (rnd + (rnd == old).astype(np.int64)) % num_classes
+        out[flip_mask] = rnd.astype(out.dtype)
+        return out
+
     for s_idx in range(num_subjects):
         patient_name = f"P{s_idx:03d}"
+        patient_seed = int(seed + s_idx * 100003)
+        patient_rng = np.random.default_rng(patient_seed)
         for k in range(samples_per_subject):
+            sample_rng = np.random.default_rng(patient_seed + k * 1009)
+
             date = f"20260{1 + (s_idx % 6):02d}{1 + (k % 28):02d}"
             direction = directions[(s_idx + k) % len(directions)]
             sample_id = f"{patient_name}_{date}_{direction}"
@@ -866,45 +996,76 @@ def generate_synthetic_dataset(
             mask = np.zeros((h, w), dtype=np.uint8)
 
             # thyroid region (class 3).
-            center = (int(w * (0.35 + 0.25 * rng.random())), int(h * (0.40 + 0.20 * rng.random())))
-            axes = (int(w * (0.22 + 0.08 * rng.random())), int(h * (0.18 + 0.07 * rng.random())))
+            center = (
+                int(w * (0.35 + 0.25 * sample_rng.random())),
+                int(h * (0.40 + 0.20 * sample_rng.random())),
+            )
+            axes = (
+                int(w * (0.22 + 0.08 * sample_rng.random())),
+                int(h * (0.18 + 0.07 * sample_rng.random())),
+            )
             cv2.ellipse(mask, center, axes, 0.0, 0.0, 360.0, color=3, thickness=-1)
 
             # trachea region (class 2).
-            x0 = int(w * (0.58 + 0.12 * rng.random()))
-            y0 = int(h * (0.30 + 0.18 * rng.random()))
+            x0 = int(w * (0.58 + 0.12 * sample_rng.random()))
+            y0 = int(h * (0.30 + 0.18 * sample_rng.random()))
             x1 = min(w - 1, x0 + int(w * 0.12))
             y1 = min(h - 1, y0 + int(h * 0.26))
             cv2.rectangle(mask, (x0, y0), (x1, y1), color=2, thickness=-1)
 
             # parathyroid small targets (class 1).
-            n_small = int(rng.integers(1, 3))
+            n_small = int(sample_rng.integers(1, 4))
             for _ in range(n_small):
-                cx = int(w * (0.40 + 0.25 * rng.random()))
-                cy = int(h * (0.42 + 0.16 * rng.random()))
-                rad = int(max(2, image_size * (0.015 + 0.01 * rng.random())))
+                cx = int(w * (0.40 + 0.25 * sample_rng.random()))
+                cy = int(h * (0.42 + 0.16 * sample_rng.random()))
+                rad = int(max(2, image_size * (0.012 + 0.014 * sample_rng.random())))
                 cv2.circle(mask, (cx, cy), radius=rad, color=1, thickness=-1)
 
-            cube = np.zeros((num_bands, h, w), dtype=np.float32)
-            noise = rng.normal(0.0, 0.02, size=(num_bands, h, w)).astype(np.float32)
-            for cls_idx in range(4):
-                cls_mask = mask == cls_idx
-                if np.any(cls_mask):
-                    cube[:, cls_mask] = templates[cls_idx][:, None]
-            cube += noise
-            cube = np.clip(cube, 0.0, 1.0)
+            mask = _inject_boundary_label_noise(mask, sample_rng).astype(np.uint8)
+
+            # Class mixing near boundaries makes decision regions less trivial.
+            sigma = float(boundary_mix_sigma * sample_rng.uniform(0.5, 1.4))
+            soft = _soft_labels(mask, sigma=max(0.1, sigma))
+
+            sample_templates = _sample_variant_templates(patient_rng)
+            cube = (sample_templates.T @ soft.reshape(num_classes, -1)).reshape(num_bands, h, w)
+            cube = _add_artifacts(cube.astype(np.float32), sample_rng)
 
             hsi_path = fisher_dir / f"{sample_id}.npy"
             gt_path = fisher_dir / f"{sample_id}_gt.npy"
             np.save(hsi_path, cube.astype(np.float32))
             np.save(gt_path, mask.astype(np.int64))
 
-            # create rgb from selected bands.
-            rgb = np.stack([cube[12], cube[42], cube[78]], axis=-1)
-            rgb = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+            # Create RGB by random band mixing + gamma shift to mimic camera style variance.
+            rgb_w = sample_rng.uniform(0.0, 1.0, size=(3, num_bands)).astype(np.float32)
+            rgb_w = rgb_w / np.maximum(rgb_w.sum(axis=1, keepdims=True), 1e-6)
+            rgb = (rgb_w @ cube.reshape(num_bands, -1)).reshape(3, h, w).transpose(1, 2, 0)
+            gamma = float(sample_rng.uniform(0.8, 1.25))
+            rgb = np.clip(rgb, 0.0, 1.0) ** gamma
+            rgb = np.clip(rgb * 255.0, 0.0, 255.0).astype(np.uint8)
             cv2.imwrite(str(rgb_dir / f"{sample_id}_Merged_rgb.png"), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
 
-    tprint(f"synthetic dataset generated at: {root}")
+    manifest = {
+        "generator": "synthetic_hard_v2",
+        "seed": int(seed),
+        "num_subjects": int(num_subjects),
+        "samples_per_subject": int(samples_per_subject),
+        "image_size": int(image_size),
+        "num_bands": int(num_bands),
+        "domain_shift_strength": float(domain_shift_strength),
+        "noise_std": float(noise_std),
+        "boundary_mix_sigma": float(boundary_mix_sigma),
+        "label_noise_prob": float(label_noise_prob),
+    }
+    with (root / "synthetic_manifest.json").open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+    tprint(
+        "synthetic dataset generated at: "
+        f"{root} (generator=synthetic_hard_v2, domain_shift_strength={domain_shift_strength}, "
+        f"noise_std={noise_std}, boundary_mix_sigma={boundary_mix_sigma}, "
+        f"label_noise_prob={label_noise_prob})"
+    )
     return {
         "hsi_dir": str(fisher_dir),
         "label_dir": str(fisher_dir),

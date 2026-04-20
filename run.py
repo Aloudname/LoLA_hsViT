@@ -160,11 +160,19 @@ def main() -> None:
         tprint(f"output root: {output_root}")
 
         if args.generate_synthetic:
+            synth_cfg = getattr(config.data, "synthetic", None)
+            domain_shift_strength = float(getattr(synth_cfg, "domain_shift_strength", 0.12))
+            noise_std = float(getattr(synth_cfg, "noise_std", 0.03))
+            boundary_mix_sigma = float(getattr(synth_cfg, "boundary_mix_sigma", 1.2))
+            label_noise_prob = float(getattr(synth_cfg, "label_noise_prob", 0.01))
+
             tprint(
                 "generate synthetic dataset: "
                 f"root={args.synthetic_root} subjects={int(args.synthetic_subjects)} "
                 f"samples_per_subject={int(args.synthetic_samples_per_subject)} "
-                f"image_size={int(args.synthetic_image_size)}"
+                f"image_size={int(args.synthetic_image_size)} "
+                f"domain_shift_strength={domain_shift_strength} noise_std={noise_std} "
+                f"boundary_mix_sigma={boundary_mix_sigma} label_noise_prob={label_noise_prob}"
             )
             synth_paths = generate_synthetic_dataset(
                 root_dir=args.synthetic_root,
@@ -173,6 +181,10 @@ def main() -> None:
                 image_size=int(args.synthetic_image_size),
                 num_bands=int(config.data.hsi_bands),
                 seed=int(config.runtime.seed),
+                domain_shift_strength=domain_shift_strength,
+                noise_std=noise_std,
+                boundary_mix_sigma=boundary_mix_sigma,
+                label_noise_prob=label_noise_prob,
             )
             config.path.hsi_dir = synth_paths["hsi_dir"]
             config.path.label_dir = synth_paths["label_dir"]
