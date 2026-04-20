@@ -3,8 +3,7 @@ from pipeline.core import Pipeline, PipelineResult
 from pipeline.dataset import (RGBDataset, NpyHSIDataset,
                               generate_synthetic_dataset,
                               build_dataloaders, prepare_data)
-from pipeline.monitor import (Monitor, _managed_pool,
-                              monitor, tprint)
+from pipeline.monitor import (monitor, tprint)
 from pipeline.trainer import Trainer, TrainerResult
 from pipeline.visualize import Visualizer
 
