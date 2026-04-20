@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 # 2d unet baseline for segmentation comparison.
 from typing import Any, Mapping
-from __future__ import annotations
 
 import torch
 import torch.nn as nn
@@ -71,18 +72,15 @@ class UNet(nn.Module):
         b = self.bottleneck(self.pool(e3))
 
         d3 = self.up3(b)
-        if d3.shape[-2:] != e3.shape[-2:]:
-            d3 = F.interpolate(d3, size=e3.shape[-2:], mode="bilinear", align_corners=False)
+        d3 = F.interpolate(d3, size=e3.shape[-2:], mode="bilinear", align_corners=False)
         d3 = self.dec3(torch.cat([d3, e3], dim=1))
 
         d2 = self.up2(d3)
-        if d2.shape[-2:] != e2.shape[-2:]:
-            d2 = F.interpolate(d2, size=e2.shape[-2:], mode="bilinear", align_corners=False)
+        d2 = F.interpolate(d2, size=e2.shape[-2:], mode="bilinear", align_corners=False)
         d2 = self.dec2(torch.cat([d2, e2], dim=1))
 
         d1 = self.up1(d2)
-        if d1.shape[-2:] != e1.shape[-2:]:
-            d1 = F.interpolate(d1, size=e1.shape[-2:], mode="bilinear", align_corners=False)
+        d1 = F.interpolate(d1, size=e1.shape[-2:], mode="bilinear", align_corners=False)
         d1 = self.dec1(torch.cat([d1, e1], dim=1))
         return d1
 

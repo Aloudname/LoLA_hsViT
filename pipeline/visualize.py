@@ -1,12 +1,14 @@
+from __future__ import annotations
+
 # visualization methods for experiment analysis and paper figures.
 from pathlib import Path
-import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
-from __future__ import annotations
-from pipeline.analyzer import MetricsBundle
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
+from sklearn.manifold import TSNE
+
+from pipeline.analyzer import MetricsBundle
 
 
 class Visualizer:
@@ -89,9 +91,9 @@ class Visualizer:
                 for j in range(mat.shape[1]):
                     ax.text(j, i, fmt.format(mat[i, j]), ha="center", va="center", fontsize=8)
 
-                fig.colorbar(im0, ax=axes[0], shrink=0.8)
-                fig.colorbar(im1, ax=axes[1], shrink=0.8)
-                fig.tight_layout()
+        fig.colorbar(im0, ax=axes[0], shrink=0.8)
+        fig.colorbar(im1, ax=axes[1], shrink=0.8)
+        fig.tight_layout()
         self._save_fig(fig, "metrics/confusion_matrix.png")
 
     def plot_roc(self, bundle: MetricsBundle) -> None:
@@ -144,24 +146,59 @@ class Visualizer:
         self._save_fig(fig, "metrics/roc_auc.png")
 
     def plot_distribution(self, stats: Mapping[str, Any]) -> None:
-        """plot split distribution before/after patch filtering and tracking."""
+        """plot class distribution summary as grouped bars for train/eval/test."""
         class_names = list(stats.get("class_names", self.class_names))
         split_stats = stats.get("split", {})
+        splits = [name for name in ["train", "eval", "test"] if name in split_stats]
+        if not splits:
+            return
 
-        for split_name in ["train", "eval", "test"]:
-            if split_name not in split_stats:
-                continue
+        split_ratio_rows: List[np.ndarray] = []
+        for split_name in splits:
             cur = split_stats[split_name]
-            raw = np.asarray(cur.get("raw_pixel_hist", []), dtype=np.float64)
-            kept = np.asarray(cur.get("kept_patch_pixel_hist", []), dtype=np.float64)
-            pre = np.asarray(cur.get("tracked_pre_hist", []), dtype=np.float64)
-            post = np.asarray(cur.get("tracked_post_hist", []), dtype=np.float64)
+            # Prefer kept-patch distribution for final split composition;
+            # fallback to raw histogram if kept stats are absent.
+            hist = np.asarray(cur.get("kept_patch_pixel_hist", cur.get("raw_pixel_hist", [])), dtype=np.float64)
+            if hist.size == 0:
+                hist = np.zeros(len(class_names), dtype=np.float64)
+            if hist.size < len(class_names):
+                hist = np.pad(hist, (0, len(class_names) - hist.size), mode="constant")
+            elif hist.size > len(class_names):
+                hist = hist[: len(class_names)]
 
-            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-            self._plot_hist_compare(axes[0], class_names, raw, kept, title=f"{split_name}: raw vs kept")
-            self._plot_hist_compare(axes[1], class_names, pre, post, title=f"{split_name}: tracked pre vs post")
-            fig.subplots_adjust(bottom=0.25, wspace=0.3)
-            self._save_fig(fig, f"data/{split_name}_distribution_compare.png")
+            split_ratio_rows.append(hist / np.maximum(hist.sum(), 1.0))
+
+        ratio_table = np.stack(split_ratio_rows, axis=0)
+        x = np.arange(len(class_names), dtype=np.float64)
+        width = 0.78 / max(1, len(splits))
+
+        fig, ax = plt.subplots(figsize=(11, 4.8))
+        color_map = {
+            "train": "#4e79a7",
+            "eval": "#f28e2b",
+            "test": "#59a14f",
+        }
+
+        for idx, split_name in enumerate(splits):
+            offset = (idx - (len(splits) - 1) / 2.0) * width
+            ax.bar(
+                x + offset,
+                ratio_table[idx],
+                width=width,
+                label=split_name,
+                color=color_map.get(split_name, "#999999"),
+            )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(class_names, rotation=0)
+        ax.set_ylabel("ratio")
+        ax.set_xlabel("class")
+        ax.set_ylim(0.0, min(1.0, max(0.05, float(ratio_table.max()) * 1.15)))
+        ax.set_title("class distribution across train/eval/test")
+        ax.grid(axis="y", alpha=0.3)
+        ax.legend(loc="upper right", frameon=False)
+        fig.tight_layout()
+        self._save_fig(fig, "data/all_splits_distribution_compare.png")
 
     def plot_spectral(self, spectra_by_class: Mapping[str, Tuple[np.ndarray, np.ndarray]]) -> None:
         """plot class spectral curves (mean +- std)."""
@@ -290,7 +327,7 @@ class Visualizer:
         ax.set_ylabel("ratio")
         ax.set_title(title)
         ax.grid(axis="y", alpha=0.3)
-        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=2, frameon=False)
+        ax.legend(loc="upper right", frameon=False, fontsize=8)
 
     def _apply_external_legend(
         self,

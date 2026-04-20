@@ -1,12 +1,14 @@
-# config loader utilities for yaml-based experiments.
-import yaml, argparse
+from __future__ import annotations
 
-from munch import Munch
-from pathlib import Path
+# config loader utilities for yaml-based experiments.
+import argparse
 from copy import deepcopy
 from datetime import datetime
-from __future__ import annotations
+from pathlib import Path
 from typing import Any, Mapping, MutableMapping
+
+import yaml
+from munch import Munch
 
 
 def tprint(*args, **kwargs) -> None:

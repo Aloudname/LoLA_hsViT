@@ -1,10 +1,11 @@
+from __future__ import annotations
+
 # metric analyzer for multi-class segmentation.
 from dataclasses import dataclass
-from __future__ import annotations
-from sklearn.metrics import roc_auc_score, roc_curve
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+from sklearn.metrics import roc_auc_score, roc_curve
 
 
 @dataclass

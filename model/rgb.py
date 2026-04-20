@@ -1,10 +1,13 @@
+from __future__ import annotations
+
 # rgb vit baseline model for comparison experiments.
 from typing import Any, Mapping
-from __future__ import annotations
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from model.backbones.builder import build_backbone
 
 
 class RGBViT(nn.Module):
@@ -49,18 +52,19 @@ class RGBViT(nn.Module):
             nn.GELU(),
         )
 
-        ff_dim = int(embed_dim * mlp_ratio)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=ff_dim,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True,
-            activation="gelu",
-        )
-        self.backbone = nn.TransformerEncoder(encoder_layer, num_layers=depth)
-        self.backbone_norm = nn.LayerNorm(embed_dim)
+        backbone_cfg = {
+            "embed_dim": embed_dim,
+            "depth": depth,
+            "num_heads": num_heads,
+            "mlp_ratio": mlp_ratio,
+            "dropout": dropout,
+            "freeze_backbone": freeze_backbone,
+            "use_pretrained": bool(config.get("use_pretrained", config.get("pretrained_backbone", False))),
+            "backbone_name": str(config.get("backbone_name", "vit_small_patch16_224")),
+            "pretrained_weights": bool(config.get("pretrained_weights", config.get("backbone_pretrained", True))),
+            "pretrained_cache_dir": str(config.get("pretrained_cache_dir", "")),
+        }
+        self.backbone = build_backbone(backbone_cfg)
 
         self.decoder = nn.Sequential(
             nn.Conv2d(embed_dim, decoder_dim, kernel_size=3, padding=1, bias=False),
@@ -73,9 +77,7 @@ class RGBViT(nn.Module):
         )
         self.seg_head = nn.Conv2d(decoder_dim, num_classes, kernel_size=1)
 
-        if freeze_backbone:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
+        # backbone freezing/unfreezing is handled by the backbone builder and trainer.
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         """extract low-resolution token feature map.
@@ -89,7 +91,7 @@ class RGBViT(nn.Module):
         x = self.patch_embed(x)
         b, c, h, w = x.shape
         tokens = x.flatten(2).transpose(1, 2)
-        tokens = self.backbone_norm(self.backbone(tokens))
+        tokens = self.backbone(tokens)
         return tokens.transpose(1, 2).reshape(b, c, h, w)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -1,15 +1,48 @@
-# trainer for segmentation models with dice/focal/tversky losses.
-import os, copy, torch, numpy as np, torch.nn as nn, torch.nn.functional as F
-
-from munch import Munch
-from pathlib import Path
-from dataclasses import dataclass
 from __future__ import annotations
-from pipeline.monitor import tprint
+
+# trainer for segmentation models with dice/focal/tversky losses.
+import copy
+import os
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from munch import Munch
+from tqdm.auto import tqdm
+
+from pipeline.monitor import tprint
 
 
 os.environ.setdefault("TORCH_DISABLE_DYNAMO", "1")
+
+
+def set_trainable_layers(model: nn.Module, config: Mapping[str, Any]) -> None:
+    """Optionally unfreeze last N backbone blocks from trainer side."""
+    cfg = Munch.fromDict(dict(config))
+    n = int(getattr(cfg.model, "unfreeze_last_n", 0))
+    if n <= 0:
+        return
+
+    backbone = getattr(model, "backbone", None)
+    if backbone is None or not hasattr(backbone, "blocks"):
+        return
+
+    blocks = list(backbone.blocks)
+    if not blocks:
+        return
+
+    n = min(n, len(blocks))
+    for blk in blocks[-n:]:
+        for p in blk.parameters():
+            p.requires_grad_(True)
+
+    if hasattr(backbone, "norm"):
+        for p in backbone.norm.parameters():
+            p.requires_grad_(True)
 
 class CompositeSegLoss(nn.Module):
     """composite segmentation loss = dice + focal + tversky."""
@@ -116,15 +149,20 @@ class Trainer:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        self.show_progress = bool(getattr(self.config.runtime, "progress_bar", True))
+
         device_name = str(self.config.runtime.device).lower()
         if device_name == "auto":
             device_name = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device_name)
 
         self.model.to(self.device)
+        set_trainable_layers(self.model, self.config)
         self.loss_fn = CompositeSegLoss(self.config, num_classes=int(self.config.data.num_classes)).to(self.device)
 
         params = [p for p in self.model.parameters() if p.requires_grad]
+        if not params:
+            params = list(self.model.parameters())
         self.optimizer = torch.optim.AdamW(
             params,
             lr=float(self.config.train.lr),
@@ -143,6 +181,20 @@ class Trainer:
         self.max_train_steps = int(self.config.train.max_train_steps_per_epoch)
         self.max_eval_steps = int(self.config.train.max_eval_steps)
 
+        total_params = int(sum(p.numel() for p in self.model.parameters()))
+        trainable_params = int(sum(p.numel() for p in self.model.parameters() if p.requires_grad))
+        tprint(
+            "trainer init: "
+            f"device={self.device} amp={self.use_amp} ema_decay={ema_decay} "
+            f"trainable_params={trainable_params} total_params={total_params}"
+        )
+        tprint(
+            "optimizer: "
+            f"AdamW(lr={float(self.config.train.lr):.6g}, "
+            f"weight_decay={float(self.config.train.weight_decay):.6g}, "
+            f"grad_clip={self.grad_clip}, grad_accum_steps={self.grad_accum_steps})"
+        )
+
     def fit(self, train_loader, eval_loader, epochs: int) -> TrainerResult:
         """train model and keep best checkpoint by eval dice."""
         history = {
@@ -154,12 +206,22 @@ class Trainer:
 
         best_metric = -1.0
         best_epoch = 0
-        best_ckpt = self.output_dir / "models" / "best_model.pt"
+        # Keep .pt checkpoint as a temporary training artifact only.
+        # Final deployment artifact is exported as ONNX by pipeline.core.
+        best_ckpt = self.output_dir / ".cache" / "best_model.pt"
         best_ckpt.parent.mkdir(parents=True, exist_ok=True)
 
+        tprint(
+            "fit start: "
+            f"epochs={epochs} "
+            f"train_batches={len(train_loader)} eval_batches={len(eval_loader)} "
+            f"max_train_steps={self.max_train_steps} max_eval_steps={self.max_eval_steps}"
+        )
+
         for epoch in range(1, epochs + 1):
-            train_loss, train_dice = self.train_one_epoch(train_loader)
-            eval_loss, eval_dice = self.validate(eval_loader)
+            tprint(f"epoch {epoch:03d}/{epochs:03d} start")
+            train_loss, train_dice = self.train_one_epoch(train_loader, epoch=epoch, total_epochs=epochs)
+            eval_loss, eval_dice = self.validate(eval_loader, phase="eval", epoch=epoch, total_epochs=epochs)
 
             history["train_loss"].append(train_loss)
             history["eval_loss"].append(eval_loss)
@@ -178,6 +240,22 @@ class Trainer:
                 self.save_checkpoint(str(best_ckpt), epoch=epoch, metric=eval_dice)
 
         self.load_checkpoint(str(best_ckpt))
+
+        # Clean temporary checkpoint so the run output is ONNX-oriented.
+        if best_ckpt.exists():
+            try:
+                best_ckpt.unlink()
+            except OSError:
+                pass
+        if best_ckpt.parent.exists():
+            try:
+                next(best_ckpt.parent.iterdir())
+            except StopIteration:
+                try:
+                    best_ckpt.parent.rmdir()
+                except OSError:
+                    pass
+
         return TrainerResult(
             best_metric=best_metric,
             best_epoch=best_epoch,
@@ -185,7 +263,14 @@ class Trainer:
             history=history,
         )
 
-    def train_one_epoch(self, dataloader) -> Tuple[float, float]:
+    @staticmethod
+    def _planned_steps(dataloader, max_steps: int) -> Optional[int]:
+        total = len(dataloader)
+        if max_steps > 0:
+            return min(total, max_steps)
+        return total
+
+    def train_one_epoch(self, dataloader, epoch: int, total_epochs: int) -> Tuple[float, float]:
         """run one train epoch and return loss/dice."""
         self.model.train()
 
@@ -194,7 +279,17 @@ class Trainer:
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        for step, (images, masks) in enumerate(dataloader, start=1):
+        train_iter = tqdm(
+            enumerate(dataloader, start=1),
+            total=self._planned_steps(dataloader, self.max_train_steps),
+            desc=f"train {epoch:03d}/{total_epochs:03d}",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not self.show_progress,
+            mininterval=0.2,
+        )
+
+        for step, (images, masks) in train_iter:
             if self.max_train_steps > 0 and step > self.max_train_steps:
                 break
 
@@ -221,10 +316,21 @@ class Trainer:
             losses.append(float(loss.item() * self.grad_accum_steps))
             dice_scores.append(float(self._batch_dice(logits, masks)))
 
+            train_iter.set_postfix(
+                loss=f"{losses[-1]:.4f}",
+                dice=f"{dice_scores[-1]:.4f}",
+                refresh=False,
+            )
+
+        train_iter.close()
+
+        if not losses:
+            return 0.0, 0.0
+
         return float(np.mean(losses)), float(np.mean(dice_scores))
 
     @torch.no_grad()
-    def validate(self, dataloader) -> Tuple[float, float]:
+    def validate(self, dataloader, phase: str, epoch: int, total_epochs: int) -> Tuple[float, float]:
         """run one validation epoch and return loss/dice."""
         model = self.ema.ema_model if self.ema is not None else self.model
         model.eval()
@@ -232,7 +338,17 @@ class Trainer:
         losses: List[float] = []
         dice_scores: List[float] = []
 
-        for step, (images, masks) in enumerate(dataloader, start=1):
+        eval_iter = tqdm(
+            enumerate(dataloader, start=1),
+            total=self._planned_steps(dataloader, self.max_eval_steps),
+            desc=f"{phase}  {epoch:03d}/{total_epochs:03d}",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not self.show_progress,
+            mininterval=0.2,
+        )
+
+        for step, (images, masks) in eval_iter:
             if self.max_eval_steps > 0 and step > self.max_eval_steps:
                 break
 
@@ -244,6 +360,17 @@ class Trainer:
 
             losses.append(float(loss.item()))
             dice_scores.append(float(self._batch_dice(logits, masks)))
+
+            eval_iter.set_postfix(
+                loss=f"{losses[-1]:.4f}",
+                dice=f"{dice_scores[-1]:.4f}",
+                refresh=False,
+            )
+
+        eval_iter.close()
+
+        if not losses:
+            return 0.0, 0.0
 
         return float(np.mean(losses)), float(np.mean(dice_scores))
 
@@ -268,7 +395,17 @@ class Trainer:
 
         collected_features = 0
 
-        for step, (images, masks) in enumerate(dataloader, start=1):
+        test_iter = tqdm(
+            enumerate(dataloader, start=1),
+            total=self._planned_steps(dataloader, self.max_eval_steps),
+            desc="test  predict",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not self.show_progress,
+            mininterval=0.2,
+        )
+
+        for step, (images, masks) in test_iter:
             if self.max_eval_steps > 0 and step > self.max_eval_steps:
                 break
 
@@ -315,6 +452,14 @@ class Trainer:
                 feature_bank.append(feat_flat)
                 label_bank.append(mask_flat)
                 collected_features += feat_flat.shape[0]
+
+            test_iter.set_postfix(
+                kept_imgs=f"{len(image_samples)}/{keep_images}",
+                feat_pts=collected_features,
+                refresh=False,
+            )
+
+        test_iter.close()
 
         return {
             "pred_masks": pred_masks,

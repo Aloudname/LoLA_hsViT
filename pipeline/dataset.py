@@ -1,15 +1,21 @@
-# dataset and preprocessing pipeline for hsi/rgb segmentation.
-import cv2, json, torch, numpy as np
-
-from munch import Munch
-from pathlib import Path
-from dataclasses import dataclass
 from __future__ import annotations
-from pipeline.monitor import tprint
-from sklearn.decomposition import PCA
-from torch.utils.data import DataLoader, Dataset
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+
+# dataset and preprocessing pipeline for hsi/rgb segmentation.
+import json
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+import cv2
+import numpy as np
+import torch
+from munch import Munch
+from sklearn.decomposition import PCA
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
+
+from pipeline.monitor import tprint
 
 
 @dataclass
@@ -97,16 +103,26 @@ def _compute_hist(mask: np.ndarray, num_classes: int) -> np.ndarray:
     return np.bincount(mask.reshape(-1), minlength=num_classes).astype(np.int64)
 
 
-def _should_keep_patch(mask_patch: np.ndarray, foreground_ratio_threshold: float) -> bool:
+def _should_keep_patch(
+    mask_patch: np.ndarray,
+    foreground_ratio_threshold: float,
+    max_background_ratio: float = 1.0,
+    parathyroid_class: int = 1,
+) -> bool:
     """patch keep rule.
 
     keep when:
-    - class-1 exists, or
-    - foreground ratio >= threshold.
+    - parathyroid exists, or
+    - foreground ratio >= threshold and background ratio <= max_background_ratio.
     """
-    has_small_target = bool(np.any(mask_patch == 1))
+    has_small_target = bool(np.any(mask_patch == int(parathyroid_class)))
     fg_ratio = float(np.mean(mask_patch > 0))
-    return has_small_target or fg_ratio >= foreground_ratio_threshold
+    bg_ratio = float(np.mean(mask_patch == 0))
+    if has_small_target:
+        return True
+    if bg_ratio > float(max_background_ratio):
+        return False
+    return fg_ratio >= foreground_ratio_threshold
 
 
 class SpectralReducer:
@@ -129,7 +145,7 @@ class SpectralReducer:
         self.pca_tail: Optional[PCA] = None
         self.fitted = False
 
-    def fit(self, samples: Sequence[SampleItem], num_classes: int) -> None:
+    def fit(self, samples: Sequence[SampleItem], num_classes: int, show_progress: bool = True) -> None:
         """fit reducer from train split pixels.
 
         input:
@@ -140,7 +156,7 @@ class SpectralReducer:
             self.fitted = True
             return
 
-        x_fit, y_fit = self._collect_pixels(samples, num_classes)
+        x_fit, y_fit = self._collect_pixels(samples, num_classes, show_progress=show_progress)
         if x_fit.size == 0:
             raise RuntimeError("failed to collect fit pixels for spectral reducer")
 
@@ -204,13 +220,28 @@ class SpectralReducer:
 
         return y.reshape(h, w, self.output_dim).transpose(2, 0, 1)
 
-    def _collect_pixels(self, samples: Sequence[SampleItem], num_classes: int) -> Tuple[np.ndarray, np.ndarray]:
+    def _collect_pixels(
+        self,
+        samples: Sequence[SampleItem],
+        num_classes: int,
+        show_progress: bool = True,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """collect class-balanced train pixels for fitting."""
         rng = np.random.default_rng(self.seed)
         per_class_budget = max(256, self.max_fit_pixels // max(1, num_classes))
         x_by_class: List[List[np.ndarray]] = [[] for _ in range(num_classes)]
 
-        for sample in samples:
+        sample_iter = tqdm(
+            samples,
+            total=len(samples),
+            desc="reducer-fit",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not show_progress,
+            mininterval=0.2,
+        )
+
+        for sample in sample_iter:
             cube = np.load(sample.hsi_path).astype(np.float32)
             mask = np.load(sample.mask_path).astype(np.int64)
             cube, mask = _pad_to_patch(cube, mask, patch_size=1)
@@ -226,6 +257,8 @@ class SpectralReducer:
                 take = min(idx.size, max(32, per_class_budget // max(1, len(samples))))
                 chosen = rng.choice(idx, size=take, replace=False)
                 x_by_class[cls_idx].append(flat[chosen])
+
+            sample_iter.close()
 
         x_parts: List[np.ndarray] = []
         y_parts: List[np.ndarray] = []
@@ -343,6 +376,11 @@ def _build_patch_records(
     foreground_ratio_threshold: float,
     num_classes: int,
     tracked_sample_ids: Sequence[str],
+    split_name: str = "split",
+    show_progress: bool = True,
+    max_background_ratio: float = 1.0,
+    parathyroid_repeat: int = 1,
+    parathyroid_class: int = 1,
 ) -> Tuple[List[PatchRecord], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """build patch index list and class histograms.
 
@@ -361,7 +399,20 @@ def _build_patch_records(
     tracked_pre = np.zeros(num_classes, dtype=np.int64)
     tracked_post = np.zeros(num_classes, dtype=np.int64)
 
-    for sample_index, sample in enumerate(samples):
+    parathyroid_repeat = max(1, int(parathyroid_repeat))
+    parathyroid_class = int(parathyroid_class)
+
+    sample_iter = tqdm(
+        enumerate(samples),
+        total=len(samples),
+        desc=f"patch-{split_name}",
+        dynamic_ncols=True,
+        leave=False,
+        disable=not show_progress,
+        mininterval=0.2,
+    )
+
+    for sample_index, sample in sample_iter:
         mask = np.load(sample.mask_path).astype(np.int64)
         raw_hist += _compute_hist(mask, num_classes)
 
@@ -377,25 +428,42 @@ def _build_patch_records(
         sample_kept = 0
         for top, left in _iter_patch_positions(h, w, patch_size, stride):
             patch_mask = mask[top : top + patch_size, left : left + patch_size]
+            patch_hist_once = _compute_hist(patch_mask, num_classes)
+            has_parathyroid = bool(np.any(patch_mask == parathyroid_class))
             if sample.sample_id in tracked_set:
-                tracked_pre += _compute_hist(patch_mask, num_classes)
+                tracked_pre += patch_hist_once
 
-            keep = _should_keep_patch(patch_mask, foreground_ratio_threshold)
+            keep = _should_keep_patch(
+                patch_mask,
+                foreground_ratio_threshold,
+                max_background_ratio=max_background_ratio,
+                parathyroid_class=parathyroid_class,
+            )
             if keep:
-                records.append(PatchRecord(sample_index=sample_index, top=top, left=left))
-                patch_hist += _compute_hist(patch_mask, num_classes)
-                sample_kept += 1
+                repeat_count = parathyroid_repeat if has_parathyroid else 1
+                for _ in range(repeat_count):
+                    records.append(PatchRecord(sample_index=sample_index, top=top, left=left))
+                    patch_hist += patch_hist_once
+                    sample_kept += 1
                 if sample.sample_id in tracked_set:
-                    tracked_post += _compute_hist(patch_mask, num_classes)
+                    tracked_post += patch_hist_once
 
         if sample_kept == 0:
             center_top = max(0, (h - patch_size) // 2)
             center_left = max(0, (w - patch_size) // 2)
             patch_mask = mask[center_top : center_top + patch_size, center_left : center_left + patch_size]
-            records.append(PatchRecord(sample_index=sample_index, top=center_top, left=center_left))
-            patch_hist += _compute_hist(patch_mask, num_classes)
+            patch_hist_once = _compute_hist(patch_mask, num_classes)
+            has_parathyroid = bool(np.any(patch_mask == parathyroid_class))
+            repeat_count = parathyroid_repeat if has_parathyroid else 1
+            for _ in range(repeat_count):
+                records.append(PatchRecord(sample_index=sample_index, top=center_top, left=center_left))
+                patch_hist += patch_hist_once
             if sample.sample_id in tracked_set:
-                tracked_post += _compute_hist(patch_mask, num_classes)
+                tracked_post += patch_hist_once
+
+        sample_iter.set_postfix(kept=len(records), refresh=False)
+
+    sample_iter.close()
 
     return records, raw_hist, patch_hist, tracked_pre, tracked_post
 
@@ -415,6 +483,7 @@ _PREPARED_CACHE: Dict[str, PreparedData] = {}
 
 def _build_cache_key(config: Munch, modality: str) -> str:
     """build deterministic cache key for prepared data."""
+    sampling_cfg = getattr(config.data, "sampling", Munch())
     payload = {
         "modality": modality,
         "paths": {
@@ -426,6 +495,18 @@ def _build_cache_key(config: Munch, modality: str) -> str:
         "patch_size": int(config.data.patch_size),
         "stride": int(config.data.stride),
         "threshold": float(config.data.foreground_ratio_threshold),
+        "sampling": {
+            "train_fg_ratio_threshold": float(
+                getattr(sampling_cfg, "train_fg_ratio_threshold", float(config.data.foreground_ratio_threshold))
+            ),
+            "train_max_background_ratio": float(
+                getattr(sampling_cfg, "train_max_background_ratio", 1.0)
+            ),
+            "train_parathyroid_repeat": int(
+                getattr(sampling_cfg, "train_parathyroid_repeat", 1)
+            ),
+            "parathyroid_class": int(getattr(sampling_cfg, "parathyroid_class", 1)),
+        },
         "preprocess": dict(config.data.preprocess),
     }
     return json.dumps(payload, sort_keys=True)
@@ -435,13 +516,30 @@ def prepare_data(config: Mapping[str, Any], modality: str) -> PreparedData:
     """prepare split, patch records, and reducer once."""
     cfg = _as_munch(config)
     modality = modality.lower()
+    show_progress = bool(getattr(cfg.runtime, "progress_bar", True))
+
+    tprint(
+        "prepare data start: "
+        f"modality={modality} "
+        f"paths(hsi={cfg.path.hsi_dir}, label={cfg.path.label_dir}, rgb={cfg.path.rgb_dir})"
+    )
 
     cache_key = _build_cache_key(cfg, modality)
     if cache_key in _PREPARED_CACHE:
+        tprint(f"prepare data cache hit: modality={modality}")
         return _PREPARED_CACHE[cache_key]
 
     all_samples = _discover_hsi_samples(cfg)
+    unique_patients = len({s.patient_id for s in all_samples})
+    tprint(f"discovered samples: total={len(all_samples)} unique_patients={unique_patients}")
+
     samples_by_split = _split_subjects(all_samples, cfg)
+    tprint(
+        "subject split: "
+        f"train={len(samples_by_split['train'])} "
+        f"eval={len(samples_by_split['eval'])} "
+        f"test={len(samples_by_split['test'])}"
+    )
 
     patch_size = int(cfg.data.patch_size)
     stride = int(cfg.data.stride)
@@ -449,6 +547,13 @@ def prepare_data(config: Mapping[str, Any], modality: str) -> PreparedData:
     num_classes = int(cfg.data.num_classes)
     seed = int(cfg.data.split.seed)
     track_ratio = float(cfg.data.track_sample_ratio)
+    sampling_cfg = getattr(cfg.data, "sampling", Munch())
+
+    train_fg_threshold = float(getattr(sampling_cfg, "train_fg_ratio_threshold", threshold))
+    train_max_background_ratio = float(getattr(sampling_cfg, "train_max_background_ratio", 1.0))
+    train_max_background_ratio = min(1.0, max(0.0, train_max_background_ratio))
+    train_parathyroid_repeat = max(1, int(getattr(sampling_cfg, "train_parathyroid_repeat", 1)))
+    parathyroid_class = int(getattr(sampling_cfg, "parathyroid_class", 1))
 
     reducer = SpectralReducer(
         mode=str(cfg.data.preprocess.mode),
@@ -457,10 +562,16 @@ def prepare_data(config: Mapping[str, Any], modality: str) -> PreparedData:
         seed=seed,
     )
     if modality == "hsi":
-        reducer.fit(samples_by_split["train"], num_classes=num_classes)
+        tprint(
+            "spectral reducer: "
+            f"mode={reducer.mode} output_dim={reducer.output_dim} max_fit_pixels={reducer.max_fit_pixels}"
+        )
+        reducer.fit(samples_by_split["train"], num_classes=num_classes, show_progress=show_progress)
+        tprint("spectral reducer fit done")
     else:
         reducer.mode = "none"
         reducer.fitted = True
+        tprint("spectral reducer skipped for rgb modality")
 
     patches_by_split: Dict[str, List[PatchRecord]] = {}
     split_stats: Dict[str, Any] = {}
@@ -469,13 +580,32 @@ def prepare_data(config: Mapping[str, Any], modality: str) -> PreparedData:
         split_samples = samples_by_split[split_name]
         tracked_ids = _pick_tracked_samples(split_samples, ratio=track_ratio, seed=seed + split_idx)
 
+        split_threshold = threshold
+        split_max_background_ratio = 1.0
+        split_parathyroid_repeat = 1
+        if split_name == "train":
+            split_threshold = train_fg_threshold
+            split_max_background_ratio = train_max_background_ratio
+            split_parathyroid_repeat = train_parathyroid_repeat
+
         records, raw_hist, patch_hist, tracked_pre, tracked_post = _build_patch_records(
             samples=split_samples,
             patch_size=patch_size,
             stride=stride,
-            foreground_ratio_threshold=threshold,
+            foreground_ratio_threshold=split_threshold,
             num_classes=num_classes,
             tracked_sample_ids=tracked_ids,
+            split_name=split_name,
+            show_progress=show_progress,
+            max_background_ratio=split_max_background_ratio,
+            parathyroid_repeat=split_parathyroid_repeat,
+            parathyroid_class=parathyroid_class,
+        )
+
+        tprint(
+            f"patch prep [{split_name}]: samples={len(split_samples)} "
+            f"patches={len(records)} tracked={len(tracked_ids)} "
+            f"policy(fg_thr={split_threshold:.3f}, bg_max={split_max_background_ratio:.3f}, repeat={split_parathyroid_repeat})"
         )
 
         patches_by_split[split_name] = records
@@ -487,6 +617,12 @@ def prepare_data(config: Mapping[str, Any], modality: str) -> PreparedData:
             "tracked_sample_ids": tracked_ids,
             "tracked_pre_hist": tracked_pre.tolist(),
             "tracked_post_hist": tracked_post.tolist(),
+            "sampling_policy": {
+                "foreground_ratio_threshold": float(split_threshold),
+                "max_background_ratio": float(split_max_background_ratio),
+                "parathyroid_repeat": int(split_parathyroid_repeat),
+                "parathyroid_class": int(parathyroid_class),
+            },
         }
 
     prepared = PreparedData(
@@ -679,6 +815,13 @@ def build_dataloaders(config: Mapping[str, Any], modality: str) -> Tuple[Dict[st
         "eval": DataLoader(eval_ds, batch_size=eval_bs, shuffle=False, num_workers=num_workers, pin_memory=False),
         "test": DataLoader(test_ds, batch_size=eval_bs, shuffle=False, num_workers=num_workers, pin_memory=False),
     }
+
+    tprint(
+        f"dataloaders[{modality}]: "
+        f"train_samples={len(train_ds)} eval_samples={len(eval_ds)} test_samples={len(test_ds)} "
+        f"train_batches={len(loaders['train'])} eval_batches={len(loaders['eval'])} test_batches={len(loaders['test'])} "
+        f"batch_size(train/eval)={train_bs}/{eval_bs} workers={num_workers}"
+    )
     return loaders, prepared
 
 

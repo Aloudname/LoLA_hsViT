@@ -1,12 +1,17 @@
-# end-to-end pipeline orchestration for refactored experiments.
-import json, random, torch, numpy as np
-
-from munch import Munch
-from pathlib import Path
-from datetime import datetime
-from dataclasses import dataclass
 from __future__ import annotations
+
+# end-to-end pipeline orchestration for refactored experiments.
+import json
+import random
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
+
+import numpy as np
+import torch
+from munch import Munch
 
 from pipeline.monitor import tprint
 from pipeline.visualize import Visualizer
@@ -26,6 +31,7 @@ class PipelineResult:
     test_summary: Dict[str, float]
     metrics_json: str
     onnx_path: Optional[str]
+    onnx_note_path: Optional[str]
 
 
 class Pipeline:
@@ -51,25 +57,49 @@ class Pipeline:
 
     def run(self) -> PipelineResult:
         """execute full training/eval/test workflow."""
-        modality = "rgb" if self.model_key == "rgb_vit" else "hsi"
+        tprint(f"pipeline start: model_key={self.model_key} output_dir={self.output_dir}")
+
+        modality = "rgb" if self.model_key == "rgb" else "hsi"
+
+        stage_t0 = time.perf_counter()
+        tprint(f"stage[data]: build dataloaders (modality={modality})")
         loaders, prepared = build_dataloaders(self.config, modality=modality)
+        tprint(f"stage[data] done in {time.perf_counter() - stage_t0:.2f}s")
 
+        stage_t0 = time.perf_counter()
         in_channels = self._resolve_input_channels(modality)
+        tprint(f"stage[model]: build model (in_channels={in_channels})")
         model = self._build_model(in_channels=in_channels)
+        tprint(f"stage[model] done in {time.perf_counter() - stage_t0:.2f}s")
 
+        stage_t0 = time.perf_counter()
+        tprint("stage[trainer]: init trainer")
         trainer = Trainer(model=model, config=self.config, output_dir=str(self.output_dir))
+        tprint(f"stage[trainer] done in {time.perf_counter() - stage_t0:.2f}s")
+
+        stage_t0 = time.perf_counter()
+        tprint("stage[train]: fit train/eval")
         trainer_result = trainer.fit(
             train_loader=loaders["train"],
             eval_loader=loaders["eval"],
             epochs=int(self.config.train.epochs),
         )
+        tprint(
+            f"stage[train] done in {time.perf_counter() - stage_t0:.2f}s "
+            f"(best_epoch={trainer_result.best_epoch}, best_eval_dice={trainer_result.best_metric:.4f})"
+        )
 
+        stage_t0 = time.perf_counter()
+        tprint("stage[test]: predict on test loader")
         pred_pack = trainer.predict(
             dataloader=loaders["test"],
             keep_images=int(self.config.visualization.num_seg_examples),
             keep_features=int(self.config.visualization.tsne_max_points),
         )
+        tprint(f"stage[test] done in {time.perf_counter() - stage_t0:.2f}s")
 
+        stage_t0 = time.perf_counter()
+        tprint("stage[metrics]: compute analyzer metrics")
         metrics_bundle = self.analyzer.compute_metrics(
             preds=pred_pack["pred_masks"],
             targets=pred_pack["gt_masks"],
@@ -77,11 +107,24 @@ class Pipeline:
         )
 
         tprint(self.analyzer.summarize(metrics_bundle))
+        tprint(f"stage[metrics] done in {time.perf_counter() - stage_t0:.2f}s")
 
+        stage_t0 = time.perf_counter()
         metrics_path = self._save_metrics(metrics_bundle, trainer_result)
-        self._run_visualizations(metrics_bundle, trainer_result, pred_pack, prepared.stats, modality)
+        tprint(f"stage[metrics-save] done in {time.perf_counter() - stage_t0:.2f}s")
 
+        stage_t0 = time.perf_counter()
+        tprint("stage[viz]: generate visualizations")
+        self._run_visualizations(metrics_bundle, trainer_result, pred_pack, prepared.stats, modality)
+        tprint(f"stage[viz] done in {time.perf_counter() - stage_t0:.2f}s")
+
+        stage_t0 = time.perf_counter()
+        tprint("stage[export]: export onnx")
         onnx_path = self._export_onnx(trainer, in_channels=in_channels)
+        tprint(f"stage[export] done in {time.perf_counter() - stage_t0:.2f}s")
+        onnx_note_path = str(Path(onnx_path).with_name("best_model_info.txt")) if onnx_path else None
+
+        tprint(f"pipeline done: model_key={self.model_key} output_dir={self.output_dir}")
 
         return PipelineResult(
             model_key=self.model_key,
@@ -91,6 +134,7 @@ class Pipeline:
             test_summary={k: float(v) for k, v in metrics_bundle.summary.items()},
             metrics_json=str(metrics_path),
             onnx_path=onnx_path,
+            onnx_note_path=onnx_note_path,
         )
 
     def _build_model(self, in_channels: int) -> torch.nn.Module:
@@ -106,31 +150,62 @@ class Pipeline:
             "decoder_dim": int(self.config.model.decoder_dim),
             "dropout": float(self.config.model.dropout),
             "freeze_backbone": bool(self.config.model.freeze_backbone),
+            "use_pretrained": bool(
+                getattr(self.config.model, "use_pretrained", getattr(self.config.model, "pretrained_backbone", False))
+            ),
+            "backbone_name": str(getattr(self.config.model, "backbone_name", "vit_small_patch16_224")),
+            "pretrained_weights": bool(
+                getattr(self.config.model, "pretrained_weights", getattr(self.config.model, "backbone_pretrained", True))
+            ),
+            "pretrained_cache_dir": str(getattr(self.config.path, "pretrained_cache_dir", "")),
+            "unfreeze_last_n": int(getattr(self.config.model, "unfreeze_last_n", 0)),
         }
 
-        if self.model_key.startswith("hsi_adapter"):
-            return HSIAdapter(common_cfg)
-        if self.model_key == "rgb_vit":
-            return RGBViT(common_cfg)
-        if self.model_key == "unet":
+        tprint(
+            "model config: "
+            f"family={self.config.model.family} in_channels={in_channels} "
+            f"num_classes={int(self.config.data.num_classes)} "
+            f"embed_dim={int(self.config.model.embed_dim)} depth={int(self.config.model.depth)} "
+            f"heads={int(self.config.model.num_heads)} "
+            f"freeze_backbone={bool(self.config.model.freeze_backbone)} "
+            f"use_pretrained={common_cfg['use_pretrained']} pretrained_weights={common_cfg['pretrained_weights']}"
+        )
+
+        if self.model_key.startswith("hsi"):
+            model = HSIAdapter(common_cfg)
+        elif self.model_key == "rgb":
+            model = RGBViT(common_cfg)
+        elif self.model_key == "unet":
             unet_cfg = {
                 "in_channels": in_channels,
                 "num_classes": int(self.config.data.num_classes),
                 "base_channels": int(max(16, self.config.model.embed_dim // 4)),
             }
-            return UNet(unet_cfg)
+            model = UNet(unet_cfg)
+        else:
+            raise ValueError(f"unknown model_key: {self.model_key}")
 
-        raise ValueError(f"unknown model_key: {self.model_key}")
+        total_params = int(sum(p.numel() for p in model.parameters()))
+        trainable_params = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+        tprint(f"model ready: trainable_params={trainable_params} total_params={total_params}")
+        return model
 
     def _resolve_input_channels(self, modality: str) -> int:
         """resolve input channels according to modality and preprocessing mode."""
         if modality == "rgb":
+            tprint("input channels resolved: modality=rgb channels=3")
             return 3
 
         preprocess_mode = str(self.config.data.preprocess.mode).lower()
         if preprocess_mode == "none":
-            return int(self.config.data.hsi_bands)
-        return int(self.config.data.preprocess.output_dim)
+            channels = int(self.config.data.hsi_bands)
+        else:
+            channels = int(self.config.data.preprocess.output_dim)
+
+        tprint(
+            f"input channels resolved: modality=hsi preprocess_mode={preprocess_mode} channels={channels}"
+        )
+        return channels
 
     def _save_metrics(self, bundle: MetricsBundle, trainer_result: TrainerResult) -> Path:
         """save metrics and training history json files."""
@@ -142,6 +217,13 @@ class Pipeline:
             "summary": bundle.summary,
             "per_class": bundle.per_class,
             "roc_auc": bundle.roc_auc,
+            "roc_curves": {
+                name: {
+                    "fpr": curves["fpr"].tolist(),
+                    "tpr": curves["tpr"].tolist(),
+                }
+                for name, curves in bundle.roc_curves.items()
+            },
             "confusion_matrix": cm,
             "best_epoch": int(trainer_result.best_epoch),
             "best_eval_dice": float(trainer_result.best_metric),
@@ -151,6 +233,8 @@ class Pipeline:
         metrics_path = metrics_dir / "result_metrics.json"
         with metrics_path.open("w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
+
+        tprint(f"metrics saved: {metrics_path}")
 
         return metrics_path
 
@@ -163,12 +247,15 @@ class Pipeline:
         modality: str,
     ) -> None:
         """generate all required plots."""
+        tprint("visualization: training curves")
         self.visualizer.plot_training_curves(trainer_result.history)
+        tprint("visualization: prf/confusion/roc/distribution")
         self.visualizer.plot_prf(metrics_bundle)
         self.visualizer.plot_confusion_matrix(metrics_bundle)
         self.visualizer.plot_roc(metrics_bundle)
         self.visualizer.plot_distribution(split_stats)
 
+        tprint("visualization: segmentation samples")
         self.visualizer.show_segmentation(
             images=pred_pack["image_samples"],
             preds=pred_pack["pred_masks"],
@@ -180,13 +267,16 @@ class Pipeline:
         features = np.asarray(pred_pack.get("features", np.empty((0, 0), dtype=np.float32)))
         labels = np.asarray(pred_pack.get("feature_labels", np.empty((0,), dtype=np.int64)))
         if features.size > 0 and labels.size > 0:
+            tprint(f"visualization: tsne points={features.shape[0]}")
             self.visualizer.plot_tsne(features=features, labels=labels, title=f"{self.model_key} feature tsne")
 
         if modality == "hsi":
             spectra = self._collect_spectral_curves(pred_pack, max_points=int(self.config.visualization.spectral_max_points_per_class))
+            tprint(f"visualization: spectral curves classes={len(spectra)}")
             self.visualizer.plot_spectral(spectra)
 
         attention = pred_pack.get("attention_map")
+        tprint(f"visualization: attention map available={attention is not None}")
         self.visualizer.plot_attention_map(attention)
 
     def _collect_spectral_curves(self, pred_pack: Mapping[str, Any], max_points: int) -> Dict[str, Any]:
@@ -233,6 +323,7 @@ class Pipeline:
     def _export_onnx(self, trainer: Trainer, in_channels: int) -> Optional[str]:
         """export best model to onnx."""
         if not bool(self.config.export.export_onnx):
+            tprint("onnx export skipped: export.export_onnx=false")
             return None
 
         model = trainer.ema.ema_model if trainer.ema is not None else trainer.model
@@ -241,27 +332,198 @@ class Pipeline:
         onnx_dir = self.output_dir / "models"
         onnx_dir.mkdir(parents=True, exist_ok=True)
         onnx_path = onnx_dir / "best_model.onnx"
+        note_path = onnx_dir / "best_model_info.txt"
+
+        tprint(
+            "onnx export start: "
+            f"path={onnx_path} opset={int(self.config.export.onnx_opset)} in_channels={in_channels}"
+        )
 
         patch_size = int(self.config.data.patch_size)
         dummy = torch.randn(1, in_channels, patch_size, patch_size, dtype=torch.float32)
 
+        prev_fastpath: Optional[bool] = None
         try:
-            torch.onnx.export(
-                model.cpu(),
-                dummy,
-                str(onnx_path),
-                input_names=["input"],
-                output_names=["logits"],
-                opset_version=int(self.config.export.onnx_opset),
-                dynamic_axes={
-                    "input": {0: "batch"},
-                    "logits": {0: "batch"},
-                },
+            if hasattr(torch.backends, "mha") and hasattr(torch.backends.mha, "get_fastpath_enabled"):
+                prev_fastpath = bool(torch.backends.mha.get_fastpath_enabled())
+                torch.backends.mha.set_fastpath_enabled(False)
+
+            model_cpu = model.cpu()
+            with torch.no_grad():
+                output_sample = model_cpu(dummy)
+                torch.onnx.export(
+                    model_cpu,
+                    dummy,
+                    str(onnx_path),
+                    input_names=["input"],
+                    output_names=["logits"],
+                    opset_version=int(self.config.export.onnx_opset),
+                    dynamic_axes={
+                        "input": {0: "batch"},
+                        "logits": {0: "batch"},
+                    },
+                )
+
+            self._write_onnx_note(
+                note_path=note_path,
+                onnx_path=onnx_path,
+                model=model_cpu,
+                input_sample=dummy,
+                output_sample=output_sample,
             )
+            tprint(f"onnx info note saved: {note_path}")
             return str(onnx_path)
         except Exception as exc:
             tprint(f"onnx export failed: {exc}")
             return None
+        finally:
+            if prev_fastpath is not None and hasattr(torch.backends, "mha") and hasattr(torch.backends.mha, "set_fastpath_enabled"):
+                torch.backends.mha.set_fastpath_enabled(prev_fastpath)
+
+    def _write_onnx_note(
+        self,
+        note_path: Path,
+        onnx_path: Path,
+        model: torch.nn.Module,
+        input_sample: torch.Tensor,
+        output_sample: torch.Tensor,
+    ) -> None:
+        """Write deployment-friendly model and I/O notes beside ONNX file."""
+        input_shape = [int(v) for v in input_sample.shape]
+        output_shape = [int(v) for v in output_sample.shape]
+        patch_size = int(self.config.data.patch_size)
+        stride = int(getattr(self.config.data, "stride", patch_size))
+        overlap_ratio = max(0.0, 1.0 - (float(stride) / float(max(1, patch_size))))
+
+        input_c = input_shape[1] if len(input_shape) > 1 else 1
+        input_h = input_shape[2] if len(input_shape) > 2 else patch_size
+        input_w = input_shape[3] if len(input_shape) > 3 else patch_size
+        class_names = [str(name) for name in list(self.config.data.class_names)]
+        class_map_lines = [f"  - {idx}: {name}" for idx, name in enumerate(class_names)]
+
+        preprocess_mode = str(getattr(self.config.data.preprocess, "mode", "none"))
+        preprocess_out_dim = int(getattr(self.config.data.preprocess, "output_dim", input_shape[1]))
+        model_family = str(getattr(self.config.model, "family", "unknown"))
+        backbone_name = str(getattr(self.config.model, "backbone_name", "n/a"))
+
+        total_params = int(sum(p.numel() for p in model.parameters()))
+        trainable_params = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+
+        preprocess_lines = [
+            "  - Convert input to float32.",
+            "  - Ensure tensor layout is [N, C, H, W].",
+        ]
+        if self.model_key == "rgb":
+            preprocess_lines.extend(
+                [
+                    "  - Read image as RGB (if using OpenCV, convert BGR -> RGB first).",
+                    "  - Scale pixel values to [0, 1] using /255.0.",
+                    f"  - Expected channels C={input_shape[1]}.",
+                ]
+            )
+        else:
+            preprocess_lines.extend(
+                [
+                    "  - Load hyperspectral cube with float32 values.",
+                    f"  - Reducer mode from training config: {preprocess_mode}.",
+                ]
+            )
+            if preprocess_mode != "none":
+                preprocess_lines.append(
+                    f"  - Reducer output channels from training config: {preprocess_out_dim}."
+                )
+            preprocess_lines.append(f"  - Expected channels C={input_shape[1]}.")
+
+        sliding_window_lines = [
+            f"  - window_size: {patch_size} x {patch_size}",
+            f"  - stride: {stride}",
+            f"  - overlap_ratio: ~{overlap_ratio:.2f}",
+            "  - For large images, tile windows with tail coverage so the right/bottom borders are always covered.",
+            "  - Fuse overlapping windows by averaging logits with a count map, then run argmax.",
+            "  - If input is smaller than window_size, pad first and crop back to original size after fusion.",
+        ]
+
+        lines = [
+            "Model Deployment Note",
+            "=====================",
+            f"model_key: {self.model_key}",
+            f"model_family: {model_family}",
+            f"backbone_name: {backbone_name}",
+            f"onnx_file: {onnx_path.name}",
+            f"onnx_path: {onnx_path}",
+            f"export_time: {datetime.now().isoformat(timespec='seconds')}",
+            f"parameter_count_total: {total_params}",
+            f"parameter_count_trainable: {trainable_params}",
+            "",
+            "Input",
+            "-----",
+            "name: input",
+            f"dtype: {str(input_sample.dtype).replace('torch.', '')}",
+            f"shape_example: {input_shape}",
+            "dynamic_axes: batch axis 0",
+            "layout: [N, C, H, W]",
+            f"recommended_patch_size: {patch_size} x {patch_size}",
+            "",
+            "Output",
+            "------",
+            "name: logits",
+            f"dtype: {str(output_sample.dtype).replace('torch.', '')}",
+            f"shape_example: {output_shape}",
+            "dynamic_axes: batch axis 0",
+            "layout: [N, num_classes, H, W]",
+            "postprocess: argmax(logits, axis=1) -> predicted label map [N, H, W]",
+            "",
+            "Class Mapping",
+            "-------------",
+            *class_map_lines,
+            "",
+            "Preprocess Contract",
+            "-------------------",
+            *preprocess_lines,
+            "",
+            "Sliding Window Inference Contract",
+            "---------------------------------",
+            *sliding_window_lines,
+            "",
+            "ONNX Runtime Example (Python)",
+            "-----------------------------",
+            "import numpy as np",
+            "import onnxruntime as ort",
+            "",
+            f"sess = ort.InferenceSession(r\"{onnx_path}\", providers=['CPUExecutionProvider'])",
+            f"x = np.random.randn(1, {input_c}, {input_h}, {input_w}).astype(np.float32)",
+            "logits = sess.run(['logits'], {'input': x})[0]",
+            "pred = logits.argmax(axis=1).astype(np.int64)",
+            "",
+            "Sliding Window Pseudocode (NumPy)",
+            "-------------------------------",
+            "# logits_acc: [num_classes, H, W], count_acc: [1, H, W]",
+            "# for each window (y, x):",
+            "#   patch = image[:, y:y+patch_h, x:x+patch_w]",
+            "#   logits_patch = sess.run(['logits'], {'input': patch[None].astype(np.float32)})[0][0]",
+            "#   logits_acc[:, y:y+patch_h, x:x+patch_w] += logits_patch",
+            "#   count_acc[:, y:y+patch_h, x:x+patch_w] += 1.0",
+            "# fused_logits = logits_acc / np.maximum(count_acc, 1e-6)",
+            "# pred = np.argmax(fused_logits, axis=0).astype(np.int64)",
+            "",
+            "Model Structure",
+            "---------------",
+            str(model),
+            "",
+            "Config Snapshot",
+            "---------------",
+            f"num_classes: {int(self.config.data.num_classes)}",
+            f"class_names: {class_names}",
+            f"preprocess_mode: {preprocess_mode}",
+            f"patch_size: {patch_size}",
+            f"stride: {stride}",
+            f"onnx_opset: {int(self.config.export.onnx_opset)}",
+            f"device_for_export: cpu",
+        ]
+
+        note_path.parent.mkdir(parents=True, exist_ok=True)
+        with note_path.open("w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
 
     @staticmethod
     def _seed_everything(seed: int) -> None:

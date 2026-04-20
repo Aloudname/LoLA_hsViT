@@ -1,10 +1,13 @@
-# hsi adapter model with spectral-spatial token fusion.
 from __future__ import annotations
+
+# hsi adapter model with spectral-spatial token fusion.
 from typing import Any, Mapping, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from model.backbones.builder import build_backbone
 
 
 class SpectralEncoder(nn.Module):
@@ -109,18 +112,19 @@ class HSIAdapter(nn.Module):
 
         self.fusion = CrossAttentionFusion(embed_dim=embed_dim, num_heads=num_heads, dropout=dropout)
 
-        ff_dim = int(embed_dim * mlp_ratio)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=ff_dim,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True,
-            activation="gelu",
-        )
-        self.backbone = nn.TransformerEncoder(encoder_layer, num_layers=depth)
-        self.backbone_norm = nn.LayerNorm(embed_dim)
+        backbone_cfg = {
+            "embed_dim": embed_dim,
+            "depth": depth,
+            "num_heads": num_heads,
+            "mlp_ratio": mlp_ratio,
+            "dropout": dropout,
+            "freeze_backbone": freeze_backbone,
+            "use_pretrained": bool(config.get("use_pretrained", config.get("pretrained_backbone", False))),
+            "backbone_name": str(config.get("backbone_name", "vit_small_patch16_224")),
+            "pretrained_weights": bool(config.get("pretrained_weights", config.get("backbone_pretrained", True))),
+            "pretrained_cache_dir": str(config.get("pretrained_cache_dir", "")),
+        }
+        self.backbone = build_backbone(backbone_cfg)
 
         self.skip_proj = nn.Sequential(
             nn.Conv2d(spectral_dim, decoder_dim, kernel_size=1, bias=False),
@@ -143,9 +147,7 @@ class HSIAdapter(nn.Module):
         )
         self.seg_head = nn.Conv2d(decoder_dim, num_classes, kernel_size=1)
 
-        if freeze_backbone:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
+        # backbone freezing/unfreezing is handled by the backbone builder and trainer.
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         """extract fused feature map.
@@ -169,16 +171,18 @@ class HSIAdapter(nn.Module):
         spectral_tokens = spectral_map.flatten(2).transpose(1, 2)
         spectral_tokens = self.spectral_token_proj(spectral_tokens)
 
-        # align token length by pooled sampling when needed.
-        if spectral_tokens.shape[1] != spatial_tokens.shape[1]:
-            pooled = F.adaptive_avg_pool1d(
-                spectral_tokens.transpose(1, 2),
-                output_size=spatial_tokens.shape[1],
-            )
-            spectral_tokens = pooled.transpose(1, 2)
+        # Always align spectral token length to spatial token length via 1D interpolation.
+        # This avoids Python-shape branching and is friendlier to ONNX export.
+        target_len = spatial_tokens.shape[1]
+        spectral_tokens = F.interpolate(
+            spectral_tokens.transpose(1, 2),
+            size=target_len,
+            mode="linear",
+            align_corners=False,
+        ).transpose(1, 2)
 
         fused_tokens = self.fusion(spatial_tokens, spectral_tokens)
-        fused_tokens = self.backbone_norm(self.backbone(fused_tokens))
+        fused_tokens = self.backbone(fused_tokens)
 
         return fused_tokens.transpose(1, 2).reshape(b, self.embed_dim, hs, ws)
 
