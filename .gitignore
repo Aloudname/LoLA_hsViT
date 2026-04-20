@@ -4,9 +4,10 @@ __pycache__/
 *$py.class
 
 # ignore Directory
-output/
+outputs/
 .github/
 .vscode/
+synthetic_data
 
 # test file
 state.md

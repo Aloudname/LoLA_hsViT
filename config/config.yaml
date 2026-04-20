@@ -1,145 +1,90 @@
-# configuration of model hyperparams in training.py
-augment:
-  augment_train: true     # if enable aug on train.
-  spatial:
-    spatial_prob: 0.5     # Comparison factor with random.
-    rotate_prob: 0.35     # likewise.
-    cutout_prob: 0.05     # likewise.
-    cutout_ratio: 0.15    # Area ratio in a cutout sample.
-  spectral:
-    scale_prob: 0.2       # likewise.
-    noise_prob: 0.2       # likewise.
-    noise_std: 0.01       # std of gaussian blur.
-    band_drop_rate: 0.02  # p of drop a band.
-    band_jitter_prob: 0.2 # add a smooth to continuous bands.
-    band_jitter_width: 0.15
-
-common:
-  dataset:
-    name: 'placeholder'
-  optim:
-    lr: 0.00005             # Reduced from 1e-4 to slow down early convergence
-    weight_decay: 0.15      # Increased from 0.10 for stronger L2 regularization
-    warmup_epochs: 5        # Longer warmup (was 2) — gradual ramp prevents early memorization
-    grad_clip: 0.5          # mixed precision settings
-    gradient_accumulation_steps: 2
-    scheduler:
-      T_0: 10               # Longer warm restart period (was 5) — slower LR decay
-      T_mult: 2
-      eta_min: 0.000005     # Lower floor LR
-  loss:
-    focal_gamma: 2.0        # Focal Loss focusing parameter (0 = CE, higher = more focus on hard samples)
-    dice_weight: 0.20       # Composite loss: soft Dice term weight
-    boundary_weight: 0.20   # Composite loss: boundary CE term weight
-    boundary_dilation: 1    # Boundary mask dilation radius for boundary term
-    label_smoothing: 0.1    # Label smoothing to prevent overconfident predictions
-  train:
-    use_amp: true           # Enable mixed precision (will auto-disable on CPU)
-    eval_interval: 10        # Evaluate every x epoch
-    patience: 25            # Slightly more patience to let slower LR explore
-    max_train_batches_per_epoch: 1280  # 0 -> full batch in a epoch
-  eval:
-    vis_samples: 4          # Number of samples to visualize in final eval
-    early_stop_metric: eval  # evaluation-class-only
-    exclude_class0_in_metrics: true  # Compute metrics/plots on foreground classes only
-    use_batch_cap: true     # true -> sample a subset of eval_loader each epoch
-    max_val_batches_per_epoch: 256  # 0 -> full eval_loader, >0 -> capped batches per eval
-    fixed_batch_cap: false  # false -> random stratified sampling each eval
-    sample_seed: 350234     # base seed used when fixed_batch_cap=false
-    boundary_band_dilation: 2
-  checkpoint:
-    save_topk_models: 3
-  class_weight:
-    max_sample_patches: 10000   # 0 -> counts all train patches
-    max_sample_pixels: 5000000  # 0 -> no sampling inside patches
-    sample_seed: 350234
-  cv:
-    folds: 1                # Default number of folds for cross-validation (0 = disabled)
-
-lora:
-  lora_dropout: 0.1
-  lora_rank: 16
-  lora_alpha: 32
-  merge_lora_for_inference: false
-
-split:
-  seed: 350234  # Patient-level split random seed; vary it for robust multi-seed evaluation.
-  ratio:
-    # Split ratios for patient-level split-first pipeline.
-    train: 0.8
-    val: 0.18
-    test: 0.02
-    legacy:
-      # For compatibility, analyzer/cv still reads these keys.
-      test_rate: 0.1
-      val_rate: 0.1
-  cv:
-    n_folds: 5  # Number of folds for cross-validation (0 = disabled, use hold-out)
-  patch:
-    size: 47  # 47, Pixel size of image patches.
-  batch:
-    train_batch_size: 128  # 1024, This refers to the size on a single GPU.
-    eval_batch_size: 128   # 1024, Smaller eval batch size for CPU training
-    samples_per_step: 8  # 8, Number of samples stacked per iteration; each sample contributes all its patches.
-    target_patches_per_step: 128  # 128, Total patch target per optimization step (global across GPUs in cached mode).
-    max_patches_per_sample_chunk: 0  # 0 => auto derive from target_patches_per_step and memory budget.
-  sampler:
-    mode: hsi_adaptive  # fixed | adaptive | hsi_adaptive
-    mix:
-      fg: 0.10        # FG vs boundary relative mix (renormalized, no BG pool)
-      boundary: 0.05  # FG vs boundary relative mix (renormalized, no BG pool)
-    target_mix:
-      fg: 0.10        # Adaptive target for FG mix (renormalized with boundary)
-      boundary: 0.05  # Adaptive target for boundary mix
-    adaptive:
-      momentum: 0.9
-      diversity_strength: 0.75  # Group-diversity penalty strength for hsi_adaptive
-    fg_constraints:
-      ratio_min: 0.08
-      ratio_max: 0.10
-      inverse_pow: 1.0
-      min_per_class: 8
-      min_centers_per_patient: 100
-    boundary:
-      min_centers_per_patient: 10
-      sampling_dilation: 1
-      include_fg_edges: true
-
-preprocess:
-  # Cache/split pipeline controls
-  enable_split_cache_pipeline: true # true
-  force_rebuild_split_cache: false
-  split_preprocess_workers: 4
-
-  # Train-only fitting controls
-  pca_components: 8  # Number of PCA components to retain.
-  max_fit_samples: 2000000
-  max_pca_samples: 2000000
-
-memory:
-  pin_memory: true  # true is faster but may cause memoleak in distant server.
-  num_workers: 4  # Workers on single GPU. More memory usage to accelerate data loading.
-  parallel_gpu: 4  # Number of parallel GPU device. This influence many worker params.
-  prefetch_factor: 4  # Prefetch batches to speed up training.
-  cached_loader_num_workers: 4
-  cached_loader_prefetch_factor: 2
-  cached_loader_persistent_workers: true
-  cached_loader_patch_budget_mb: 1024
-  benchmark: true  # Fixed input shape; enabling cuDNN benchmark improves kernel selection.
+# central configuration for the refactored segmentation pipeline.
 
 path:
-  data: /data/chenhaoran/bishe/fisher
-  label: /data/chenhaoran/bishe/fisher
-  output: /home/chenhaoran/LoLA_hsViT/output
+  hsi_dir: "./data/fisher" # used in pipeline.dataset._discover_hsi_samples to locate hsi .npy files.
+  label_dir: "./data/fisher" # used in pipeline.dataset._discover_hsi_samples to locate *_gt.npy files.
+  rgb_dir: "./data/rgb" # used in pipeline.dataset._discover_hsi_samples to locate rgb comparison images.
+  output_dir: "./outputs" # used in pipeline.core.Pipeline to create timestamped experiment folders.
 
-# hereby only declares front targets, except BG.
-clsf:
-  num: 3
-  targets:
-    - 'PG'   # ⭐Parathyroid gland
-    - 'Tra'  # Trachea (boundary hard example for PG)
-    - 'TG'   # ⭐Thyroid gland
-  label_remap: [1, 2, 3]  # raw(PG/Tra/TG) -> remap(PG/Tra/TG)
-  strict_label_remap: true
-  unknown_label_policy: error  # error | map_to_class0
+data:
+  num_classes: 4 # used in dataset/analyzer/trainer for segmentation label space.
+  class_names: ["background", "parathyroid", "trachea", "thyroid"] # used in analyzer and visualize for reports.
+  hsi_bands: 96 # used in dataset synthetic generation and hsi input checks.
+  patch_size: 63 # used in pipeline.dataset._iter_patch_positions.
+  stride: 32 # used in pipeline.dataset._iter_patch_positions.
+  foreground_ratio_threshold: 0.03 # used in pipeline.dataset._should_keep_patch.
+  track_sample_ratio: 0.30 # used in pipeline.dataset._compute_tracking_stats.
+  split:
+    train: 0.70 # used in pipeline.dataset._split_subjects.
+    eval: 0.15 # used in pipeline.dataset._split_subjects.
+    test: 0.15 # used in pipeline.dataset._split_subjects.
+    seed: 3407 # used in pipeline.dataset and pipeline.core for deterministic behavior.
+  preprocess:
+    mode: "none" # used in pipeline.dataset.SpectralReducer; options: none, supervised_pca, lda_pca.
+    output_dim: 32 # used in spectral reducer and hsi model input channels for method b.
+    max_fit_pixels: 250000 # used in reducer fit sampling budget.
 
+augment:
+  enable_train_aug: true # used in pipeline.dataset.BasePatchDataset.__getitem__.
+  flip_prob: 0.10 # used in pipeline.dataset._apply_augment.
+  rotate_prob: 0.10 # used in pipeline.dataset._apply_augment.
+  noise_prob: 0.10 # used in pipeline.dataset._apply_augment.
+  noise_std: 0.01 # used in pipeline.dataset._apply_augment.
+  spectral_shift_prob: 0.10 # used in pipeline.dataset._apply_augment.
+  spectral_shift_std: 0.01 # used in pipeline.dataset._apply_augment.
+  band_drop_prob: 0.02 # used in pipeline.dataset._apply_augment.
+
+model:
+  family: "hsi_adapter" # used in pipeline.core._build_model.
+  spectral_dim: 32 # used in model.hsi_adapter.HSIAdapter.
+  embed_dim: 128 # used in all model backbones.
+  depth: 4 # used in transformer encoder depth.
+  num_heads: 4 # used in multi-head attention layers.
+  mlp_ratio: 4.0 # used in transformer feed-forward width.
+  decoder_dim: 96 # used in decoder channels.
+  dropout: 0.10 # used in backbone and decoder.
+  freeze_backbone: true # used in model constructors for overfitting control.
+
+train:
+  epochs: 10 # used in pipeline.trainer.Trainer.fit.
+  batch_size: 8 # used in train dataloader.
+  eval_batch_size: 8 # used in eval/test dataloaders.
+  num_workers: 0 # used in dataloader worker setup.
+  lr: 0.0003 # used in optimizer construction.
+  weight_decay: 0.0001 # used in optimizer construction.
+  grad_clip: 1.0 # used in trainer backward step.
+  grad_accum_steps: 1 # used in trainer gradient accumulation.
+  amp: false # used in trainer mixed precision switch.
+  ema_decay: 0.999 # used in trainer ema update.
+  max_train_steps_per_epoch: 0 # used in trainer to optionally cap train steps.
+  max_eval_steps: 0 # used in trainer to optionally cap eval steps.
+
+loss:
+  dice_weight: 0.40 # used in composite segmentation loss.
+  focal_weight: 0.40 # used in composite segmentation loss.
+  tversky_weight: 0.20 # used in composite segmentation loss.
+  focal_gamma: 2.0 # used in focal loss.
+  tversky_alpha: 0.70 # used in tversky loss.
+  tversky_beta: 0.30 # used in tversky loss.
+  class_weights: [0.20, 3.00, 1.50, 1.20] # used in focal/cross-entropy weighting.
+
+runtime:
+  seed: 3407 # used in pipeline.core._seed_everything.
+  device: "auto" # used in pipeline.trainer device selection.
+  save_top_k: 1 # used in trainer checkpoint policy.
+
+visualization:
+  num_seg_examples: 3 # used in pipeline.visualize.show_segmentation.
+  tsne_max_points: 3000 # used in pipeline.visualize.plot_tsne.
+  spectral_max_points_per_class: 2000 # used in pipeline.visualize.plot_spectral.
+
+export:
+  export_onnx: true # used in pipeline.core.Pipeline._export_onnx.
+  onnx_opset: 17 # used in torch.onnx.export.
+
+experiments:
+  default_models: # used in run.py when --models is omitted.
+    - "hsi_adapter_learnable"
+    - "hsi_adapter_lda"
+    - "rgb_vit"
+    - "unet"

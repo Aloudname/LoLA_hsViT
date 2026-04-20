@@ -1,32 +1,33 @@
-from pipeline.dataset import (AbstractHSDataset,
-                              MatHSDataset, NpyHSDataset, RGBDataset,
-                              HSPreprocessor)
-from pipeline.trainer import hsTrainer
-from pipeline.monitor import (monitor, tprint, _managed_pool)
-from pipeline.analyzer import (DatasetAnalyzer, analyze_dataset)
-from pipeline.core import (TrainPipeline, TrainResult, 
-                           CVResult, ModelFactory)
+from pipeline.analyzer import Analyzer, MetricsBundle
+from pipeline.core import Pipeline, PipelineResult
+from pipeline.dataset import (RGBDataset, NpyHSIDataset,
+                              generate_synthetic_dataset,
+                              build_dataloaders, prepare_data)
+from pipeline.monitor import (Monitor, _managed_pool,
+                              monitor, tprint)
+from pipeline.trainer import Trainer, TrainerResult
 from pipeline.visualize import Visualizer
 
 __all__ = [
-    'TrainPipeline',
-    'TrainResult',
-    'CVResult',
-    'ModelFactory',
+    "Analyzer",
+    "MetricsBundle",
     
-    'Visualizer',
+    "Pipeline",
+    "PipelineResult",
     
-    'AbstractHSDataset',
-    'MatHSDataset', 
-    'NpyHSDataset',
-    'RGBDataset',
-    'HSPreprocessor',
+    "NpyHSIDataset",
+    "RGBDataset",
+    "build_dataloaders",
+    "prepare_data",
+    "generate_synthetic_dataset",
     
-    'hsTrainer',
+    "Trainer",
+    "TrainerResult",
     
-    'monitor', 
-    'tprint',
-    'DatasetAnalyzer',
-    'analyze_dataset',
-    '_managed_pool',
+    "Visualizer",
+    
+    "Monitor",
+    "monitor",
+    "tprint",
+    "_managed_pool",
 ]
