@@ -19,6 +19,27 @@ Dependencies:
 """
 
 import os, time, psutil, argparse, platform
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Enhanced system monitor with:
+- Configurable refresh rate
+- CLI flag to enable/disable logging (state_true style)
+- Smooth CPU usage (EMA)
+- Aggregated memory & multi-GPU VRAM
+- Colored progress bars (green/yellow/red thresholds)
+- Clean, structured terminal UI (auto clear)
+
+Usage:
+    python monitor.py --interval 1.0 --log
+    python monitor.py --interval 0.5        # no log
+
+Dependencies:
+    pip install psutil pynvml
+"""
+
+import os, time, psutil, argparse, platform
 from datetime import datetime
 
 # Optional NVML (multi-GPU)
