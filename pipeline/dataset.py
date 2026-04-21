@@ -15,7 +15,7 @@ from munch import Munch
 from sklearn.decomposition import PCA
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from torch.utils.data import DataLoader, Dataset
-from tqdm.rich import tqdm
+from tqdm import tqdm
 from tqdm import TqdmExperimentalWarning
 
 from pipeline.monitor import tprint

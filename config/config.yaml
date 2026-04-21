@@ -16,10 +16,10 @@ data:
   foreground_ratio_threshold: 0.10 # used in pipeline.dataset._should_keep_patch.
   track_sample_ratio: 0.30 # used in pipeline.dataset._compute_tracking_stats.
   sampling:
-    train_fg_ratio_threshold: 0.05 # used in pipeline.dataset.prepare_data for stricter train patch keep threshold.
-    train_max_background_ratio: 0.92 # used in pipeline.dataset._should_keep_patch to suppress overly background-dominant train patches.
-    train_parathyroid_repeat: 3 # used in pipeline.dataset._build_patch_records to oversample class-1 train patches.
-    parathyroid_class: 1 # used in pipeline.dataset sampling rules for small-target emphasis.
+    train_fg_ratio_threshold: 0.03 # used in pipeline.dataset.prepare_data for stricter train patch keep threshold.
+    train_max_background_ratio: 0.95 # used in pipeline.dataset._should_keep_patch to suppress overly background-dominant train patches.
+    train_precious_repeat: 3 # used in pipeline.dataset._build_patch_records to oversample class-1 train patches.
+    precious_class: 1 # used in pipeline.dataset sampling rules for small-target emphasis.
   split:
     train: 0.80 # used in pipeline.dataset._split_subjects.
     eval: 0.18 # used in pipeline.dataset._split_subjects.
@@ -50,7 +50,6 @@ model:
   use_pretrained: true # always enable. used in model.backbones.builder; true enables timm ViT blocks.
   pretrained_weights: true # used in timm.create_model(pretrained=...).
   backbone_name: "vit_small_patch16_224" # used in model.backbones.builder when use_pretrained=true.
-  unfreeze_last_n: 0 # used in pipeline.trainer.set_trainable_layers.
   spectral_dim: 32 # used in model.hsi_adapter.HSIAdapter.
   embed_dim: 128 # used in all model backbones.
   depth: 4 # used in transformer encoder depth.
@@ -59,13 +58,14 @@ model:
   decoder_dim: 96 # used in decoder channels.
   dropout: 0.05 # used in backbone and decoder.
   freeze_backbone: true # used in model constructors for overfitting control.
+  unfreeze_last_n: 0 # used in pipeline.trainer.set_trainable_layers.
   base_channels: 32 # used only in unet. embed_dim // 4.
 
 train:
   epochs: 10 # used in pipeline.trainer.Trainer.fit.
-  batch_size: 256 # used in train dataloader.
-  eval_batch_size: 256 # used in eval/test dataloaders.
-  num_workers: 4 # used in dataloader worker setup.
+  batch_size: 128 # used in train dataloader.
+  eval_batch_size: 128 # used in eval/test dataloaders.
+  num_workers: 2 # used in dataloader worker setup.
   lr: 0.0003 # used in optimizer construction.
   weight_decay: 0.0001 # used in optimizer construction.
   grad_clip: 1.0 # used in trainer backward step.
@@ -82,7 +82,7 @@ loss:
   focal_gamma: 2.0 # used in focal loss.
   tversky_alpha: 0.70 # used in tversky loss.
   tversky_beta: 0.30 # used in tversky loss.
-  class_weights: [0.20, 3.00, 1.50, 1.20] # used in focal/cross-entropy weighting.
+  class_weights: [0.50, 3.00, 1.50, 1.20] # used in focal/cross-entropy weighting.
 
 runtime:
   seed: 350234 # used in pipeline.core._seed_everything.

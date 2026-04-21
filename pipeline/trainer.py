@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from munch import Munch
-from tqdm.rich import tqdm
+from tqdm import tqdm
 from tqdm import TqdmExperimentalWarning
 
 from pipeline.monitor import tprint
@@ -242,8 +242,8 @@ class Trainer:
 
             tprint(
                 f"epoch {epoch:03d}:\n"
-                f"\ttrain_loss = {train_loss:.4f}, eval_loss = {eval_loss:.4f}\t"
-                f"\ttrain_dice = {train_dice:.4f}, eval_dice = {eval_dice:.4f}\t"
+                f"\ttrain_loss = {train_loss:.4f}, eval_loss = {eval_loss:.4f}\n"
+                f"\ttrain_dice = {train_dice:.4f}, eval_dice = {eval_dice:.4f}\n"
             )
             tprint(
                 "epoch timing:\n"
