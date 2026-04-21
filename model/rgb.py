@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 # rgb vit baseline model for comparison experiments.
+from munch import Munch
 from typing import Any, Mapping
 
 import torch
@@ -21,17 +22,17 @@ class RGBViT(nn.Module):
       -> decoder (b, num_classes, h, w)
     """
 
-    def __init__(self, config: Mapping[str, Any]) -> None:
+    def __init__(self, config: Munch) -> None:
         super().__init__()
-        in_channels = int(config.get("in_channels", 3))
-        num_classes = int(config["num_classes"])
-        embed_dim = int(config.get("embed_dim", 128))
-        depth = int(config.get("depth", 4))
-        num_heads = int(config.get("num_heads", 4))
-        mlp_ratio = float(config.get("mlp_ratio", 4.0))
-        decoder_dim = int(config.get("decoder_dim", 96))
-        dropout = float(config.get("dropout", 0.1))
-        freeze_backbone = bool(config.get("freeze_backbone", False))
+        in_channels = 3
+        num_classes = int(config.data.get("num_classes"))
+        embed_dim = int(config.model.get("embed_dim", 128))
+        depth = int(config.model.get("depth", 4))
+        num_heads = int(config.model.get("num_heads", 4))
+        mlp_ratio = float(config.model.get("mlp_ratio", 4.0))
+        decoder_dim = int(config.model.get("decoder_dim", 96))
+        dropout = float(config.model.get("dropout", 0.1))
+        freeze_backbone = bool(config.model.get("freeze_backbone", False))
 
         self.in_channels = in_channels
         self.num_classes = num_classes

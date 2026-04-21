@@ -59,6 +59,7 @@ model:
   decoder_dim: 96 # used in decoder channels.
   dropout: 0.05 # used in backbone and decoder.
   freeze_backbone: true # used in model constructors for overfitting control.
+  base_channels: 32 # used only in unet. embed_dim // 4.
 
 train:
   epochs: 10 # used in pipeline.trainer.Trainer.fit.
@@ -100,7 +101,8 @@ export:
 
 experiments:
   default_models: # used in run.py when --models is omitted.
-    - "hsi_learn"
+    # too memory costy.
+    # - "hsi_learn"
     - "hsi_lda"
     - "rgb"
     - "unet"

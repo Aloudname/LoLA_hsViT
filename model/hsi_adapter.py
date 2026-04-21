@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 # hsi adapter model with spectral-spatial token fusion.
+from munch import Munch
 from typing import Any, Mapping, Optional
 
 import torch
@@ -83,7 +84,7 @@ class HSIAdapter(nn.Module):
       -> decoder + skip (b, num_classes, h, w)
     """
 
-    def __init__(self, config: Mapping[str, Any]) -> None:
+    def __init__(self, config: Munch) -> None:
         super().__init__()
         in_channels = int(config.data.preprocess.get("output_dim"))
         num_classes = int(config.data.get("num_classes"))
@@ -112,19 +113,7 @@ class HSIAdapter(nn.Module):
 
         self.fusion = CrossAttentionFusion(embed_dim=embed_dim, num_heads=num_heads, dropout=dropout)
 
-        backbone_cfg = {
-            "embed_dim": embed_dim,
-            "depth": depth,
-            "num_heads": num_heads,
-            "mlp_ratio": mlp_ratio,
-            "dropout": dropout,
-            "freeze_backbone": freeze_backbone,
-            "use_pretrained": bool(config.model.get("use_pretrained", False)),
-            "backbone_name": str(config.model.get("backbone_name", "vit_small_patch16_224")),
-            "pretrained_weights": bool(config.model.get("pretrained_weights", True)),
-            "pretrained_cache_dir": str(config.path.get("pretrained_cache_dir", "")),
-        }
-        self.backbone = build_backbone(backbone_cfg)
+        self.backbone = build_backbone(config)
 
         self.skip_proj = nn.Sequential(
             nn.Conv2d(spectral_dim, decoder_dim, kernel_size=1, bias=False),

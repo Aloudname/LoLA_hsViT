@@ -1,3 +1,3 @@
-from config.loader import load_config, merge_args, tprint
+from config.loader import load_config, _to_munch, merge_args, tprint
 
-__all__ = ["load_config", "merge_args", "tprint"]
+__all__ = ["load_config", "_to_munch", "merge_args", "tprint"]

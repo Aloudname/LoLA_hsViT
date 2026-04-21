@@ -20,9 +20,9 @@ from pipeline.monitor import tprint
 os.environ.setdefault("TORCH_DISABLE_DYNAMO", "1")
 
 
-def set_trainable_layers(model: nn.Module, config: Mapping[str, Any]) -> None:
+def set_trainable_layers(model: nn.Module, config: Munch) -> None:
     """Optionally unfreeze last N backbone blocks from trainer side."""
-    cfg = Munch.fromDict(dict(config))
+    cfg = config
     n = int(getattr(cfg.model, "unfreeze_last_n", 0))
     if n <= 0:
         return
@@ -47,9 +47,9 @@ def set_trainable_layers(model: nn.Module, config: Mapping[str, Any]) -> None:
 class CompositeSegLoss(nn.Module):
     """composite segmentation loss = dice + focal + tversky."""
 
-    def __init__(self, config: Mapping[str, Any], num_classes: int) -> None:
+    def __init__(self, config: Munch, num_classes: int) -> None:
         super().__init__()
-        cfg = Munch.fromDict(dict(config))
+        cfg = config
         self.num_classes = int(num_classes)
 
         self.dice_weight = float(cfg.loss.dice_weight)
@@ -143,9 +143,9 @@ class TrainerResult:
 class Trainer:
     """training loop manager with grad accumulation and ema."""
 
-    def __init__(self, model: nn.Module, config: Mapping[str, Any], output_dir: str) -> None:
+    def __init__(self, model: nn.Module, config: Munch, output_dir: str) -> None:
         self.model = model
-        self.config = Munch.fromDict(dict(config))
+        self.config = config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -184,15 +184,15 @@ class Trainer:
         total_params = int(sum(p.numel() for p in self.model.parameters()))
         trainable_params = int(sum(p.numel() for p in self.model.parameters() if p.requires_grad))
         tprint(
-            "trainer init: "
-            f"device={self.device} amp={self.use_amp} ema_decay={ema_decay} "
-            f"trainable_params={trainable_params} total_params={total_params}"
+            "trainer init:\n"
+            f"\tdevice={self.device} amp={self.use_amp} ema_decay={ema_decay}\n"
+            f"\ttrainable_params={trainable_params} total_params={total_params}\n"
         )
         tprint(
-            "optimizer: "
-            f"AdamW(lr={float(self.config.train.lr):.6g}, "
-            f"weight_decay={float(self.config.train.weight_decay):.6g}, "
-            f"grad_clip={self.grad_clip}, grad_accum_steps={self.grad_accum_steps})"
+            "optimizer:\n"
+            f"\tAdamW(lr={float(self.config.train.lr):.6g},\n"
+            f"\tweight_decay={float(self.config.train.weight_decay):.6g},\n"
+            f"\tgrad_clip={self.grad_clip}, grad_accum_steps={self.grad_accum_steps})"
         )
 
     def fit(self, train_loader, eval_loader, epochs: int) -> TrainerResult:
@@ -210,12 +210,15 @@ class Trainer:
         # Final deployment artifact is exported as ONNX by pipeline.core.
         best_ckpt = self.output_dir / ".cache" / "best_model.pt"
         best_ckpt.parent.mkdir(parents=True, exist_ok=True)
+        
+        # debug
+        # sample_batch = next(iter(train_loader))
 
         tprint(
-            "fit start: \n"
-            f"  epochs = {epochs} \n"
-            f"  train batches = {len(train_loader)} eval batches = {len(eval_loader)} \n"
-            f"  batch shape = {train_loader[0].shape}"
+            "fit start:\n"
+            f"\tepochs = {epochs}\n"
+            f"\ttrain batches = {len(train_loader)}, eval batches = {len(eval_loader)} \n"
+            # f"\tbatch shape = {sample_batch[0].shape}\n"
         )
 
         for epoch in range(1, epochs + 1):
@@ -229,9 +232,9 @@ class Trainer:
             history["eval_dice"].append(eval_dice)
 
             tprint(
-                f"epoch {epoch:03d}: "
-                f"train_loss={train_loss:.4f} eval_loss={eval_loss:.4f} "
-                f"train_dice={train_dice:.4f} eval_dice={eval_dice:.4f}"
+                f"epoch {epoch:03d}:\n"
+                f"\ttrain_loss = {train_loss:.4f}, eval_loss = {eval_loss:.4f}\t"
+                f"\ttrain_dice = {train_dice:.4f}, eval_dice = {eval_dice:.4f}\t"
             )
 
             if eval_dice > best_metric:

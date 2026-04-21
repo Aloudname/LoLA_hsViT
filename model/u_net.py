@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 # 2d unet baseline for segmentation comparison.
+from munch import Munch
 from typing import Any, Mapping
 
 import torch
@@ -40,11 +41,11 @@ class UNet(nn.Module):
       -> logits (b, num_classes, h, w)
     """
 
-    def __init__(self, config: Mapping[str, Any]) -> None:
+    def __init__(self, config: Munch) -> None:
         super().__init__()
-        in_channels = int(config["in_channels"])
-        num_classes = int(config["num_classes"])
-        base_channels = int(config.get("base_channels", 32))
+        in_channels = int(config.preprocess.get("output_dim"))
+        num_classes = int(config.data.get("num_classes"))
+        base_channels = int(config.model.get("base_channels", 32))
 
         self.enc1 = ConvBlock(in_channels, base_channels)
         self.enc2 = ConvBlock(base_channels, base_channels * 2)

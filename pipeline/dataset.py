@@ -158,6 +158,7 @@ class SpectralReducer:
             return
 
         x_fit, y_fit = self._collect_pixels(samples, num_classes, show_progress=show_progress)
+        tprint("x.shape = ", x_fit.shape, "y.shape = ", y_fit.shape)
         if x_fit.size == 0:
             raise RuntimeError("failed to collect fit pixels for spectral reducer")
 
@@ -516,33 +517,35 @@ def _build_cache_key(config: Munch, modality: str) -> str:
     return json.dumps(payload, sort_keys=True)
 
 
-def prepare_data(config: Mapping[str, Any], modality: str) -> PreparedData:
+def prepare_data(config: Munch, modality: str) -> PreparedData:
     """prepare split, patch records, and reducer once."""
-    cfg = _as_munch(config)
+    cfg = config
     modality = modality.lower()
     show_progress = bool(getattr(cfg.runtime, "progress_bar", True))
 
     tprint(
-        "prepare data start: "
-        f"modality={modality} "
-        f"paths(hsi={cfg.path.hsi_dir}, label={cfg.path.label_dir}, rgb={cfg.path.rgb_dir})"
+        "prepare data start:\n"
+        f"\tmodality={modality}\n"
+        f"\tpaths(hsi={cfg.path.hsi_dir}, label={cfg.path.label_dir}, rgb={cfg.path.rgb_dir})"
     )
 
     cache_key = _build_cache_key(cfg, modality)
     if cache_key in _PREPARED_CACHE:
-        tprint(f"prepare data cache hit: modality={modality}")
+        tprint(f"prepare data cache hit:\n"
+               f"\tmodality={modality}")
         return _PREPARED_CACHE[cache_key]
 
     all_samples = _discover_hsi_samples(cfg)
     unique_patients = len({s.patient_id for s in all_samples})
-    tprint(f"discovered samples: total={len(all_samples)} unique_patients={unique_patients}")
+    tprint(f"discovered samples:\n"
+           f"\ttotal={len(all_samples)}, unique_patients={unique_patients}")
 
     samples_by_split = _split_subjects(all_samples, cfg)
     tprint(
-        "subject split: "
-        f"train={len(samples_by_split['train'])} "
-        f"eval={len(samples_by_split['eval'])} "
-        f"test={len(samples_by_split['test'])}"
+        "subject split:\n"
+        f"\ttrain={len(samples_by_split['train'])}\n"
+        f"\teval={len(samples_by_split['eval'])}\n"
+        f"\ttest={len(samples_by_split['test'])}"
     )
 
     patch_size = int(cfg.data.patch_size)
@@ -567,8 +570,8 @@ def prepare_data(config: Mapping[str, Any], modality: str) -> PreparedData:
     )
     if modality == "hsi":
         tprint(
-            "spectral reducer: "
-            f"mode={reducer.mode} output_dim={reducer.output_dim} max_fit_pixels={reducer.max_fit_pixels}"
+            "spectral reducer:\n"
+            f"\tmode={reducer.mode}, output_dim={reducer.output_dim}, max_fit_pixels={reducer.max_fit_pixels}"
         )
         reducer.fit(samples_by_split["train"], num_classes=num_classes, show_progress=show_progress)
         tprint("spectral reducer fit done")
@@ -607,9 +610,9 @@ def prepare_data(config: Mapping[str, Any], modality: str) -> PreparedData:
         )
 
         tprint(
-            f"patch prep [{split_name}]: samples={len(split_samples)} "
-            f"patches={len(records)} tracked={len(tracked_ids)} "
-            f"policy(fg_thr={split_threshold:.3f}, bg_max={split_max_background_ratio:.3f}, repeat={split_parathyroid_repeat})"
+            f"patch prep [{split_name}]: samples={len(split_samples)}\n"
+            f"\tpatches={len(records)}, tracked={len(tracked_ids)}\n"
+            f"\tpolicy(fg_thr={split_threshold:.3f}, bg_max={split_max_background_ratio:.3f}, repeat={split_parathyroid_repeat})"
         )
 
         patches_by_split[split_name] = records
@@ -643,10 +646,10 @@ def prepare_data(config: Mapping[str, Any], modality: str) -> PreparedData:
 
     _PREPARED_CACHE[cache_key] = prepared
     tprint(
-        f"prepared {modality} data: "
-        f"train={len(patches_by_split['train'])} "
-        f"eval={len(patches_by_split['eval'])} "
-        f"test={len(patches_by_split['test'])} patches"
+        f"prepared {modality} data patches:\n"
+        f"\ttrain={len(patches_by_split['train'])}\n"
+        f"\teval={len(patches_by_split['eval'])}\n"
+        f"\ttest={len(patches_by_split['test'])}"
     )
     return prepared
 
@@ -656,13 +659,13 @@ class BasePatchDataset(Dataset):
 
     def __init__(
         self,
-        config: Mapping[str, Any],
+        config: Munch,
         split: str,
         modality: str,
         prepared: Optional[PreparedData] = None,
         training: bool = False,
     ) -> None:
-        self.config = _as_munch(config)
+        self.config = config
         self.split = split
         self.modality = modality
         self.training = bool(training)
@@ -767,13 +770,13 @@ class NpyHSIDataset(BasePatchDataset):
     """hsi dataset with strict subject split and patch filtering.
 
     input:
-        config(mapping): runtime config tree.
+        config(munch): runtime config tree.
         split(str): train/eval/test.
     output item:
         image tensor (c, h, w), mask tensor (h, w).
     """
 
-    def __init__(self, config: Mapping[str, Any], split: str = "train", prepared: Optional[PreparedData] = None):
+    def __init__(self, config: Munch, split: str = "train", prepared: Optional[PreparedData] = None):
         super().__init__(
             config=config,
             split=split,
@@ -786,7 +789,7 @@ class NpyHSIDataset(BasePatchDataset):
 class RGBDataset(BasePatchDataset):
     """rgb dataset using same masks and patch policy as hsi dataset."""
 
-    def __init__(self, config: Mapping[str, Any], split: str = "train", prepared: Optional[PreparedData] = None):
+    def __init__(self, config: Munch, split: str = "train", prepared: Optional[PreparedData] = None):
         super().__init__(
             config=config,
             split=split,
@@ -796,9 +799,9 @@ class RGBDataset(BasePatchDataset):
         )
 
 
-def build_dataloaders(config: Mapping[str, Any], modality: str) -> Tuple[Dict[str, DataLoader], PreparedData]:
+def build_dataloaders(config: Munch, modality: str) -> Tuple[Dict[str, DataLoader], PreparedData]:
     """build train/eval/test dataloaders for selected modality."""
-    cfg = _as_munch(config)
+    cfg = config
     prepared = prepare_data(cfg, modality=modality)
 
     if modality == "hsi":
@@ -821,10 +824,10 @@ def build_dataloaders(config: Mapping[str, Any], modality: str) -> Tuple[Dict[st
     }
 
     tprint(
-        f"dataloaders[{modality}]: "
-        f"train_samples={len(train_ds)} eval_samples={len(eval_ds)} test_samples={len(test_ds)} "
-        f"train_batches={len(loaders['train'])} eval_batches={len(loaders['eval'])} test_batches={len(loaders['test'])} "
-        f"batch_size(train/eval)={train_bs}/{eval_bs} workers={num_workers}"
+        f"dataloaders[{modality}]:\n"
+        f"\ttrain_samples={len(train_ds)}, eval_samples={len(eval_ds)}, test_samples={len(test_ds)}\n"
+        f"\ttrain_batches={len(loaders['train'])}, eval_batches={len(loaders['eval'])}, test_batches={len(loaders['test'])}\n"
+        f"\tbatch_size(train/eval)={train_bs}/{eval_bs}, workers={num_workers}\n"
     )
     return loaders, prepared
 
@@ -1064,10 +1067,10 @@ def generate_synthetic_dataset(
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
     tprint(
-        "synthetic dataset generated at: "
-        f"{root} (generator=synthetic_hard_v2, domain_shift_strength={domain_shift_strength}, "
-        f"noise_std={noise_std}, boundary_mix_sigma={boundary_mix_sigma}, "
-        f"label_noise_prob={label_noise_prob})"
+        "synthetic dataset generated at:\n"
+        f"\t{root} (generator=synthetic_hard_v2, domain_shift_strength={domain_shift_strength},\n"
+        f"\tnoise_std={noise_std}, boundary_mix_sigma={boundary_mix_sigma},\n"
+        f"\tlabel_noise_prob={label_noise_prob})"
     )
     return {
         "hsi_dir": str(fisher_dir),

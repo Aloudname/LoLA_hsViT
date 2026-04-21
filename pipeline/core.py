@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from munch import Munch
 
+from config import _to_munch
 from pipeline.monitor import tprint
 from pipeline.visualize import Visualizer
 from model import HSIAdapter, RGBViT, UNet
@@ -35,10 +36,13 @@ class PipelineResult:
 
 
 class Pipeline:
-    """main execution bus for data -> model -> trainer -> analyzer -> visualize."""
+    """
+    main execution bus for
+    ``data -> model -> trainer -> analyzer -> visualize``.
+    """
 
-    def __init__(self, config: Mapping[str, Any], model_key: str, experiment_name: Optional[str] = None) -> None:
-        self.config = Munch.fromDict(dict(config))
+    def __init__(self, config: Munch, model_key: str, experiment_name: Optional[str] = None) -> None:
+        self.config = config
         self.model_key = str(model_key)
 
         self._seed_everything(int(self.config.runtime.seed))
@@ -57,25 +61,26 @@ class Pipeline:
 
     def run(self) -> PipelineResult:
         """execute full training/eval/test workflow."""
-        tprint(f"pipeline start: model_key={self.model_key} output_dir={self.output_dir}")
+        tprint(f"pipeline start: \n"
+               f"\tmodel_key={self.model_key}, output_dir={self.output_dir}\n")
 
         modality = "rgb" if self.model_key == "rgb" else "hsi"
 
         stage_t0 = time.perf_counter()
         tprint(f"stage[data]: build dataloaders (modality={modality})")
         loaders, prepared = build_dataloaders(self.config, modality=modality)
-        tprint(f"stage[data] done in {time.perf_counter() - stage_t0:.2f}s")
+        tprint(f"stage[data] done in {time.perf_counter() - stage_t0:.2f}s\n")
 
         stage_t0 = time.perf_counter()
         in_channels = self._resolve_input_channels(modality)
         tprint(f"stage[model]: build model (in_channels={in_channels})")
         model = self._build_model(in_channels=in_channels)
-        tprint(f"stage[model] done in {time.perf_counter() - stage_t0:.2f}s")
+        tprint(f"stage[model] done in {time.perf_counter() - stage_t0:.2f}s\n")
 
         stage_t0 = time.perf_counter()
         tprint("stage[trainer]: init trainer")
         trainer = Trainer(model=model, config=self.config, output_dir=str(self.output_dir))
-        tprint(f"stage[trainer] done in {time.perf_counter() - stage_t0:.2f}s")
+        tprint(f"stage[trainer] done in {time.perf_counter() - stage_t0:.2f}s\n")
 
         stage_t0 = time.perf_counter()
         tprint("stage[train]: fit train/eval")
@@ -85,8 +90,8 @@ class Pipeline:
             epochs=int(self.config.train.epochs),
         )
         tprint(
-            f"stage[train] done in {time.perf_counter() - stage_t0:.2f}s "
-            f"(best_epoch={trainer_result.best_epoch}, best_eval_dice={trainer_result.best_metric:.4f})"
+            f"stage[train] done in {time.perf_counter() - stage_t0:.2f}s\n"
+            f"\t(best_epoch={trainer_result.best_epoch}, best_eval_dice={trainer_result.best_metric:.4f}\n)"
         )
 
         stage_t0 = time.perf_counter()
@@ -96,7 +101,7 @@ class Pipeline:
             keep_images=int(self.config.visualization.num_seg_examples),
             keep_features=int(self.config.visualization.tsne_max_points),
         )
-        tprint(f"stage[test] done in {time.perf_counter() - stage_t0:.2f}s")
+        tprint(f"stage[test] done in {time.perf_counter() - stage_t0:.2f}s\n")
 
         stage_t0 = time.perf_counter()
         tprint("stage[metrics]: compute analyzer metrics")
@@ -121,10 +126,10 @@ class Pipeline:
         stage_t0 = time.perf_counter()
         tprint("stage[export]: export onnx")
         onnx_path = self._export_onnx(trainer, in_channels=in_channels)
-        tprint(f"stage[export] done in {time.perf_counter() - stage_t0:.2f}s")
+        tprint(f"stage[export] done in {time.perf_counter() - stage_t0:.2f}s\n")
         onnx_note_path = str(Path(onnx_path).with_name("best_model_info.txt")) if onnx_path else None
 
-        tprint(f"pipeline done: model_key={self.model_key} output_dir={self.output_dir}")
+        tprint(f"pipeline done: model_key={self.model_key}, output_dir={self.output_dir}\n")
 
         return PipelineResult(
             model_key=self.model_key,
@@ -139,49 +144,23 @@ class Pipeline:
 
     def _build_model(self, in_channels: int) -> torch.nn.Module:
         """build model instance from model_key."""
-        common_cfg = {
-            "in_channels": in_channels,
-            "num_classes": int(self.config.data.num_classes),
-            "spectral_dim": int(self.config.model.spectral_dim),
-            "embed_dim": int(self.config.model.embed_dim),
-            "depth": int(self.config.model.depth),
-            "num_heads": int(self.config.model.num_heads),
-            "mlp_ratio": float(self.config.model.mlp_ratio),
-            "decoder_dim": int(self.config.model.decoder_dim),
-            "dropout": float(self.config.model.dropout),
-            "freeze_backbone": bool(self.config.model.freeze_backbone),
-            "use_pretrained": bool(
-                getattr(self.config.model, "use_pretrained", getattr(self.config.model, "pretrained_backbone", False))
-            ),
-            "backbone_name": str(getattr(self.config.model, "backbone_name", "vit_small_patch16_224")),
-            "pretrained_weights": bool(
-                getattr(self.config.model, "pretrained_weights", getattr(self.config.model, "backbone_pretrained", True))
-            ),
-            "pretrained_cache_dir": str(getattr(self.config.path, "pretrained_cache_dir", "")),
-            "unfreeze_last_n": int(getattr(self.config.model, "unfreeze_last_n", 0)),
-        }
 
         tprint(
-            "model config: "
-            f"family={self.config.model.family} in_channels={in_channels} "
-            f"num_classes={int(self.config.data.num_classes)} "
-            f"embed_dim={int(self.config.model.embed_dim)} depth={int(self.config.model.depth)} "
-            f"heads={int(self.config.model.num_heads)} "
-            f"freeze_backbone={bool(self.config.model.freeze_backbone)} "
-            f"use_pretrained={common_cfg['use_pretrained']} pretrained_weights={common_cfg['pretrained_weights']}"
+            "model config: \n"
+            f"\tfamily={self.config.model.family}, in_channels={in_channels}\n"
+            f"\tnum_classes={int(self.config.data.num_classes)}\n"
+            f"\tembed_dim={int(self.config.model.embed_dim)}, depth={int(self.config.model.depth)}\n"
+            f"\theads={int(self.config.model.num_heads)}\n"
+            f"\tfreeze_backbone={bool(self.config.model.freeze_backbone)}\n"
+            f"\tuse_pretrained={self.config.model.use_pretrained}, pretrained_weights={self.config.model.pretrained_weights}\n"
         )
 
         if self.model_key.startswith("hsi"):
-            model = HSIAdapter(common_cfg)
+            model = HSIAdapter(self.config)
         elif self.model_key == "rgb":
-            model = RGBViT(common_cfg)
+            model = RGBViT(self.config)
         elif self.model_key == "unet":
-            unet_cfg = {
-                "in_channels": in_channels,
-                "num_classes": int(self.config.data.num_classes),
-                "base_channels": int(max(16, self.config.model.embed_dim // 4)),
-            }
-            model = UNet(unet_cfg)
+            model = UNet(self.config)
         else:
             raise ValueError(f"unknown model_key: {self.model_key}")
 
@@ -193,7 +172,8 @@ class Pipeline:
     def _resolve_input_channels(self, modality: str) -> int:
         """resolve input channels according to modality and preprocessing mode."""
         if modality == "rgb":
-            tprint("input channels resolved: modality=rgb channels=3")
+            tprint("input channels resolved:\n"
+                   "\tmodality = rgb, C = 3")
             return 3
 
         preprocess_mode = str(self.config.data.preprocess.mode).lower()
@@ -203,7 +183,8 @@ class Pipeline:
             channels = int(self.config.data.preprocess.output_dim)
 
         tprint(
-            f"input channels resolved: modality=hsi preprocess_mode={preprocess_mode} channels={channels}"
+            f"input channels resolved:\n"
+            f"\tmodality = hsi, preprocess_mode = {preprocess_mode}, reduced C = {channels}"
         )
         return channels
 
@@ -335,7 +316,7 @@ class Pipeline:
         note_path = onnx_dir / "best_model_info.txt"
 
         tprint(
-            "onnx export start: "
+            ".onnx export start: "
             f"path={onnx_path} opset={int(self.config.export.onnx_opset)} in_channels={in_channels}"
         )
 
@@ -445,7 +426,7 @@ class Pipeline:
 
         lines = [
             "Model Deployment Note",
-            "=====================",
+            "_____________________",
             f"model_key: {self.model_key}",
             f"model_family: {model_family}",
             f"backbone_name: {backbone_name}",

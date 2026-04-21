@@ -2,22 +2,21 @@
 from __future__ import annotations
 
 # unified entry point for refactored hsi segmentation experiments.
-import argparse
-import copy
-import io
-import json
-import sys
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
-from datetime import datetime
+from munch import Munch
 from pathlib import Path
+from datetime import datetime
 from typing import Any, Dict, List, Mapping
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 
-from config import load_config, merge_args, tprint
+import io, sys, copy, json, argparse
+
 from pipeline import Pipeline, generate_synthetic_dataset
+from config import load_config, _to_munch, merge_args, tprint
 
 
 VALID_MODELS = [
-    "hsi_learn",
+    # too memory costy
+    # "hsi_learn",
     "hsi_lda",
     "rgb",
     "unet",
@@ -97,7 +96,7 @@ def _parse_set_overrides(items: List[str]) -> Dict[str, Any]:
     return out
 
 
-def _apply_model_profile(config: Mapping[str, Any], model_key: str) -> Dict[str, Any]:
+def _apply_model_profile(config: Munch, model_key: str) -> Dict[str, Any]:
     """apply experiment-specific profile from design document."""
     base = config.toDict() if hasattr(config, "toDict") else dict(config)
     cfg = copy.deepcopy(base)
@@ -145,10 +144,10 @@ def main() -> None:
     config = merge_args(config, override_map)
 
     tprint(
-        "runtime config: "
-        f"seed={int(config.runtime.seed)} device={str(config.runtime.device)} "
-        f"epochs={int(config.train.epochs)} train_bs={int(config.train.batch_size)} eval_bs={int(config.train.eval_batch_size)} "
-        f"progress_bar={bool(getattr(config.runtime, 'progress_bar', True))}"
+        "runtime config:\n "
+        f"\tseed={int(config.runtime.seed)}, device={str(config.runtime.device)}\n"
+        f"\tepochs={int(config.train.epochs)}, train_bs={int(config.train.batch_size)}, eval_bs={int(config.train.eval_batch_size)}\n"
+        f"\tprogress_bar={bool(getattr(config.runtime, 'progress_bar', True))}\n"
     )
 
     output_root = Path(config.path.output_dir)
@@ -156,8 +155,8 @@ def main() -> None:
     run_log_path = output_root / "logs" / f"run_{run_stamp}.log"
 
     with _capture_console(run_log_path):
-        tprint(f"cli log file: {run_log_path}")
-        tprint(f"output root: {output_root}")
+        tprint(f"\tcli log file: {run_log_path}\n"
+               f"\toutput root: {output_root}\n")
 
         if args.generate_synthetic:
             synth_cfg = getattr(config.data, "synthetic", None)
@@ -168,11 +167,11 @@ def main() -> None:
 
             tprint(
                 "generate synthetic dataset: "
-                f"root={args.synthetic_root} subjects={int(args.synthetic_subjects)} "
-                f"samples_per_subject={int(args.synthetic_samples_per_subject)} "
-                f"image_size={int(args.synthetic_image_size)} "
-                f"domain_shift_strength={domain_shift_strength} noise_std={noise_std} "
-                f"boundary_mix_sigma={boundary_mix_sigma} label_noise_prob={label_noise_prob}"
+                f"  root={args.synthetic_root}, subjects={int(args.synthetic_subjects)} "
+                f"  samples_per_subject={int(args.synthetic_samples_per_subject)} "
+                f"  image_size={int(args.synthetic_image_size)} "
+                f"  domain_shift_strength={domain_shift_strength}, noise_std={noise_std} "
+                f"  boundary_mix_sigma={boundary_mix_sigma}, label_noise_prob={label_noise_prob}\n"
             )
             synth_paths = generate_synthetic_dataset(
                 root_dir=args.synthetic_root,
@@ -202,12 +201,14 @@ def main() -> None:
             tprint(f"[{idx}/{len(models)}] start model: {model_key}")
 
             run_cfg = _apply_model_profile(config, model_key)
-            tprint(
-                f"[{idx}/{len(models)}] profile: "
-                f"family={run_cfg['model']['family']} "
-                f"preprocess={run_cfg['data']['preprocess']['mode']} "
-                f"use_pretrained={bool(run_cfg['model'].get('use_pretrained', False))} "
-                f"pretrained_weights={bool(run_cfg['model'].get('pretrained_weights', True))}"
+            run_cfg = _to_munch(run_cfg)
+            
+            print(
+                f"[{idx}/{len(models)}] profile:\n"
+                f"\tfamily={run_cfg.model.family}\n"
+                f"\tpreprocess={run_cfg.data.preprocess.mode}\n"
+                f"\tuse_pretrained={bool(run_cfg.model.get('use_pretrained', False))}\n"
+                f"\tpretrained_weights={bool(run_cfg.model.get('pretrained_weights', True))}\n"
             )
             pipeline = Pipeline(run_cfg, model_key=model_key)
             result = pipeline.run()
@@ -226,8 +227,8 @@ def main() -> None:
             )
 
             tprint(
-                f"[{idx}/{len(models)}] done model: {model_key} | "
-                f"best_eval_dice={result.best_eval_dice:.4f}"
+                f"[{idx}/{len(models)}] done model: {model_key}\n"
+                f"  best_eval_dice={result.best_eval_dice:.4f}"
             )
 
         output_root.mkdir(parents=True, exist_ok=True)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from munch import Munch
 from typing import Any, Mapping
 
 from model.backbones.base import BaseBackbone
@@ -7,7 +8,7 @@ from model.backbones.transformer_scratch import TransformerBackbone
 from model.backbones.vit_timm import TimmViTBackbone
 
 
-def build_backbone(config: Mapping[str, Any]) -> BaseBackbone:
+def build_backbone(config: Munch) -> BaseBackbone:
     """Backbone factory.
 
     If use_pretrained=True, build a timm ViT wrapper.
@@ -17,17 +18,17 @@ def build_backbone(config: Mapping[str, Any]) -> BaseBackbone:
     behavior explicit and reproducible.
     """
 
-    embed_dim = int(config.get("embed_dim", 128))
-    depth = int(config.get("depth", 4))
-    num_heads = int(config.get("num_heads", 4))
-    mlp_ratio = float(config.get("mlp_ratio", 4.0))
-    dropout = float(config.get("dropout", 0.1))
-    freeze = bool(config.get("freeze_backbone", False))
+    embed_dim = int(config.model.get("embed_dim", 128))
+    depth = int(config.model.get("depth", 4))
+    num_heads = int(config.model.get("num_heads", 4))
+    mlp_ratio = float(config.model.get("mlp_ratio", 4.0))
+    dropout = float(config.model.get("dropout", 0.1))
+    freeze = bool(config.model.get("freeze_backbone", False))
 
-    use_pretrained = bool(config.get("use_pretrained", config.get("pretrained_backbone", False)))
-    backbone_name = str(config.get("backbone_name", "vit_small_patch16_224"))
-    pretrained_weights = bool(config.get("pretrained_weights", config.get("backbone_pretrained", True)))
-    pretrained_cache_dir = str(config.get("pretrained_cache_dir", "")).strip()
+    use_pretrained = bool(config.model.get("use_pretrained", False))
+    backbone_name = str(config.model.get("backbone_name", "vit_small_patch16_224"))
+    pretrained_weights = bool(config.model.get("pretrained_weights", True))
+    pretrained_cache_dir = str(config.path.get("pretrained_cache_dir", "")).strip()
 
     if use_pretrained:
         try:
