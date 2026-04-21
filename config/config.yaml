@@ -13,17 +13,17 @@ data:
   hsi_bands: 96 # used in dataset synthetic generation and hsi input checks.
   patch_size: 63 # used in pipeline.dataset._iter_patch_positions.
   stride: 32 # used in pipeline.dataset._iter_patch_positions.
-  foreground_ratio_threshold: 0.10 # used in pipeline.dataset._should_keep_patch.
+  foreground_ratio_threshold: 0.05 # used in pipeline.dataset._should_keep_patch.
   track_sample_ratio: 0.30 # used in pipeline.dataset._compute_tracking_stats.
   sampling:
-    train_fg_ratio_threshold: 0.03 # used in pipeline.dataset.prepare_data for stricter train patch keep threshold.
-    train_max_background_ratio: 0.95 # used in pipeline.dataset._should_keep_patch to suppress overly background-dominant train patches.
+    train_fg_ratio_threshold: 0.08 # used in pipeline.dataset.prepare_data for stricter train patch keep threshold.
+    train_max_background_ratio: 0.99 # used in pipeline.dataset._should_keep_patch to suppress overly background-dominant train patches.
     train_precious_repeat: 3 # used in pipeline.dataset._build_patch_records to oversample class-1 train patches.
     precious_class: 1 # used in pipeline.dataset sampling rules for small-target emphasis.
   split:
-    train: 0.80 # used in pipeline.dataset._split_subjects.
-    eval: 0.18 # used in pipeline.dataset._split_subjects.
-    test: 0.02 # used in pipeline.dataset._split_subjects.
+    train: 0.70 # used in pipeline.dataset._split_subjects.
+    eval: 0.20 # used in pipeline.dataset._split_subjects.
+    test: 0.10 # used in pipeline.dataset._split_subjects.
     seed: 350234 # used in pipeline.dataset and pipeline.core for deterministic behavior.
   preprocess:
     mode: "lda_pca" # used in pipeline.dataset.SpectralReducer; options: none, supervised_pca, lda_pca.
@@ -58,7 +58,7 @@ model:
   decoder_dim: 96 # used in decoder channels.
   dropout: 0.05 # used in backbone and decoder.
   freeze_backbone: true # used in model constructors for overfitting control.
-  unfreeze_last_n: 0 # used in pipeline.trainer.set_trainable_layers.
+  unfreeze_last_n: 1 # used in pipeline.trainer.set_trainable_layers.
   base_channels: 32 # used only in unet. embed_dim // 4.
 
 train:
@@ -79,10 +79,10 @@ loss:
   dice_weight: 0.40 # used in composite segmentation loss.
   focal_weight: 0.40 # used in composite segmentation loss.
   tversky_weight: 0.20 # used in composite segmentation loss.
-  focal_gamma: 2.0 # used in focal loss.
-  tversky_alpha: 0.70 # used in tversky loss.
-  tversky_beta: 0.30 # used in tversky loss.
-  class_weights: [0.50, 3.00, 1.50, 1.20] # used in focal/cross-entropy weighting.
+  focal_gamma: 1.5 # used in focal loss.
+  tversky_alpha: 0.85 # used in tversky loss.
+  tversky_beta: 0.15 # used in tversky loss.
+  class_weights: [1.00, 2.50, 1.50, 1.20] # used in focal/cross-entropy weighting.
 
 runtime:
   seed: 350234 # used in pipeline.core._seed_everything.

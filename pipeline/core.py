@@ -72,6 +72,11 @@ class Pipeline:
         tprint(f"stage[data] done in {time.perf_counter() - stage_t0:.2f}s\n")
 
         stage_t0 = time.perf_counter()
+        tprint("stage[data-viz]: dataset visualizations before training")
+        self._run_dataset_visualizations(prepared=prepared)
+        tprint(f"stage[data-viz] done in {time.perf_counter() - stage_t0:.2f}s\n")
+
+        stage_t0 = time.perf_counter()
         in_channels = self._resolve_input_channels(modality)
         tprint(f"stage[model]: build model (in_channels={in_channels})")
         model = self._build_model(in_channels=in_channels)
@@ -198,13 +203,6 @@ class Pipeline:
             "summary": bundle.summary,
             "per_class": bundle.per_class,
             "roc_auc": bundle.roc_auc,
-            "roc_curves": {
-                name: {
-                    "fpr": curves["fpr"].tolist(),
-                    "tpr": curves["tpr"].tolist(),
-                }
-                for name, curves in bundle.roc_curves.items()
-            },
             "confusion_matrix": cm,
             "best_epoch": int(trainer_result.best_epoch),
             "best_eval_dice": float(trainer_result.best_metric),
@@ -230,11 +228,10 @@ class Pipeline:
         """generate all required plots."""
         tprint("visualization: training curves")
         self.visualizer.plot_training_curves(trainer_result.history)
-        tprint("visualization: prf/confusion/roc/distribution")
+        tprint("visualization: prf/confusion/roc")
         self.visualizer.plot_prf(metrics_bundle)
         self.visualizer.plot_confusion_matrix(metrics_bundle)
         self.visualizer.plot_roc(metrics_bundle)
-        self.visualizer.plot_distribution(prepared.stats)
 
         tprint("visualization: segmentation samples")
         self.visualizer.show_segmentation(
@@ -252,6 +249,20 @@ class Pipeline:
             self.visualizer.plot_tsne(features=features, labels=labels, title=f"{self.model_key} feature tsne")
 
         if modality == "hsi":
+            spectra = self._collect_spectral_curves(pred_pack, max_points=int(self.config.visualization.spectral_max_points_per_class))
+            tprint(f"visualization: spectral curves classes={len(spectra)}")
+            self.visualizer.plot_spectral(spectra)
+
+        attention = pred_pack.get("attention_map")
+        tprint(f"visualization: attention map available={attention is not None}")
+        self.visualizer.plot_attention_map(attention)
+
+    def _run_dataset_visualizations(self, prepared: Any) -> None:
+        """generate dataset-only plots that do not depend on trained predictions."""
+        tprint("visualization: dataset class distribution")
+        self.visualizer.plot_distribution(prepared.stats)
+
+        if prepared.modality == "hsi":
             tprint("visualization: pca/lda comparison")
             pca_payload = self._collect_pca_lda_points(
                 prepared=prepared,
@@ -268,15 +279,6 @@ class Pipeline:
                     lda_dim=getattr(prepared.reducer, "lda_dim", None),
                     title=f"{self.model_key} PCA-LDA comparison",
                 )
-
-        if modality == "hsi":
-            spectra = self._collect_spectral_curves(pred_pack, max_points=int(self.config.visualization.spectral_max_points_per_class))
-            tprint(f"visualization: spectral curves classes={len(spectra)}")
-            self.visualizer.plot_spectral(spectra)
-
-        attention = pred_pack.get("attention_map")
-        tprint(f"visualization: attention map available={attention is not None}")
-        self.visualizer.plot_attention_map(attention)
 
     def _collect_pca_lda_points(self, prepared: Any, max_points: int) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """collect balanced pixels for PCA-LDA comparison plots."""
