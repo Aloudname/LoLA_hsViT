@@ -22,9 +22,7 @@ def _to_munch(obj: Any) -> Any:
         return obj
     if isinstance(obj, Mapping):
         return Munch({k: _to_munch(v) for k, v in obj.items()})
-    if isinstance(obj, list):
-        return [_to_munch(v) for v in obj]
-    return obj
+    return [_to_munch(v) for v in obj] if isinstance(obj, list) else obj
 
 
 def _set_nested(container: MutableMapping[str, Any], dotted_key: str, value: Any) -> None:

@@ -20,13 +20,38 @@ class SpectralEncoder(nn.Module):
     def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
         self.proj = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.Conv2d(in_channels, 64, 1),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.Conv2d(64, out_channels, 1),
             nn.BatchNorm2d(out_channels),
             nn.GELU(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(x)
+
+
+class SpectralSE(nn.Module):
+    """Squeeze-and-Excitation for spectral channels"""
+
+    def __init__(self, channels: int, reduction: int = 4) -> None:
+        super().__init__()
+        hidden = max(1, channels // reduction)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, hidden, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(hidden, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, _, _ = x.shape
+        y = self.pool(x).view(b, c)      # (b, c)
+        y = self.fc(y).view(b, c, 1, 1) # (b, c, 1, 1)
+        return x * y
 
 
 class CrossAttentionFusion(nn.Module):
@@ -103,6 +128,7 @@ class HSIAdapter(nn.Module):
         self.embed_dim = embed_dim
 
         self.spectral_encoder = SpectralEncoder(in_channels, spectral_dim)
+        self.spectral_se = SpectralSE(spectral_dim)
         self.spectral_token_proj = nn.Linear(spectral_dim, embed_dim)
 
         self.patch_embed = nn.Sequential(
@@ -147,6 +173,7 @@ class HSIAdapter(nn.Module):
             feature map (b, d, h/4, w/4)
         """
         spectral_map = self.spectral_encoder(x)
+        spectral_map = self.spectral_se(spectral_map)
         return self._forward_features_from_spectral(spectral_map)
 
     def _forward_features_from_spectral(self, spectral_map: torch.Tensor) -> torch.Tensor:
@@ -192,6 +219,8 @@ class HSIAdapter(nn.Module):
 
         h, w = x.shape[2], x.shape[3]
         spectral_map = self.spectral_encoder(x)
+        spectral_map = self.spectral_se(spectral_map)
+        
         skip = self.skip_proj(spectral_map)
 
         feat_map = self._forward_features_from_spectral(spectral_map)
@@ -199,5 +228,4 @@ class HSIAdapter(nn.Module):
         dec = F.interpolate(dec, size=(h, w), mode="bilinear", align_corners=False)
 
         fused = torch.cat([dec, skip], dim=1)
-        logits = self.seg_head(self.fuse_head(fused))
-        return logits
+        return self.seg_head(self.fuse_head(fused))

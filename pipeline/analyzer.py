@@ -31,7 +31,7 @@ class Analyzer:
         self.class_names = list(class_names)
         self.num_classes = len(self.class_names)
         self.ignore_index = ignore_index
-        self.small_target_class = int(small_target_class)
+        self.small_target_class = small_target_class
 
     def compute_metrics(
         self,
@@ -66,9 +66,8 @@ class Analyzer:
         class_range = list(range(self.num_classes))
         fg_range = [c for c in class_range if c != 0]
 
-        per_class: Dict[str, Dict[str, float]] = {}
-        for cls_idx, cls_name in enumerate(self.class_names):
-            per_class[cls_name] = {
+        per_class: Dict[str, Dict[str, float]] = {
+            cls_name: {
                 "precision": float(precision[cls_idx]),
                 "recall": float(recall[cls_idx]),
                 "f1": float(f1[cls_idx]),
@@ -77,7 +76,8 @@ class Analyzer:
                 "accuracy": float(acc[cls_idx]),
                 "support": int(cm.sum(axis=1)[cls_idx]),
             }
-
+            for cls_idx, cls_name in enumerate(self.class_names)
+        }
         summary = {
             "pixel_accuracy": float(tp.sum() / np.maximum(cm.sum(), 1.0)),
             "dice_mean": float(np.mean(dice[fg_range] if fg_range else dice)),

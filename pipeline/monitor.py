@@ -2,54 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-Enhanced system monitor with:
-- Configurable refresh rate
-- CLI flag to enable/disable logging (state_true style)
-- Smooth CPU usage (EMA)
-- Aggregated memory & multi-GPU VRAM
-- Colored progress bars (green/yellow/red thresholds)
-- Clean, structured terminal UI (auto clear)
-
 Usage:
-    python monitor.py --interval 1.0 --log
-    python monitor.py --interval 0.5        # no log
+    python monitor.py -i 1.0 -l     # with log
+    python monitor.py -i 0.5        # no log
 
 Dependencies:
     pip install psutil pynvml
 """
-
-import os, time, psutil, argparse, platform
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Enhanced system monitor with:
-- Configurable refresh rate
-- CLI flag to enable/disable logging (state_true style)
-- Smooth CPU usage (EMA)
-- Aggregated memory & multi-GPU VRAM
-- Colored progress bars (green/yellow/red thresholds)
-- Clean, structured terminal UI (auto clear)
-
-Usage:
-    python monitor.py --interval 1.0 --log
-    python monitor.py --interval 0.5        # no log
-
-Dependencies:
-    pip install psutil pynvml
-"""
-
-import os, time, psutil, argparse, platform
-from datetime import datetime
 
 # Optional NVML (multi-GPU)
+from datetime import datetime
+import os, time, psutil, pynvml, argparse, platform
+
+
 try:
-    import pynvml
     pynvml.nvmlInit()
     NVML_AVAILABLE = True
 except Exception:
     NVML_AVAILABLE = False
-
 
 def tprint(*args, **kwargs) -> None:
     """print logs with [hh:mm:ss] timestamp."""
@@ -90,7 +60,7 @@ class Monitor:
         return self.value
 
 
-def get_cpu_name():
+def get_cpu_name():  # sourcery skip: do-not-use-bare-except
     try:
         with open("/proc/cpuinfo") as f:
             for line in f:
@@ -169,7 +139,10 @@ def render(mem, cpu, gpus, cpu_name, gpu_name, gpu_count):
         total_vram = used_vram = vram_pct = avg_temp = avg_util = 0
 
     # Header
-    print(f"\033[93m{'System Monitor  |  '}\033[0m", f"\033[93m{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\033[0m")
+    print(
+        f"\033[93mSystem Monitor  |  \033[0m",
+        f"\033[93m{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\033[0m",
+    )
 
     # Memory
     print(f"\n[Memory & CPU: \033[95m{cpu_name}\033[0m")
@@ -195,10 +168,7 @@ def monitor():
     cpu_name = get_cpu_name()
     gpu_name, gpu_count = get_gpu_names_and_count()
 
-    log_file = None
-    if args.log:
-        log_file = open('monitor.log', 'a')
-
+    log_file = open('monitor.log', 'a') if args.log else None
     try:
         while True:
             mem = get_mem_info()

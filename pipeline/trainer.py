@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 # trainer for segmentation models with dice/focal/tversky losses.
 import copy
 import os
@@ -54,7 +55,7 @@ class CompositeSegLoss(nn.Module):
     def __init__(self, config: Munch, num_classes: int) -> None:
         super().__init__()
         cfg = config
-        self.num_classes = int(num_classes)
+        self.num_classes = num_classes
 
         self.dice_weight = float(cfg.loss.dice_weight)
         self.focal_weight = float(cfg.loss.focal_weight)
@@ -112,7 +113,7 @@ class ModelEMA:
     """exponential moving average model wrapper."""
 
     def __init__(self, model: nn.Module, decay: float) -> None:
-        self.decay = float(decay)
+        self.decay = decay
         self.ema_model = self._clone_model(model)
 
     def _clone_model(self, model: nn.Module) -> nn.Module:
@@ -164,9 +165,7 @@ class Trainer:
         set_trainable_layers(self.model, self.config)
         self.loss_fn = CompositeSegLoss(self.config, num_classes=int(self.config.data.num_classes)).to(self.device)
 
-        params = [p for p in self.model.parameters() if p.requires_grad]
-        if not params:
-            params = list(self.model.parameters())
+        params = [p for p in self.model.parameters() if p.requires_grad] or list(self.model.parameters())
         self.optimizer = torch.optim.AdamW(
             params,
             lr=float(self.config.train.lr),
@@ -214,7 +213,7 @@ class Trainer:
         # Final deployment artifact is exported as ONNX by pipeline.core.
         best_ckpt = self.output_dir / ".cache" / "best_model.pt"
         best_ckpt.parent.mkdir(parents=True, exist_ok=True)
-        
+
         # # debug
         # an iterable may cause unexpectedly long time cost.
         # sample_batch = next(iter(train_loader))
@@ -255,25 +254,19 @@ class Trainer:
             if eval_dice > best_metric:
                 best_metric = eval_dice
                 best_epoch = epoch
-                self.save_checkpoint(str(best_ckpt), epoch=epoch, metric=eval_dice)
-
+                self.save_checkpoint(str(best_ckpt), best_epoch=best_epoch, metric=best_metric)
         self.load_checkpoint(str(best_ckpt))
 
         # Clean temporary checkpoint so the run output is ONNX-oriented.
         if best_ckpt.exists():
-            try:
+            with contextlib.suppress(OSError):
                 best_ckpt.unlink()
-            except OSError:
-                pass
         if best_ckpt.parent.exists():
             try:
                 next(best_ckpt.parent.iterdir())
             except StopIteration:
-                try:
+                with contextlib.suppress(OSError):
                     best_ckpt.parent.rmdir()
-                except OSError:
-                    pass
-
         return TrainerResult(
             best_metric=best_metric,
             best_epoch=best_epoch,
@@ -284,9 +277,7 @@ class Trainer:
     @staticmethod
     def _planned_steps(dataloader, max_steps: int) -> Optional[int]:
         total = len(dataloader)
-        if max_steps > 0:
-            return min(total, max_steps)
-        return total
+        return min(total, max_steps) if max_steps > 0 else total
 
     def train_one_epoch(self, dataloader, epoch: int, total_epochs: int) -> Tuple[float, float, Dict[str, float]]:
         """run one train epoch and return loss/dice."""
@@ -326,16 +317,7 @@ class Trainer:
             self.scaler.scale(loss).backward()
 
             if step % self.grad_accum_steps == 0:
-                self.scaler.unscale_(self.optimizer)
-                if self.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                self.optimizer.zero_grad(set_to_none=True)
-
-                if self.ema is not None:
-                    self.ema.update(self.model)
-
+                self._unscale_optimizer()
             losses.append(float(loss.item() * self.grad_accum_steps))
             dice_scores.append(float(self._batch_dice(logits, masks)))
 
@@ -358,6 +340,19 @@ class Trainer:
             "total_s": float(total_s),
             "first_batch_s": float(first_batch_s if first_batch_s is not None else total_s),
         }
+
+    # TODO Rename this here and in `train_one_epoch`
+    def _unscale_optimizer(self):
+        """unscale gradients, optionally clip, step optimizer, and update ema."""
+        self.scaler.unscale_(self.optimizer)
+        if self.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.optimizer.zero_grad(set_to_none=True)
+
+        if self.ema is not None:
+            self.ema.update(self.model)
 
     @torch.no_grad()
     def validate(self, dataloader, phase: str, epoch: int, total_epochs: int) -> Tuple[float, float, Dict[str, float]]:
@@ -467,13 +462,13 @@ class Trainer:
             mask_np = masks.detach().cpu().numpy()
             prob_np = probs.detach().cpu().numpy()
 
-            pred_masks.extend([p for p in pred_np])
-            gt_masks.extend([m for m in mask_np])
-            prob_maps.extend([p for p in prob_np])
+            pred_masks.extend(list(pred_np))
+            gt_masks.extend(list(mask_np))
+            prob_maps.extend(list(prob_np))
 
             if len(image_samples) < keep_images:
                 remain = keep_images - len(image_samples)
-                image_samples.extend([arr for arr in images.detach().cpu().numpy()[:remain]])
+                image_samples.extend(list(images.detach().cpu().numpy()[:remain]))
 
             # collect feature vectors for tsne.
             if hasattr(model, "forward_features") and collected_features < keep_features:
@@ -519,8 +514,8 @@ class Trainer:
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
 
         payload = {
-            "epoch": int(epoch),
-            "metric": float(metric),
+            "epoch": epoch,
+            "metric": metric,
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
         }
@@ -550,6 +545,4 @@ class Trainer:
             dice = (2.0 * inter + 1e-6) / (den + 1e-6)
             dices.append(dice)
 
-        if not dices:
-            return 0.0
-        return float(torch.mean(torch.stack(dices)).item())
+        return float(torch.mean(torch.stack(dices)).item()) if dices else 0.0
