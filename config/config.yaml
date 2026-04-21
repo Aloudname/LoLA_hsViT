@@ -16,9 +16,9 @@ data:
   foreground_ratio_threshold: 0.05 # used in pipeline.dataset._should_keep_patch.
   track_sample_ratio: 0.30 # used in pipeline.dataset._compute_tracking_stats.
   sampling:
-    train_fg_ratio_threshold: 0.08 # used in pipeline.dataset.prepare_data for stricter train patch keep threshold.
-    train_max_background_ratio: 0.99 # used in pipeline.dataset._should_keep_patch to suppress overly background-dominant train patches.
-    train_precious_repeat: 3 # used in pipeline.dataset._build_patch_records to oversample class-1 train patches.
+    train_fg_ratio_threshold: 0.05 # used in pipeline.dataset.prepare_data for stricter train patch keep threshold.
+    train_max_background_ratio: 0.96 # used in pipeline.dataset._should_keep_patch to suppress overly background-dominant train patches.
+    train_precious_repeat: 5 # used in pipeline.dataset._build_patch_records to oversample class-1 train patches.
     precious_class: 1 # used in pipeline.dataset sampling rules for small-target emphasis.
   split:
     train: 0.70 # used in pipeline.dataset._split_subjects.
@@ -39,9 +39,9 @@ augment:
   enable_train_aug: true # used in pipeline.dataset.BasePatchDataset.__getitem__.
   flip_prob: 0.10 # used in pipeline.dataset._apply_augment.
   rotate_prob: 0.10 # used in pipeline.dataset._apply_augment.
-  noise_prob: 0.10 # used in pipeline.dataset._apply_augment.
+  noise_prob: 0.05 # used in pipeline.dataset._apply_augment.
   noise_std: 0.01 # used in pipeline.dataset._apply_augment.
-  spectral_shift_prob: 0.10 # used in pipeline.dataset._apply_augment.
+  spectral_shift_prob: 0.05 # used in pipeline.dataset._apply_augment.
   spectral_shift_std: 0.01 # used in pipeline.dataset._apply_augment.
   band_drop_prob: 0.02 # used in pipeline.dataset._apply_augment.
 
@@ -69,7 +69,7 @@ train:
   lr: 0.0003 # used in optimizer construction.
   weight_decay: 0.0001 # used in optimizer construction.
   grad_clip: 1.0 # used in trainer backward step.
-  grad_accum_steps: 1 # used in trainer gradient accumulation.
+  grad_accum_steps: 2 # used in trainer gradient accumulation.
   amp: true # used in trainer mixed precision switch.
   ema_decay: 0.999 # used in trainer ema update.
   max_train_steps_per_epoch: 0 # used in trainer to optionally cap train steps.
@@ -79,10 +79,10 @@ loss:
   dice_weight: 0.40 # used in composite segmentation loss.
   focal_weight: 0.40 # used in composite segmentation loss.
   tversky_weight: 0.20 # used in composite segmentation loss.
-  focal_gamma: 1.5 # used in focal loss.
+  focal_gamma: 2.0 # used in focal loss.
   tversky_alpha: 0.85 # used in tversky loss.
   tversky_beta: 0.15 # used in tversky loss.
-  class_weights: [1.00, 2.50, 1.50, 1.20] # used in focal/cross-entropy weighting.
+  class_weights: [1.00, 3.00, 1.50, 1.50] # used in focal/cross-entropy weighting.
 
 runtime:
   seed: 350234 # used in pipeline.core._seed_everything.
