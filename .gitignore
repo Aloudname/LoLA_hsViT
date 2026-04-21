@@ -12,7 +12,7 @@ pretrained/
 docs/
 
 # test file
-
+test.ipynb
 
 # C extensions
 *.so

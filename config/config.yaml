@@ -1,9 +1,9 @@
 # central configuration for the refactored segmentation pipeline.
 
 path:
-  hsi_dir: "./synthetic_data/fisher" # used in pipeline.dataset._discover_hsi_samples to locate hsi .npy files.
-  label_dir: "./synthetic_data/fisher" # used in pipeline.dataset._discover_hsi_samples to locate *_gt.npy files.
-  rgb_dir: "./synthetic_data/rgb" # used in pipeline.dataset._discover_hsi_samples to locate rgb comparison images.
+  hsi_dir: "/data/chenhaoran/bishe/fisher" # used in pipeline.dataset._discover_hsi_samples to locate hsi .npy files.
+  label_dir: "/data/chenhaoran/bishe/fisher" # used in pipeline.dataset._discover_hsi_samples to locate *_gt.npy files.
+  rgb_dir: "/data/chenhaoran/bishe/rgb" # used in pipeline.dataset._discover_hsi_samples to locate rgb comparison images.
   output_dir: "./outputs" # used in pipeline.core.Pipeline to create timestamped experiment folders.
   pretrained_cache_dir: "./pretrained" # used in model.backbones.vit_timm via timm.create_model(cache_dir=...); empty means default cache.
 
@@ -21,13 +21,13 @@ data:
     train_parathyroid_repeat: 3 # used in pipeline.dataset._build_patch_records to oversample class-1 train patches.
     parathyroid_class: 1 # used in pipeline.dataset sampling rules for small-target emphasis.
   split:
-    train: 0.70 # used in pipeline.dataset._split_subjects.
-    eval: 0.15 # used in pipeline.dataset._split_subjects.
-    test: 0.15 # used in pipeline.dataset._split_subjects.
-    seed: 3407 # used in pipeline.dataset and pipeline.core for deterministic behavior.
+    train: 0.80 # used in pipeline.dataset._split_subjects.
+    eval: 0.18 # used in pipeline.dataset._split_subjects.
+    test: 0.02 # used in pipeline.dataset._split_subjects.
+    seed: 350234 # used in pipeline.dataset and pipeline.core for deterministic behavior.
   preprocess:
     mode: "lda_pca" # used in pipeline.dataset.SpectralReducer; options: none, supervised_pca, lda_pca.
-    output_dim: 32 # used in spectral reducer and hsi model input channels for method b.
+    output_dim: 16 # used in spectral reducer and hsi model input channels for method b.
     max_fit_pixels: 500000 # used in reducer fit sampling budget.
   synthetic:
     domain_shift_strength: 0.08 # medium difficulty: patient/sample spectral domain shift close to clinical acquisition variability.
@@ -57,19 +57,19 @@ model:
   num_heads: 4 # used in multi-head attention layers.
   mlp_ratio: 4.0 # used in transformer feed-forward width.
   decoder_dim: 96 # used in decoder channels.
-  dropout: 0.10 # used in backbone and decoder.
+  dropout: 0.05 # used in backbone and decoder.
   freeze_backbone: true # used in model constructors for overfitting control.
 
 train:
   epochs: 10 # used in pipeline.trainer.Trainer.fit.
-  batch_size: 8 # used in train dataloader.
-  eval_batch_size: 8 # used in eval/test dataloaders.
-  num_workers: 0 # used in dataloader worker setup.
+  batch_size: 256 # used in train dataloader.
+  eval_batch_size: 256 # used in eval/test dataloaders.
+  num_workers: 4 # used in dataloader worker setup.
   lr: 0.0003 # used in optimizer construction.
   weight_decay: 0.0001 # used in optimizer construction.
   grad_clip: 1.0 # used in trainer backward step.
   grad_accum_steps: 1 # used in trainer gradient accumulation.
-  amp: false # used in trainer mixed precision switch.
+  amp: true # used in trainer mixed precision switch.
   ema_decay: 0.999 # used in trainer ema update.
   max_train_steps_per_epoch: 0 # used in trainer to optionally cap train steps.
   max_eval_steps: 0 # used in trainer to optionally cap eval steps.
@@ -90,7 +90,7 @@ runtime:
   save_top_k: 1 # used in trainer checkpoint policy.
 
 visualization:
-  num_seg_examples: 3 # used in pipeline.visualize.show_segmentation.
+  num_seg_examples: 4 # used in pipeline.visualize.show_segmentation.
   tsne_max_points: 3000 # used in pipeline.visualize.plot_tsne.
   spectral_max_points_per_class: 2000 # used in pipeline.visualize.plot_spectral.
 

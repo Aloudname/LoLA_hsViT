@@ -1,14 +1,15 @@
+# import models from timm through huggingface.
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 from model.backbones.base import BaseBackbone
+import os, torch, torch.nn as nn, torch.nn.functional as F
 
+
+# internal mirror
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 class TimmViTBackbone(BaseBackbone):
     """timm ViT block wrapper for token inputs [B, N, D].

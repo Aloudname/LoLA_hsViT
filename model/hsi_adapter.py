@@ -85,16 +85,16 @@ class HSIAdapter(nn.Module):
 
     def __init__(self, config: Mapping[str, Any]) -> None:
         super().__init__()
-        in_channels = int(config["in_channels"])
-        num_classes = int(config["num_classes"])
-        spectral_dim = int(config.get("spectral_dim", 32))
-        embed_dim = int(config.get("embed_dim", 128))
-        depth = int(config.get("depth", 4))
-        num_heads = int(config.get("num_heads", 4))
-        mlp_ratio = float(config.get("mlp_ratio", 4.0))
-        decoder_dim = int(config.get("decoder_dim", 96))
-        dropout = float(config.get("dropout", 0.1))
-        freeze_backbone = bool(config.get("freeze_backbone", True))
+        in_channels = int(config.data.preprocess.get("output_dim"))
+        num_classes = int(config.data.get("num_classes"))
+        spectral_dim = int(config.model.get("spectral_dim", 32))
+        embed_dim = int(config.model.get("embed_dim", 128))
+        depth = int(config.model.get("depth", 4))
+        num_heads = int(config.model.get("num_heads", 4))
+        mlp_ratio = float(config.model.get("mlp_ratio", 4.0))
+        decoder_dim = int(config.model.get("decoder_dim", 96))
+        dropout = float(config.model.get("dropout", 0.1))
+        freeze_backbone = bool(config.model.get("freeze_backbone", True))
 
         self.in_channels = in_channels
         self.num_classes = num_classes
@@ -119,10 +119,10 @@ class HSIAdapter(nn.Module):
             "mlp_ratio": mlp_ratio,
             "dropout": dropout,
             "freeze_backbone": freeze_backbone,
-            "use_pretrained": bool(config.get("use_pretrained", config.get("pretrained_backbone", False))),
-            "backbone_name": str(config.get("backbone_name", "vit_small_patch16_224")),
-            "pretrained_weights": bool(config.get("pretrained_weights", config.get("backbone_pretrained", True))),
-            "pretrained_cache_dir": str(config.get("pretrained_cache_dir", "")),
+            "use_pretrained": bool(config.model.get("use_pretrained", False)),
+            "backbone_name": str(config.model.get("backbone_name", "vit_small_patch16_224")),
+            "pretrained_weights": bool(config.model.get("pretrained_weights", True)),
+            "pretrained_cache_dir": str(config.path.get("pretrained_cache_dir", "")),
         }
         self.backbone = build_backbone(backbone_cfg)
 

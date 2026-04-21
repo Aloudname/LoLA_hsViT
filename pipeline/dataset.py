@@ -189,17 +189,18 @@ class SpectralReducer:
         """transform image channels.
 
         input:
-            image: (c, h, w).
+            image: (h, w, c).
         output:
-            transformed image: (c_new, h, w).
+            transformed image: (h, w, c_new).
         """
         if self.mode == "none":
             return image
         if not self.fitted:
             raise RuntimeError("spectral reducer must be fitted before transform")
 
-        c, h, w = image.shape
-        x = image.transpose(1, 2, 0).reshape(-1, c)
+        h, w, c = image.shape
+        x = image.reshape(-1, c)
+        print(image.shape, x.shape)
 
         parts: List[np.ndarray] = []
         if self.lda is not None:
@@ -246,9 +247,11 @@ class SpectralReducer:
             cube = np.load(sample.hsi_path).astype(np.float32)
             mask = np.load(sample.mask_path).astype(np.int64)
             cube, mask = _pad_to_patch(cube, mask, patch_size=1)
-            h, w = mask.shape
+            
+            # h, w also mask.shape
+            h, w, c = cube.shape
 
-            flat = cube.reshape(cube.shape[0], h * w).T
+            flat = cube.reshape(c, h * w).T
             y = mask.reshape(-1)
 
             for cls_idx in range(num_classes):
@@ -418,7 +421,7 @@ def _build_patch_records(
         raw_hist += _compute_hist(mask, num_classes)
 
         cube = np.load(sample.hsi_path, mmap_mode="r")
-        _, h, w = cube.shape
+        h, w, c = cube.shape
 
         if h < patch_size or w < patch_size:
             pad_h = max(0, patch_size - h)
@@ -695,7 +698,7 @@ class BasePatchDataset(Dataset):
         image, mask = self._load_sample(sample)
         image, mask = _pad_to_patch(image, mask, self.patch_size)
 
-        img_patch = image[:, rec.top : rec.top + self.patch_size, rec.left : rec.left + self.patch_size]
+        img_patch = image[ rec.top : rec.top + self.patch_size, rec.left : rec.left + self.patch_size, :]
         mask_patch = mask[rec.top : rec.top + self.patch_size, rec.left : rec.left + self.patch_size]
 
         if self.training and self.enable_train_aug:

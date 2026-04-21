@@ -212,10 +212,10 @@ class Trainer:
         best_ckpt.parent.mkdir(parents=True, exist_ok=True)
 
         tprint(
-            "fit start: "
-            f"epochs={epochs} "
-            f"train_batches={len(train_loader)} eval_batches={len(eval_loader)} "
-            f"max_train_steps={self.max_train_steps} max_eval_steps={self.max_eval_steps}"
+            "fit start: \n"
+            f"  epochs = {epochs} \n"
+            f"  train batches = {len(train_loader)} eval batches = {len(eval_loader)} \n"
+            f"  batch shape = {train_loader[0].shape}"
         )
 
         for epoch in range(1, epochs + 1):
