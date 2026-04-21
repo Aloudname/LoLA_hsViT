@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -120,7 +120,7 @@ class Pipeline:
 
         stage_t0 = time.perf_counter()
         tprint("stage[viz]: generate visualizations")
-        self._run_visualizations(metrics_bundle, trainer_result, pred_pack, prepared.stats, modality)
+        self._run_visualizations(metrics_bundle, trainer_result, pred_pack, prepared, modality)
         tprint(f"stage[viz] done in {time.perf_counter() - stage_t0:.2f}s")
 
         stage_t0 = time.perf_counter()
@@ -224,7 +224,7 @@ class Pipeline:
         metrics_bundle: MetricsBundle,
         trainer_result: TrainerResult,
         pred_pack: Mapping[str, Any],
-        split_stats: Mapping[str, Any],
+        prepared: Any,
         modality: str,
     ) -> None:
         """generate all required plots."""
@@ -234,7 +234,7 @@ class Pipeline:
         self.visualizer.plot_prf(metrics_bundle)
         self.visualizer.plot_confusion_matrix(metrics_bundle)
         self.visualizer.plot_roc(metrics_bundle)
-        self.visualizer.plot_distribution(split_stats)
+        self.visualizer.plot_distribution(prepared.stats)
 
         tprint("visualization: segmentation samples")
         self.visualizer.show_segmentation(
@@ -252,6 +252,24 @@ class Pipeline:
             self.visualizer.plot_tsne(features=features, labels=labels, title=f"{self.model_key} feature tsne")
 
         if modality == "hsi":
+            tprint("visualization: pca/lda comparison")
+            pca_payload = self._collect_pca_lda_points(
+                prepared=prepared,
+                max_points=int(self.config.visualization.tsne_max_points),
+            )
+            if pca_payload is not None:
+                pca_features, lda_features, pca_labels = pca_payload
+                self.visualizer.plot_pca_lda_comparison(
+                    pca_features=pca_features,
+                    lda_features=lda_features,
+                    labels=pca_labels,
+                    explained_variance_ratio=getattr(prepared.reducer.pca, "explained_variance_ratio_", None),
+                    pca_dim=getattr(prepared.reducer, "pca_dim", None),
+                    lda_dim=getattr(prepared.reducer, "lda_dim", None),
+                    title=f"{self.model_key} PCA-LDA comparison",
+                )
+
+        if modality == "hsi":
             spectra = self._collect_spectral_curves(pred_pack, max_points=int(self.config.visualization.spectral_max_points_per_class))
             tprint(f"visualization: spectral curves classes={len(spectra)}")
             self.visualizer.plot_spectral(spectra)
@@ -259,6 +277,63 @@ class Pipeline:
         attention = pred_pack.get("attention_map")
         tprint(f"visualization: attention map available={attention is not None}")
         self.visualizer.plot_attention_map(attention)
+
+    def _collect_pca_lda_points(self, prepared: Any, max_points: int) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """collect balanced pixels for PCA-LDA comparison plots."""
+        reducer = getattr(prepared, "reducer", None)
+        if reducer is None or getattr(reducer, "pca", None) is None or getattr(reducer, "lda", None) is None:
+            return None
+
+        samples = list(prepared.samples_by_split.get("train", []))
+        if not samples:
+            return None
+
+        num_classes = int(self.config.data.num_classes)
+        rng = np.random.default_rng(int(self.config.runtime.seed))
+        per_class_budget = max(32, int(max_points // max(1, num_classes)))
+        per_sample_budget = max(32, int(per_class_budget // max(1, len(samples) // 3 + 1)))
+
+        x_chunks: List[np.ndarray] = []
+        y_chunks: List[np.ndarray] = []
+
+        for sample in samples:
+            cube = np.load(sample.hsi_path).astype(np.float32)
+            mask = np.load(sample.mask_path).astype(np.int64)
+            if cube.ndim != 3 or mask.ndim != 2:
+                continue
+
+            h, w, c = cube.shape
+            flat = cube.reshape(-1, c)
+            labels = mask.reshape(-1)
+
+            for cls_idx in range(num_classes):
+                idx = np.where(labels == cls_idx)[0]
+                if idx.size == 0:
+                    continue
+                take = min(idx.size, per_sample_budget)
+                chosen = rng.choice(idx, size=take, replace=False)
+                x_chunks.append(flat[chosen])
+                y_chunks.append(np.full(take, cls_idx, dtype=np.int64))
+
+        if not x_chunks:
+            return None
+
+        x_raw = np.concatenate(x_chunks, axis=0).astype(np.float32)
+        y_raw = np.concatenate(y_chunks, axis=0).astype(np.int64)
+
+        if x_raw.shape[0] > max_points:
+            chosen = rng.choice(x_raw.shape[0], size=max_points, replace=False)
+            x_raw = x_raw[chosen]
+            y_raw = y_raw[chosen]
+
+        pca = reducer.pca
+        lda = reducer.lda
+        if pca is None or lda is None:
+            return None
+
+        x_pca = pca.transform(x_raw).astype(np.float32)
+        x_lda = lda.transform(x_pca).astype(np.float32)
+        return x_pca, x_lda, y_raw
 
     def _collect_spectral_curves(self, pred_pack: Mapping[str, Any], max_points: int) -> Dict[str, Any]:
         """estimate spectral mean/std from retained image samples and gt masks."""

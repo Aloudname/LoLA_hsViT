@@ -3,6 +3,7 @@ from __future__ import annotations
 # dataset and preprocessing pipeline for hsi/rgb segmentation.
 import json
 import shutil
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -14,9 +15,13 @@ from munch import Munch
 from sklearn.decomposition import PCA
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from torch.utils.data import DataLoader, Dataset
-from tqdm.auto import tqdm
+from tqdm.rich import tqdm
+from tqdm import TqdmExperimentalWarning
 
 from pipeline.monitor import tprint
+
+
+warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 
 
 @dataclass
@@ -94,7 +99,7 @@ def _pad_to_patch(image: np.ndarray, mask: np.ndarray, patch_size: int) -> Tuple
     if pad_h == 0 and pad_w == 0:
         return image, mask
 
-    image_pad = np.pad(image, ((0, 0), (0, pad_h), (0, pad_w)), mode="reflect")
+    image_pad = np.pad(image, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
     mask_pad = np.pad(mask, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=0)
     return image_pad, mask_pad
 
@@ -107,16 +112,16 @@ def _compute_hist(mask: np.ndarray, num_classes: int) -> np.ndarray:
 def _should_keep_patch(
     mask_patch: np.ndarray,
     foreground_ratio_threshold: float,
-    max_background_ratio: float = 1.0,
-    parathyroid_class: int = 1,
+    max_background_ratio: float = 0.9,
+    precious_class: int = 1,
 ) -> bool:
     """patch keep rule.
 
     keep when:
-    - parathyroid exists, or
+    - precious_class exists, or
     - foreground ratio >= threshold and background ratio <= max_background_ratio.
     """
-    has_small_target = bool(np.any(mask_patch == int(parathyroid_class)))
+    has_small_target = bool(np.any(mask_patch == int(precious_class)))
     fg_ratio = float(np.mean(mask_patch > 0))
     bg_ratio = float(np.mean(mask_patch == 0))
     if has_small_target:
@@ -132,7 +137,7 @@ class SpectralReducer:
     modes:
     - none: identity.
     - supervised_pca: pca on class-balanced train pixels.
-    - lda_pca: lda first, then pca padding to target dim.
+    - lda_pca: pca first, then lda on pca features.
     """
 
     def __init__(self, mode: str, output_dim: int, max_fit_pixels: int, seed: int) -> None:
@@ -143,7 +148,8 @@ class SpectralReducer:
 
         self.pca: Optional[PCA] = None
         self.lda: Optional[LinearDiscriminantAnalysis] = None
-        self.pca_tail: Optional[PCA] = None
+        self.pca_dim = 0
+        self.lda_dim = 0
         self.fitted = False
 
     def fit(self, samples: Sequence[SampleItem], num_classes: int, show_progress: bool = True) -> None:
@@ -158,29 +164,51 @@ class SpectralReducer:
             return
 
         x_fit, y_fit = self._collect_pixels(samples, num_classes, show_progress=show_progress)
-        tprint("x.shape = ", x_fit.shape, "y.shape = ", y_fit.shape)
+        
+        # debug
+        # tprint("x.shape = ", x_fit.shape, "y.shape = ", y_fit.shape)
+        tprint(f"Debugging before fitting reducer:\n"
+               f"\tx_fit.shape = {x_fit.shape}, \n\ty_fit.shape = {y_fit.shape}\n")
         if x_fit.size == 0:
             raise RuntimeError("failed to collect fit pixels for spectral reducer")
 
         if self.mode == "supervised_pca":
-            self.pca = PCA(n_components=min(self.output_dim, x_fit.shape[1]))
+            self.pca = PCA(n_components=min(self.output_dim, x_fit.shape[-1]))
             self.pca.fit(x_fit)
             self.fitted = True
             return
 
         if self.mode == "lda_pca":
-            lda_dim = int(min(max(1, len(np.unique(y_fit)) - 1), self.output_dim))
+            if self.output_dim <= 1:
+                tprint("Warning: output_dim <= 1, skipping LDA and fitting PCA with output_dim=1")
+                self.pca_dim = min(1, x_fit.shape[-1])
+                self.pca = PCA(n_components=self.pca_dim)
+                self.pca.fit(x_fit)
+                self.lda = None
+                self.lda_dim = 0
+                self.fitted = True
+                return
+            
+            lda_dim = int(min(max(1, len(np.unique(y_fit)) - 1), self.output_dim - 1))
+            pca_dim = int(min(self.output_dim - lda_dim, x_fit.shape[-1]))
+            pca_dim = max(1, pca_dim)
+            tprint(f"Fitting spectral reducer with:\n" 
+                   f"\tPCA dim = {pca_dim}\n", 
+                   f"\tLDA dim = {lda_dim}\n")
+
+            self.pca_dim = pca_dim
+            self.pca = PCA(n_components=self.pca_dim)
+            self.pca.fit(x_fit)
+
+            x_pca = self.pca.transform(x_fit)
             try:
+                lda_dim = int(min(lda_dim, x_pca.shape[-1]))
                 self.lda = LinearDiscriminantAnalysis(n_components=lda_dim)
-                self.lda.fit(x_fit, y_fit)
+                self.lda.fit(x_pca, y_fit)
+                self.lda_dim = lda_dim
             except Exception:
                 self.lda = None
-                lda_dim = 0
-
-            remain = self.output_dim - lda_dim
-            if remain > 0:
-                self.pca_tail = PCA(n_components=min(remain, x_fit.shape[1]))
-                self.pca_tail.fit(x_fit)
+                self.lda_dim = 0
             self.fitted = True
             return
 
@@ -201,15 +229,21 @@ class SpectralReducer:
 
         h, w, c = image.shape
         x = image.reshape(-1, c)
-        print(image.shape, x.shape)
+        
+        # debug
+        # print(image.shape, x.shape)
 
         parts: List[np.ndarray] = []
+        x_pca: Optional[np.ndarray] = None
         if self.lda is not None:
-            parts.append(self.lda.transform(x).astype(np.float32))
+            if self.pca is None:
+                raise RuntimeError("spectral reducer PCA stage is missing")
+            x_pca = self.pca.transform(x).astype(np.float32)
+            parts.append(x_pca)
+            parts.append(self.lda.transform(x_pca).astype(np.float32))
         if self.pca is not None:
-            parts.append(self.pca.transform(x).astype(np.float32))
-        if self.pca_tail is not None:
-            parts.append(self.pca_tail.transform(x).astype(np.float32))
+            if x_pca is None:
+                parts.append(self.pca.transform(x).astype(np.float32))
 
         if not parts:
             return image
@@ -221,6 +255,7 @@ class SpectralReducer:
         if y.shape[1] > self.output_dim:
             y = y[:, : self.output_dim]
 
+        # (h*w, c) -> (h, w, c) -> (c, h, w)
         return y.reshape(h, w, self.output_dim).transpose(2, 0, 1)
 
     def _collect_pixels(
@@ -245,14 +280,14 @@ class SpectralReducer:
         )
 
         for sample in sample_iter:
-            cube = np.load(sample.hsi_path).astype(np.float32)
+            cube = np.load(sample.hsi_path, mmap_mode="r")
             mask = np.load(sample.mask_path).astype(np.int64)
             cube, mask = _pad_to_patch(cube, mask, patch_size=1)
-            
+
             # h, w also mask.shape
             h, w, c = cube.shape
 
-            flat = cube.reshape(c, h * w).T
+            flat = cube.reshape(-1, c)
             y = mask.reshape(-1)
 
             for cls_idx in range(num_classes):
@@ -261,9 +296,9 @@ class SpectralReducer:
                     continue
                 take = min(idx.size, max(32, per_class_budget // max(1, len(samples))))
                 chosen = rng.choice(idx, size=take, replace=False)
-                x_by_class[cls_idx].append(flat[chosen])
+                x_by_class[cls_idx].append(np.asarray(flat[chosen], dtype=np.float32))
 
-            sample_iter.close()
+        sample_iter.close()
 
         x_parts: List[np.ndarray] = []
         y_parts: List[np.ndarray] = []
@@ -384,8 +419,8 @@ def _build_patch_records(
     split_name: str = "split",
     show_progress: bool = True,
     max_background_ratio: float = 1.0,
-    parathyroid_repeat: int = 1,
-    parathyroid_class: int = 1,
+    precious_repeat: int = 1,
+    precious_class: int = 1,
 ) -> Tuple[List[PatchRecord], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """build patch index list and class histograms.
 
@@ -404,8 +439,8 @@ def _build_patch_records(
     tracked_pre = np.zeros(num_classes, dtype=np.int64)
     tracked_post = np.zeros(num_classes, dtype=np.int64)
 
-    parathyroid_repeat = max(1, int(parathyroid_repeat))
-    parathyroid_class = int(parathyroid_class)
+    precious_repeat = max(1, int(precious_repeat))
+    precious_class = int(precious_class)
 
     sample_iter = tqdm(
         enumerate(samples),
@@ -421,8 +456,8 @@ def _build_patch_records(
         mask = np.load(sample.mask_path).astype(np.int64)
         raw_hist += _compute_hist(mask, num_classes)
 
-        cube = np.load(sample.hsi_path, mmap_mode="r")
-        h, w, c = cube.shape
+        # Patch indexing only needs spatial shape; avoid extra HSI file reads here.
+        h, w = mask.shape
 
         if h < patch_size or w < patch_size:
             pad_h = max(0, patch_size - h)
@@ -434,7 +469,7 @@ def _build_patch_records(
         for top, left in _iter_patch_positions(h, w, patch_size, stride):
             patch_mask = mask[top : top + patch_size, left : left + patch_size]
             patch_hist_once = _compute_hist(patch_mask, num_classes)
-            has_parathyroid = bool(np.any(patch_mask == parathyroid_class))
+            has_precious = bool(np.any(patch_mask == precious_class))
             if sample.sample_id in tracked_set:
                 tracked_pre += patch_hist_once
 
@@ -442,10 +477,10 @@ def _build_patch_records(
                 patch_mask,
                 foreground_ratio_threshold,
                 max_background_ratio=max_background_ratio,
-                parathyroid_class=parathyroid_class,
+                precious_class=precious_class,
             )
             if keep:
-                repeat_count = parathyroid_repeat if has_parathyroid else 1
+                repeat_count = precious_repeat if has_precious else 1
                 for _ in range(repeat_count):
                     records.append(PatchRecord(sample_index=sample_index, top=top, left=left))
                     patch_hist += patch_hist_once
@@ -458,8 +493,8 @@ def _build_patch_records(
             center_left = max(0, (w - patch_size) // 2)
             patch_mask = mask[center_top : center_top + patch_size, center_left : center_left + patch_size]
             patch_hist_once = _compute_hist(patch_mask, num_classes)
-            has_parathyroid = bool(np.any(patch_mask == parathyroid_class))
-            repeat_count = parathyroid_repeat if has_parathyroid else 1
+            has_precious = bool(np.any(patch_mask == precious_class))
+            repeat_count = precious_repeat if has_precious else 1
             for _ in range(repeat_count):
                 records.append(PatchRecord(sample_index=sample_index, top=center_top, left=center_left))
                 patch_hist += patch_hist_once
@@ -507,10 +542,10 @@ def _build_cache_key(config: Munch, modality: str) -> str:
             "train_max_background_ratio": float(
                 getattr(sampling_cfg, "train_max_background_ratio", 1.0)
             ),
-            "train_parathyroid_repeat": int(
-                getattr(sampling_cfg, "train_parathyroid_repeat", 1)
+            "train_precious_repeat": int(
+                getattr(sampling_cfg, "train_precious_repeat", 1)
             ),
-            "parathyroid_class": int(getattr(sampling_cfg, "parathyroid_class", 1)),
+            "precious_class": int(getattr(sampling_cfg, "precious_class", 1)),
         },
         "preprocess": dict(config.data.preprocess),
     }
@@ -526,7 +561,10 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
     tprint(
         "prepare data start:\n"
         f"\tmodality={modality}\n"
-        f"\tpaths(hsi={cfg.path.hsi_dir}, label={cfg.path.label_dir}, rgb={cfg.path.rgb_dir})"
+        f"\tpaths:\n"
+        f"\t  hsi={cfg.path.hsi_dir},\n"
+        f"\t  label={cfg.path.label_dir},\n"
+        f"\t  rgb={cfg.path.rgb_dir}"
     )
 
     cache_key = _build_cache_key(cfg, modality)
@@ -559,8 +597,8 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
     train_fg_threshold = float(getattr(sampling_cfg, "train_fg_ratio_threshold", threshold))
     train_max_background_ratio = float(getattr(sampling_cfg, "train_max_background_ratio", 1.0))
     train_max_background_ratio = min(1.0, max(0.0, train_max_background_ratio))
-    train_parathyroid_repeat = max(1, int(getattr(sampling_cfg, "train_parathyroid_repeat", 1)))
-    parathyroid_class = int(getattr(sampling_cfg, "parathyroid_class", 1))
+    train_precious_repeat = max(1, int(getattr(sampling_cfg, "train_precious_repeat", 1)))
+    precious_class = int(getattr(sampling_cfg, "precious_class", 1))
 
     reducer = SpectralReducer(
         mode=str(cfg.data.preprocess.mode),
@@ -589,11 +627,11 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
 
         split_threshold = threshold
         split_max_background_ratio = 1.0
-        split_parathyroid_repeat = 1
+        split_precious_repeat = 1
         if split_name == "train":
             split_threshold = train_fg_threshold
             split_max_background_ratio = train_max_background_ratio
-            split_parathyroid_repeat = train_parathyroid_repeat
+            split_precious_repeat = train_precious_repeat
 
         records, raw_hist, patch_hist, tracked_pre, tracked_post = _build_patch_records(
             samples=split_samples,
@@ -605,14 +643,14 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
             split_name=split_name,
             show_progress=show_progress,
             max_background_ratio=split_max_background_ratio,
-            parathyroid_repeat=split_parathyroid_repeat,
-            parathyroid_class=parathyroid_class,
+            precious_repeat=split_precious_repeat,
+            precious_class=precious_class,
         )
 
         tprint(
             f"patch prep [{split_name}]: samples={len(split_samples)}\n"
             f"\tpatches={len(records)}, tracked={len(tracked_ids)}\n"
-            f"\tpolicy(fg_thr={split_threshold:.3f}, bg_max={split_max_background_ratio:.3f}, repeat={split_parathyroid_repeat})"
+            f"\tpolicy(fg_thr={split_threshold:.3f}, bg_max={split_max_background_ratio:.3f}, repeat={split_precious_repeat})"
         )
 
         patches_by_split[split_name] = records
@@ -627,8 +665,8 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
             "sampling_policy": {
                 "foreground_ratio_threshold": float(split_threshold),
                 "max_background_ratio": float(split_max_background_ratio),
-                "parathyroid_repeat": int(split_parathyroid_repeat),
-                "parathyroid_class": int(parathyroid_class),
+                "precious_repeat": int(split_precious_repeat),
+                "precious_class": int(precious_class),
             },
         }
 
@@ -701,16 +739,21 @@ class BasePatchDataset(Dataset):
         image, mask = self._load_sample(sample)
         image, mask = _pad_to_patch(image, mask, self.patch_size)
 
-        img_patch = image[ rec.top : rec.top + self.patch_size, rec.left : rec.left + self.patch_size, :]
+        img_patch = image[rec.top : rec.top + self.patch_size, rec.left : rec.left + self.patch_size, :]
         mask_patch = mask[rec.top : rec.top + self.patch_size, rec.left : rec.left + self.patch_size]
+
+        # Keep HSI patch casting local to the sampled window to avoid full-cube copies.
+        img_patch = np.asarray(img_patch, dtype=np.float32)
 
         if self.training and self.enable_train_aug:
             img_patch, mask_patch = self._apply_augment(img_patch, mask_patch)
 
         if self.modality == "hsi":
             img_patch = self.prepared.reducer.transform(img_patch)
+        else:
+            img_patch = img_patch.transpose(2, 0, 1)
 
-        return torch.from_numpy(img_patch.astype(np.float32)), torch.from_numpy(mask_patch.astype(np.int64))
+        return torch.from_numpy(np.ascontiguousarray(img_patch, dtype=np.float32)), torch.from_numpy(mask_patch.astype(np.int64))
 
     def _load_sample(self, sample: SampleItem) -> Tuple[np.ndarray, np.ndarray]:
         """load image and mask for one sample."""
@@ -719,7 +762,7 @@ class BasePatchDataset(Dataset):
 
         if sample.sample_id not in self._cube_cache:
             if self.modality == "hsi":
-                cube = np.load(sample.hsi_path).astype(np.float32)
+                cube = np.load(sample.hsi_path, mmap_mode="r")
             else:
                 if sample.rgb_path is None:
                     raise FileNotFoundError(f"rgb file not found for sample: {sample.sample_id}")
@@ -727,7 +770,7 @@ class BasePatchDataset(Dataset):
                 if rgb is None:
                     raise FileNotFoundError(f"failed to read rgb image: {sample.rgb_path}")
                 rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-                cube = rgb.astype(np.float32).transpose(2, 0, 1) / 255.0
+                cube = rgb.astype(np.float32) / 255.0
             self._cube_cache[sample.sample_id] = cube
 
         return self._cube_cache[sample.sample_id], self._mask_cache[sample.sample_id]
@@ -739,15 +782,15 @@ class BasePatchDataset(Dataset):
 
         if self.rng.random() < self.flip_prob:
             if self.rng.random() < 0.5:
-                img = img[:, :, ::-1]
+                img = img[:, ::-1, :]
                 msk = msk[:, ::-1]
             else:
-                img = img[:, ::-1, :]
+                img = img[::-1, :, :]
                 msk = msk[::-1, :]
 
         if self.rng.random() < self.rotate_prob:
             k = int(self.rng.integers(1, 4))
-            img = np.rot90(img, k=k, axes=(1, 2)).copy()
+            img = np.rot90(img, k=k, axes=(0, 1)).copy()
             msk = np.rot90(msk, k=k).copy()
 
         if self.modality == "hsi":
@@ -755,13 +798,13 @@ class BasePatchDataset(Dataset):
                 img += self.rng.normal(0.0, self.noise_std, size=img.shape).astype(np.float32)
 
             if self.rng.random() < self.shift_prob:
-                shift = self.rng.normal(0.0, self.shift_std, size=(img.shape[0], 1, 1)).astype(np.float32)
+                shift = self.rng.normal(0.0, self.shift_std, size=(1, 1, img.shape[2])).astype(np.float32)
                 img += shift
 
             if self.rng.random() < self.band_drop_prob:
                 n_drop = int(self.rng.integers(1, 3))
-                channels = self.rng.choice(img.shape[0], size=n_drop, replace=False)
-                img[channels] = 0.0
+                channels = self.rng.choice(img.shape[2], size=n_drop, replace=False)
+                img[:, :, channels] = 0.0
 
         return img.astype(np.float32), msk.astype(np.int64)
 
@@ -816,18 +859,31 @@ def build_dataloaders(config: Munch, modality: str) -> Tuple[Dict[str, DataLoade
     train_bs = int(cfg.train.batch_size)
     eval_bs = int(cfg.train.eval_batch_size)
     num_workers = int(cfg.train.num_workers)
+    prefetch_factor = max(1, int(getattr(cfg.train, "prefetch_factor", 2)))
+
+    runtime_device = str(getattr(cfg.runtime, "device", "auto")).lower()
+    use_cuda = torch.cuda.is_available() and runtime_device != "cpu"
+
+    loader_kwargs: Dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": bool(use_cuda),
+        "persistent_workers": bool(num_workers > 0),
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
 
     loaders = {
-        "train": DataLoader(train_ds, batch_size=train_bs, shuffle=True, num_workers=num_workers, pin_memory=False),
-        "eval": DataLoader(eval_ds, batch_size=eval_bs, shuffle=False, num_workers=num_workers, pin_memory=False),
-        "test": DataLoader(test_ds, batch_size=eval_bs, shuffle=False, num_workers=num_workers, pin_memory=False),
+        "train": DataLoader(train_ds, batch_size=train_bs, shuffle=True, **loader_kwargs),
+        "eval": DataLoader(eval_ds, batch_size=eval_bs, shuffle=False, **loader_kwargs),
+        "test": DataLoader(test_ds, batch_size=eval_bs, shuffle=False, **loader_kwargs),
     }
 
     tprint(
         f"dataloaders[{modality}]:\n"
         f"\ttrain_samples={len(train_ds)}, eval_samples={len(eval_ds)}, test_samples={len(test_ds)}\n"
         f"\ttrain_batches={len(loaders['train'])}, eval_batches={len(loaders['eval'])}, test_batches={len(loaders['test'])}\n"
-        f"\tbatch_size(train/eval)={train_bs}/{eval_bs}, workers={num_workers}\n"
+        f"\tbatch_size(train/eval)={train_bs}/{eval_bs}, workers={num_workers}, prefetch={prefetch_factor}\n"
+        f"\tpin_memory={loader_kwargs['pin_memory']}, persistent_workers={loader_kwargs['persistent_workers']}\n"
     )
     return loaders, prepared
 
@@ -1019,7 +1075,7 @@ def generate_synthetic_dataset(
             y1 = min(h - 1, y0 + int(h * 0.26))
             cv2.rectangle(mask, (x0, y0), (x1, y1), color=2, thickness=-1)
 
-            # parathyroid small targets (class 1).
+            # precious small targets (class 1).
             n_small = int(sample_rng.integers(1, 4))
             for _ in range(n_small):
                 cx = int(w * (0.40 + 0.25 * sample_rng.random()))

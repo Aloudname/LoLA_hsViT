@@ -3,6 +3,8 @@ from __future__ import annotations
 # trainer for segmentation models with dice/focal/tversky losses.
 import copy
 import os
+import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -12,12 +14,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from munch import Munch
-from tqdm.auto import tqdm
+from tqdm.rich import tqdm
+from tqdm import TqdmExperimentalWarning
 
 from pipeline.monitor import tprint
 
 
 os.environ.setdefault("TORCH_DISABLE_DYNAMO", "1")
+warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 
 
 def set_trainable_layers(model: nn.Module, config: Munch) -> None:
@@ -211,20 +215,25 @@ class Trainer:
         best_ckpt = self.output_dir / ".cache" / "best_model.pt"
         best_ckpt.parent.mkdir(parents=True, exist_ok=True)
         
-        # debug
+        # # debug
+        # an iterable may cause unexpectedly long time cost.
         # sample_batch = next(iter(train_loader))
+        # img, masks = sample_batch[0]
+        # shapes = (img.shape, masks.shape)
 
         tprint(
             "fit start:\n"
             f"\tepochs = {epochs}\n"
             f"\ttrain batches = {len(train_loader)}, eval batches = {len(eval_loader)} \n"
-            # f"\tbatch shape = {sample_batch[0].shape}\n"
+            # f"\tbatch shape = {shapes}\n"
         )
 
         for epoch in range(1, epochs + 1):
             tprint(f"epoch {epoch:03d}/{epochs:03d} start")
-            train_loss, train_dice = self.train_one_epoch(train_loader, epoch=epoch, total_epochs=epochs)
-            eval_loss, eval_dice = self.validate(eval_loader, phase="eval", epoch=epoch, total_epochs=epochs)
+            epoch_t0 = time.perf_counter()
+            train_loss, train_dice, train_t = self.train_one_epoch(train_loader, epoch=epoch, total_epochs=epochs)
+            eval_loss, eval_dice, eval_t = self.validate(eval_loader, phase="eval", epoch=epoch, total_epochs=epochs)
+            epoch_total = time.perf_counter() - epoch_t0
 
             history["train_loss"].append(train_loss)
             history["eval_loss"].append(eval_loss)
@@ -235,6 +244,12 @@ class Trainer:
                 f"epoch {epoch:03d}:\n"
                 f"\ttrain_loss = {train_loss:.4f}, eval_loss = {eval_loss:.4f}\t"
                 f"\ttrain_dice = {train_dice:.4f}, eval_dice = {eval_dice:.4f}\t"
+            )
+            tprint(
+                "epoch timing:\n"
+                f"\ttrain_total={train_t['total_s']:.2f}s, train_first_batch={train_t['first_batch_s']:.2f}s\n"
+                f"\teval_total={eval_t['total_s']:.2f}s, eval_first_batch={eval_t['first_batch_s']:.2f}s\n"
+                f"\tepoch_total={epoch_total:.2f}s"
             )
 
             if eval_dice > best_metric:
@@ -273,7 +288,7 @@ class Trainer:
             return min(total, max_steps)
         return total
 
-    def train_one_epoch(self, dataloader, epoch: int, total_epochs: int) -> Tuple[float, float]:
+    def train_one_epoch(self, dataloader, epoch: int, total_epochs: int) -> Tuple[float, float, Dict[str, float]]:
         """run one train epoch and return loss/dice."""
         self.model.train()
 
@@ -281,6 +296,8 @@ class Trainer:
         dice_scores: List[float] = []
 
         self.optimizer.zero_grad(set_to_none=True)
+        epoch_t0 = time.perf_counter()
+        first_batch_s: Optional[float] = None
 
         train_iter = tqdm(
             enumerate(dataloader, start=1),
@@ -295,6 +312,9 @@ class Trainer:
         for step, (images, masks) in train_iter:
             if self.max_train_steps > 0 and step > self.max_train_steps:
                 break
+
+            if first_batch_s is None:
+                first_batch_s = time.perf_counter() - epoch_t0
 
             images = images.to(self.device, non_blocking=True)
             masks = masks.to(self.device, non_blocking=True)
@@ -326,20 +346,29 @@ class Trainer:
             )
 
         train_iter.close()
+        total_s = time.perf_counter() - epoch_t0
 
         if not losses:
-            return 0.0, 0.0
+            return 0.0, 0.0, {
+                "total_s": float(total_s),
+                "first_batch_s": float(first_batch_s if first_batch_s is not None else total_s),
+            }
 
-        return float(np.mean(losses)), float(np.mean(dice_scores))
+        return float(np.mean(losses)), float(np.mean(dice_scores)), {
+            "total_s": float(total_s),
+            "first_batch_s": float(first_batch_s if first_batch_s is not None else total_s),
+        }
 
     @torch.no_grad()
-    def validate(self, dataloader, phase: str, epoch: int, total_epochs: int) -> Tuple[float, float]:
+    def validate(self, dataloader, phase: str, epoch: int, total_epochs: int) -> Tuple[float, float, Dict[str, float]]:
         """run one validation epoch and return loss/dice."""
         model = self.ema.ema_model if self.ema is not None else self.model
         model.eval()
 
         losses: List[float] = []
         dice_scores: List[float] = []
+        eval_t0 = time.perf_counter()
+        first_batch_s: Optional[float] = None
 
         eval_iter = tqdm(
             enumerate(dataloader, start=1),
@@ -354,6 +383,9 @@ class Trainer:
         for step, (images, masks) in eval_iter:
             if self.max_eval_steps > 0 and step > self.max_eval_steps:
                 break
+
+            if first_batch_s is None:
+                first_batch_s = time.perf_counter() - eval_t0
 
             images = images.to(self.device, non_blocking=True)
             masks = masks.to(self.device, non_blocking=True)
@@ -371,11 +403,18 @@ class Trainer:
             )
 
         eval_iter.close()
+        total_s = time.perf_counter() - eval_t0
 
         if not losses:
-            return 0.0, 0.0
+            return 0.0, 0.0, {
+                "total_s": float(total_s),
+                "first_batch_s": float(first_batch_s if first_batch_s is not None else total_s),
+            }
 
-        return float(np.mean(losses)), float(np.mean(dice_scores))
+        return float(np.mean(losses)), float(np.mean(dice_scores)), {
+            "total_s": float(total_s),
+            "first_batch_s": float(first_batch_s if first_batch_s is not None else total_s),
+        }
 
     @torch.no_grad()
     def predict(

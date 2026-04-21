@@ -27,7 +27,7 @@ data:
     seed: 350234 # used in pipeline.dataset and pipeline.core for deterministic behavior.
   preprocess:
     mode: "lda_pca" # used in pipeline.dataset.SpectralReducer; options: none, supervised_pca, lda_pca.
-    output_dim: 16 # used in spectral reducer and hsi model input channels for method b.
+    output_dim: 8 # used in spectral reducer and hsi model input channels for method b.
     max_fit_pixels: 500000 # used in reducer fit sampling budget.
   synthetic:
     domain_shift_strength: 0.08 # medium difficulty: patient/sample spectral domain shift close to clinical acquisition variability.
@@ -85,8 +85,8 @@ loss:
   class_weights: [0.20, 3.00, 1.50, 1.20] # used in focal/cross-entropy weighting.
 
 runtime:
-  seed: 3407 # used in pipeline.core._seed_everything.
-  device: "auto" # used in pipeline.trainer device selection.
+  seed: 350234 # used in pipeline.core._seed_everything.
+  device: "cuda" # used in pipeline.trainer device selection.
   progress_bar: true # used in pipeline.dataset and pipeline.trainer to toggle tqdm progress bars.
   save_top_k: 1 # used in trainer checkpoint policy.
 

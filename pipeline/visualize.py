@@ -248,6 +248,208 @@ class Visualizer:
             fig.tight_layout()
         self._save_fig(fig, "features/tsne.png")
 
+    def plot_pca_lda_comparison(
+        self,
+        pca_features: np.ndarray,
+        lda_features: np.ndarray,
+        labels: np.ndarray,
+        explained_variance_ratio: Optional[np.ndarray] = None,
+        pca_dim: Optional[int] = None,
+        lda_dim: Optional[int] = None,
+        title: str = "PCA-LDA feature comparison",
+    ) -> None:
+        """plot paper-style comparison between PCA and PCA-LDA projections."""
+        if pca_features.size == 0 or lda_features.size == 0 or labels.size == 0:
+            return
+
+        n = min(pca_features.shape[0], lda_features.shape[0], labels.shape[0])
+        if n < 10:
+            return
+
+        pca_features = np.asarray(pca_features[:n], dtype=np.float32)
+        lda_features = np.asarray(lda_features[:n], dtype=np.float32)
+        labels = np.asarray(labels[:n], dtype=np.int64)
+
+        def _to_2d(points: np.ndarray) -> np.ndarray:
+            if points.ndim != 2 or points.shape[0] == 0:
+                return np.empty((0, 2), dtype=np.float32)
+            if points.shape[1] >= 2:
+                return points[:, :2].astype(np.float32)
+            pad = np.zeros((points.shape[0], 2 - points.shape[1]), dtype=np.float32)
+            return np.concatenate([points.astype(np.float32), pad], axis=1)
+
+        def _centroids(points: np.ndarray) -> Dict[int, np.ndarray]:
+            out: Dict[int, np.ndarray] = {}
+            for cls_idx in range(len(self.class_names)):
+                idx = labels == cls_idx
+                if np.any(idx):
+                    out[cls_idx] = points[idx].mean(axis=0)
+            return out
+
+        def _distance_matrix(centroids: Dict[int, np.ndarray]) -> np.ndarray:
+            mat = np.full((len(self.class_names), len(self.class_names)), np.nan, dtype=np.float32)
+            for i in range(len(self.class_names)):
+                if i not in centroids:
+                    continue
+                for j in range(len(self.class_names)):
+                    if j not in centroids:
+                        continue
+                    mat[i, j] = float(np.linalg.norm(centroids[i] - centroids[j]))
+            return mat
+
+        pca_xy = _to_2d(pca_features)
+        lda_xy = _to_2d(lda_features)
+        pca_centroids = _centroids(pca_xy)
+        lda_centroids = _centroids(lda_xy)
+        pca_dist = _distance_matrix(pca_centroids)
+        lda_dist = _distance_matrix(lda_centroids)
+
+        if explained_variance_ratio is not None:
+            explained_variance_ratio = np.asarray(explained_variance_ratio, dtype=np.float64)
+            explained_variance_ratio = explained_variance_ratio[np.isfinite(explained_variance_ratio)]
+            explained_variance_ratio = explained_variance_ratio[explained_variance_ratio > 0]
+
+        cmap = plt.get_cmap("tab10")
+        colors = [cmap(i % 10) for i in range(len(self.class_names))]
+        legend_handles = [
+            Patch(facecolor=colors[i], edgecolor="none", label=f"{i}: {name}")
+            for i, name in enumerate(self.class_names)
+        ]
+
+        fig, axes = plt.subplots(2, 2, figsize=(16.2, 9.2), gridspec_kw={"height_ratios": [1.0, 1.0], "width_ratios": [1.0, 1.0]})
+        flat_axes = axes.flatten()
+        fig.patch.set_facecolor("white")
+        fig.suptitle(title, fontsize=14, fontweight="semibold", y=1.02)
+
+        ax = flat_axes[0]
+        ax.set_facecolor("#fbfbfd")
+        if explained_variance_ratio is not None and explained_variance_ratio.size > 0:
+            cum = np.cumsum(explained_variance_ratio)
+            xs = np.arange(1, cum.shape[0] + 1)
+            ax.plot(xs, cum, color="#4e79a7", linewidth=2.2, marker="o", markersize=3.5)
+            ax.fill_between(xs, cum, 0.0, color="#4e79a7", alpha=0.12)
+            ax.axhline(0.95, color="#d62728", linestyle="--", linewidth=1.2, alpha=0.85)
+            if pca_dim is not None and pca_dim > 0:
+                mark_x = min(int(pca_dim), xs[-1])
+                mark_y = cum[mark_x - 1]
+                ax.axvline(mark_x, color="#2ca02c", linestyle=":", linewidth=1.4, alpha=0.9)
+                ax.scatter([mark_x], [mark_y], s=42, color="#2ca02c", zorder=3)
+                ax.text(
+                    0.04,
+                    0.08,
+                    f"PCA dim = {mark_x}\nexplained = {mark_y:.3f}",
+                    transform=ax.transAxes,
+                    fontsize=9,
+                    va="bottom",
+                    ha="left",
+                    bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#dddddd", alpha=0.95),
+                )
+            ax.set_xlim(1, xs[-1])
+            ax.set_ylim(0.0, 1.02)
+        else:
+            ax.text(0.5, 0.5, "PCA variance data unavailable", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title("PCA variance retention")
+        ax.set_xlabel("principal component")
+        ax.set_ylabel("cumulative variance")
+        ax.grid(alpha=0.25)
+        ax.text(0.02, 0.97, "(a)", transform=ax.transAxes, ha="left", va="top", fontsize=11, fontweight="semibold")
+
+        def _scatter_panel(ax, points: np.ndarray, centroids: Dict[int, np.ndarray], panel_label: str, panel_title: str, dim_label: str) -> None:
+            ax.set_facecolor("#fbfbfd")
+            for cls_idx, class_name in enumerate(self.class_names):
+                idx = labels == cls_idx
+                if not np.any(idx):
+                    continue
+                ax.scatter(
+                    points[idx, 0],
+                    points[idx, 1],
+                    s=11,
+                    alpha=0.72,
+                    color=colors[cls_idx],
+                    edgecolors="white",
+                    linewidths=0.25,
+                )
+                if cls_idx in centroids:
+                    cx, cy = centroids[cls_idx]
+                    ax.scatter(
+                        [cx],
+                        [cy],
+                        s=120,
+                        marker="X",
+                        color=colors[cls_idx],
+                        edgecolors="black",
+                        linewidths=0.7,
+                        zorder=4,
+                    )
+                    ax.annotate(
+                        class_name,
+                        (cx, cy),
+                        xytext=(4, 4),
+                        textcoords="offset points",
+                        fontsize=8,
+                        fontweight="semibold",
+                        color="#1f1f1f",
+                    )
+
+            ax.set_title(panel_title)
+            ax.set_xlabel(f"{dim_label}-1")
+            ax.set_ylabel(f"{dim_label}-2")
+            ax.grid(alpha=0.25)
+            ax.set_aspect("equal", adjustable="datalim")
+            ax.text(0.02, 0.97, panel_label, transform=ax.transAxes, ha="left", va="top", fontsize=11, fontweight="semibold")
+
+        _scatter_panel(flat_axes[1], pca_xy, pca_centroids, "(b)", "PCA projection", "PC")
+        _scatter_panel(flat_axes[2], lda_xy, lda_centroids, "(c)", "PCA + LDA projection", "LD")
+
+        heat_ax = flat_axes[3]
+        heat_ax.axis("off")
+        heat_gs = heat_ax.get_subplotspec().subgridspec(1, 2, wspace=0.18)
+        hm_axes = [fig.add_subplot(heat_gs[0, i]) for i in range(2)]
+
+        hm_titles = ["PCA centroid distance", "PCA + LDA centroid distance"]
+        hm_mats = [pca_dist, lda_dist]
+        hm_texts = ["(d1)", "(d2)"]
+        for idx, (hax, mat, htitle, htxt) in enumerate(zip(hm_axes, hm_mats, hm_titles, hm_texts)):
+            hax.set_facecolor("#fbfbfd")
+            valid = mat[np.isfinite(mat)]
+            if valid.size == 0:
+                hax.text(0.5, 0.5, "no centroid data", ha="center", va="center", transform=hax.transAxes)
+                hax.axis("off")
+                continue
+
+            vmax = float(np.nanmax(valid))
+            im = hax.imshow(mat, cmap="magma", vmin=0.0, vmax=max(vmax, 1e-6))
+            hax.set_title(htitle)
+            hax.set_xticks(np.arange(len(self.class_names)))
+            hax.set_yticks(np.arange(len(self.class_names)))
+            hax.set_xticklabels(self.class_names, rotation=45, ha="right")
+            hax.set_yticklabels(self.class_names)
+            hax.tick_params(axis="both", labelsize=8)
+            for i in range(mat.shape[0]):
+                for j in range(mat.shape[1]):
+                    value = mat[i, j]
+                    if np.isfinite(value):
+                        color = "white" if value > 0.55 * vmax else "black"
+                        hax.text(j, i, f"{value:.2f}", ha="center", va="center", fontsize=7.5, color=color)
+            hax.text(0.02, 0.97, htxt, transform=hax.transAxes, ha="left", va="top", fontsize=11, fontweight="semibold")
+            cbar = fig.colorbar(im, ax=hax, shrink=0.84, pad=0.02)
+            cbar.ax.tick_params(labelsize=7)
+
+        heat_ax.text(0.5, 1.02, "class-centroid pairwise distances", ha="center", va="bottom", transform=heat_ax.transAxes, fontsize=10)
+
+        fig.legend(
+            handles=legend_handles,
+            loc="lower center",
+            ncol=min(4, len(legend_handles)),
+            frameon=False,
+            fontsize=8.5,
+            bbox_to_anchor=(0.5, 0.01),
+            title="classes",
+            title_fontsize=8.5,
+        )
+        fig.tight_layout(rect=(0.0, 0.04, 1.0, 0.96))
+        self._save_fig(fig, "features/pca_lda_comparison.png")
+
     def show_segmentation(
         self,
         images: Sequence[np.ndarray],

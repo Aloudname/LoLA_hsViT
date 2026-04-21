@@ -175,7 +175,7 @@ def render(mem, cpu, gpus, cpu_name, gpu_name, gpu_count):
     print(f"\n[Memory & CPU: \033[95m{cpu_name}\033[0m")
     print(progress_bar(mem_pct))
     print(f"Total: \033[97m{total_mem/1e9:.2f}\033[0m GB \t Used: \033[97m{used_mem/1e9:.2f}\033[0m GB")
-    print(f"CPU Cores: \033[97m{cores}\033[0m \t\t Avg: \033[97m{cpu_smooth:.2f}\033[0m%")
+    print(f"CPU Cores: \033[97m{cores}\033[0m \t\t Occupated: \033[97m{cpu_smooth:.2f}\033[0m%")
 
     # GPU
     print(f"\n[GPU: \033[95m{gpu_name} x {str(gpu_count)}\033[0m")

@@ -52,20 +52,7 @@ class RGBViT(nn.Module):
             nn.BatchNorm2d(embed_dim),
             nn.GELU(),
         )
-
-        backbone_cfg = {
-            "embed_dim": embed_dim,
-            "depth": depth,
-            "num_heads": num_heads,
-            "mlp_ratio": mlp_ratio,
-            "dropout": dropout,
-            "freeze_backbone": freeze_backbone,
-            "use_pretrained": bool(config.get("use_pretrained", config.get("pretrained_backbone", False))),
-            "backbone_name": str(config.get("backbone_name", "vit_small_patch16_224")),
-            "pretrained_weights": bool(config.get("pretrained_weights", config.get("backbone_pretrained", True))),
-            "pretrained_cache_dir": str(config.get("pretrained_cache_dir", "")),
-        }
-        self.backbone = build_backbone(backbone_cfg)
+        self.backbone = build_backbone(config)
 
         self.decoder = nn.Sequential(
             nn.Conv2d(embed_dim, decoder_dim, kernel_size=3, padding=1, bias=False),

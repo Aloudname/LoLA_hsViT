@@ -43,7 +43,7 @@ class UNet(nn.Module):
 
     def __init__(self, config: Munch) -> None:
         super().__init__()
-        in_channels = int(config.preprocess.get("output_dim"))
+        in_channels = int(config.data.preprocess.get("output_dim"))
         num_classes = int(config.data.get("num_classes"))
         base_channels = int(config.model.get("base_channels", 32))
 
