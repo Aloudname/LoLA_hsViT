@@ -247,7 +247,7 @@ class Visualizer:
             fig.tight_layout(rect=(0.0, 0.0, 0.8, 1.0))
         else:
             fig.tight_layout()
-        self._save_fig(fig, "features/tsne.png")
+        self._save_fig(fig, f"features/{title.lower().replace(' ', '_')}.png")
 
     def plot_pca_lda_comparison(
         self,
@@ -449,7 +449,7 @@ class Visualizer:
             title_fontsize=8.5,
         )
         fig.tight_layout(rect=(0.0, 0.04, 1.0, 0.96))
-        self._save_fig(fig, "features/pca_lda_comparison.png")
+        self._save_fig(fig, f"features/{title.lower().replace(' ', '_')}.png")
 
     def show_segmentation(
         self,

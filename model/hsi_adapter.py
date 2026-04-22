@@ -247,6 +247,13 @@ class HSIAdapter(nn.Module):
         self.seg_head = nn.Conv2d(decoder_dim, num_classes, kernel_size=1)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(f"expected 4d input, got shape={tuple(x.shape)}")
+        if x.shape[1] != self.in_channels:
+            if x.shape[-1] == self.in_channels:
+                x = x.permute(0, 3, 1, 2).contiguous()
+            else:
+                raise ValueError(f"channel mismatch: got {x.shape[1]}, expected {self.in_channels}")
         spectral_map = self.spectral_encoder(x)
         spectral_map = self.spectral_se(spectral_map)
         return self._forward_features_from_spectral(spectral_map)

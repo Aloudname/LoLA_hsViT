@@ -91,6 +91,7 @@ runtime:
   save_top_k: 1 # used in trainer checkpoint policy.
 
 visualization:
+  tsne_enabled: true
   num_seg_examples: 4 # used in pipeline.visualize.show_segmentation.
   tsne_max_points: 3000 # used in pipeline.visualize.plot_tsne.
   spectral_max_points_per_class: 2000 # used in pipeline.visualize.plot_spectral.

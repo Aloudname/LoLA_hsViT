@@ -485,7 +485,7 @@ class Trainer:
 
             # collect feature vectors for tsne.
             if hasattr(model, "forward_features") and collected_features < keep_features:
-                feat = model(images)
+                feat = model.forward_features(images)
                 feat_np = feat.detach().cpu().numpy()
                 b, c, h, w = feat_np.shape
                 feat_flat = np.moveaxis(feat_np, 1, -1).reshape(-1, c)
@@ -542,6 +542,49 @@ class Trainer:
         self.model.load_state_dict(payload["model"])
         if self.ema is not None and "ema_model" in payload:
             self.ema.ema_model.load_state_dict(payload["ema_model"])
+
+    def extract_features(self, dataloader, max_points: int = 3000) -> Tuple[np.ndarray, np.ndarray]:
+        """extract feature vectors and labels from the dataLoader for pre-train t-SNE."""
+        model = self.ema.ema_model if self.ema is not None else self.model
+        model.eval()
+
+        feature_bank: List[np.ndarray] = []
+        label_bank: List[np.ndarray] = []
+        collected_points = 0
+
+        with torch.no_grad():
+            for images, masks in dataloader:
+                if collected_points >= max_points:
+                    break
+
+                images = images.to(self.device, non_blocking=True)
+                masks = masks.to(self.device, non_blocking=True)
+
+                if hasattr(model, "forward_features"):
+                    feat = model.forward_features(images)
+                else:
+                    feat = model(images)
+
+                feat_np = feat.detach().cpu().numpy()
+                b, c, h, w = feat_np.shape
+                feat_flat = np.moveaxis(feat_np, 1, -1).reshape(-1, c)
+
+                mask_small = F.interpolate(masks.unsqueeze(1).float(), size=(h, w), mode="nearest")
+                mask_flat = mask_small.squeeze(1).long().detach().cpu().numpy().reshape(-1)
+
+                need = max(0, max_points - collected_points)
+                if feat_flat.shape[0] > need:
+                    idx = np.random.choice(feat_flat.shape[0], size=need, replace=False)
+                    feat_flat = feat_flat[idx]
+                    mask_flat = mask_flat[idx]
+
+                feature_bank.append(feat_flat)
+                label_bank.append(mask_flat)
+                collected_points += feat_flat.shape[0]
+
+        features = np.concatenate(feature_bank, axis=0) if feature_bank else np.empty((0, 0), dtype=np.float32)
+        labels = np.concatenate(label_bank, axis=0) if label_bank else np.empty((0,), dtype=np.int64)
+        return features, labels
 
     @staticmethod
     def _batch_dice(logits: torch.Tensor, targets: torch.Tensor) -> float:

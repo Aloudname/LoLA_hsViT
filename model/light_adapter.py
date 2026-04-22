@@ -8,29 +8,63 @@ import torch.nn.functional as F
 from model.backbones.builder import build_backbone
 
 
-class SimpleSpectralEncoder(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
+class BandAttentionEncoder(nn.Module):
+    """band-wise self-attention encoder."""
+    def __init__(self, in_channels: int, out_channels: int, num_heads: int = 4):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
         )
+        # band positional embedding
+        self.pos_embed = nn.Parameter(torch.randn(1, out_channels, 1, 1) * 0.02)
+        # band-wise self-attention
+        self.attn = nn.MultiheadAttention(
+            embed_dim=out_channels,
+            num_heads=num_heads,
+            batch_first=True,
+            dropout=0.1,
+        )
+        self.norm = nn.LayerNorm(out_channels)
+        self.ffn = nn.Sequential(
+            nn.Linear(out_channels, out_channels * 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(out_channels * 2, out_channels),
+        )
+        self.norm2 = nn.LayerNorm(out_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
+        # x: (B, C, H, W)
+        x = self.stem(x)
+        x = x + self.pos_embed
+        B, C, H, W = x.shape
+        # reshape to (B*H*W, C) for attention
+        x_flat = x.permute(0, 2, 3, 1).reshape(B * H * W, C).unsqueeze(1)  # (N, 1, C)
+
+        x_conv = x.reshape(B, C, H * W).transpose(1, 2)  # (B, N, C)
+        x_conv = self.norm(x_conv)
+        attn_out, _ = self.attn(x_conv, x_conv, x_conv)
+        x_conv = x_conv + attn_out
+        x_conv = self.norm2(x_conv)
+        ffn_out = self.ffn(x_conv)
+        x_conv = x_conv + ffn_out
+        x_out = x_conv.transpose(1, 2).reshape(B, C, H, W)
+        return x_out
 
 
 class SpatialEmbed(nn.Module):
     def __init__(self, in_channels: int, embed_dim: int, patch_size: int = 4):
         super().__init__()
-        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.proj = nn.Conv2d(in_channels, embed_dim,
+                              kernel_size=patch_size, stride=patch_size)
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.proj(x)
         B, D, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2)                     # (B, H*W, D)
+        x = x.flatten(2).transpose(1, 2) # (B, H*W, D)
         x = self.norm(x)
         return x, (H, W)
 
@@ -46,7 +80,7 @@ class SimpleFusion(nn.Module):
     def forward(self, spatial_tokens: torch.Tensor, spectral_tokens: torch.Tensor) -> torch.Tensor:
         global_spectral = spectral_tokens.mean(dim=1, keepdim=True)      # (B, 1, D)
         gate = self.gate(global_spectral)
-        return spatial_tokens + gate * spatial_tokens
+        return spatial_tokens * (1 - gate) + spectral_tokens * gate
 
 
 class UNetDecoder(nn.Module):
@@ -94,7 +128,7 @@ class LightAdapter(nn.Module):
 
         self.in_channels = in_channels
 
-        self.spectral_encoder = SimpleSpectralEncoder(in_channels, spectral_dim)
+        self.spectral_encoder = BandAttentionEncoder(in_channels, spectral_dim)
         self.spatial_embed = SpatialEmbed(spectral_dim, embed_dim, patch_size=4)
         self.spectral_token_proj = nn.Linear(spectral_dim, embed_dim)
         self.fusion = SimpleFusion(embed_dim)
@@ -141,6 +175,7 @@ class LightAdapter(nn.Module):
 
         # interpolate to original size if needed
         if logits.shape[2:] != (H_orig, W_orig):
-            logits = F.interpolate(logits, size=(H_orig, W_orig), mode='bilinear', align_corners=False)
+            logits = F.interpolate(logits, size=(H_orig, W_orig),
+                                   mode='bilinear', align_corners=False)
 
         return logits
