@@ -423,7 +423,18 @@ class Trainer:
         keep_images: int = 3,
         keep_features: int = 3000,
     ) -> Dict[str, Any]:
-        """predict masks and collect arrays for analysis/visualization."""
+        """
+        predict masks and collect arrays for analysis/visualization.
+        
+        Return Dict keys:
+        - `pred_masks`: `list` of predicted mask `np.ndarray`.
+        - `gt_masks`: `list` of ground truth mask `np.ndarray`.
+        - `prob_maps`: `list` of predicted probability map `np.ndarray`.
+        - `image_samples`: `list` of input image `np.ndarray` (up to keep_images).
+        - `features`: `np.ndarray` of collected feature vectors (up to keep_features).
+        - `feature_labels`: `np.ndarray` of corresponding feature labels.
+        - `attention_map`: `np.ndarray` of optional attention map array if model provides it.
+        """
         model = self.ema.ema_model if self.ema is not None else self.model
         model.eval()
 
