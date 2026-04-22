@@ -43,7 +43,7 @@ class UNet(nn.Module):
 
     def __init__(self, config: Munch) -> None:
         super().__init__()
-        in_channels = int(config.data.preprocess.get("output_dim"))
+        in_channels = int(config.data.preprocess.get("output_dim")) if config.data.preprocess.get("mode") != "none" else int(config.data.get("hsi_bands"))
         num_classes = int(config.data.get("num_classes"))
         base_channels = int(config.model.get("base_channels", 32))
 
@@ -67,6 +67,14 @@ class UNet(nn.Module):
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         """extract final decoder feature map before segmentation head."""
+
+        # ensure shape (b, c, h, w)
+        if x.ndim != 4:
+            raise ValueError(f"expected 4d input, got shape={tuple(x.shape)}")
+        if x.shape[1] != self.in_channels:
+            # (b, h, w, c) -> (b, c, h, w)
+            x = x.permute(0, 3, 1, 2).contiguous()
+        
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool(e1))
         e3 = self.enc3(self.pool(e2))

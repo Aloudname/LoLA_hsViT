@@ -1,26 +1,18 @@
 from __future__ import annotations
 
-import itertools
-# dataset and preprocessing pipeline for hsi/rgb segmentation.
-import json
-import shutil
-import warnings
-from dataclasses import dataclass
+from tqdm import tqdm
+from munch import Munch
 from pathlib import Path
+from scipy.linalg import eig
+from dataclasses import dataclass
+from sklearn.decomposition import PCA
+from tqdm import TqdmExperimentalWarning
+from torch.utils.data import DataLoader, Dataset
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-import cv2
-import numpy as np
-import torch
-from munch import Munch
-from sklearn.decomposition import PCA
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
-from tqdm import TqdmExperimentalWarning
-
 from pipeline.monitor import tprint
-
+import cv2, json, torch, shutil, warnings, itertools, numpy as np
 
 warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 
@@ -56,74 +48,27 @@ class PreparedData:
     stats: Dict[str, Any]
 
 
-class KernelLDA:
+class KernelPCA:
     """
-    kernel PCA + LDA for spectral reduction.
+    Actually RFF, replace kernel with explicit proj.
+    This doesn't do fit per se,
+    do random proj with bandwidth gamma instead.
     """
-    def __init__(self, 
-                n_components: int,
-                gamma: float = 1.0,
-                reg: float = 1e-5):
-        self.n_components = n_components
-        self.gamma = gamma
-        self.reg = reg
-
-    def fit(self, X: np.ndarray, y:np.ndarray) -> None:
-        self.X_train = X
-        K = rbf_kernel(X, self.gamma)
-
-        N = K.shape[0]
-        classes = np.unique(y)
-
-        # overall mean
-        one_n = np.ones((N, N)) / N
-        K_centered = K - one_n @ K - K @ one_n + one_n @ K @ one_n
-
-        # within-class scatter
-        Sw = np.zeros((N, N))
-        Sb = np.zeros((N, N))
-
-        for c in classes:
-            idx = np.where(y == c)[0]
-            Nc = len(idx)
-
-            Kc = K_centered[:, idx]
-            mean_c = np.mean(Kc, axis=1, keepdims=True)
-
-            Sw += Kc @ Kc.T
-            Sb += Nc * (mean_c @ mean_c.T)
-
-        # regularization
-        Sw += self.reg * np.eye(N)
-
-        # generalized eigenvalue problem
-        eigvals, eigvecs = np.linalg.eig(
-            np.linalg.pinv(Sw) @ Sb
+    def __init__(self, input_dim: int,
+                output_dim: int, gamma: float = 1.0):
+        """
+        Args:
+            gamma (float): bandwidth parameter, larger -> narrower kernel, more aggressive reduction.
+        """
+        self.W = np.random.normal(
+            scale=np.sqrt(2 * gamma),
+            size=(input_dim, output_dim)
         )
+        self.b = np.random.uniform(0, 2*np.pi, size=output_dim)
 
-        idx = np.argsort(eigvals)[::-1]
-        self.alphas = eigvecs[:, idx[:self.n_components]]
+    def transform(self, X):
+        return np.sqrt(2.0 / self.W.shape[1]) * np.cos(X @ self.W + self.b)
 
-    def transform(self, X: np.ndarray) -> np.ndarray:
-        K = rbf_kernel(X, self.gamma)
-        return K @ self.alphas
-
-
-def rbf_kernel(X: np.ndarray, gamma=1.0) -> np.ndarray:
-    """
-    Define the RBF kernel function:
-    
-    ```
-    k(x, y) = exp(-gamma * ||x - y||^2)
-    ```
-    """
-    
-    sq_dists = (
-        np.sum(X**2, axis=1, keepdims=True)
-        + np.sum(X**2, axis=1, keepdims=True).T
-        - 2 * X @ X.T
-    )
-    return np.exp(-gamma * sq_dists)
 
 
 def _as_munch(config: Mapping[str, Any]) -> Munch:
@@ -236,9 +181,8 @@ class SpectralReducer:
         x_fit, y_fit = self._collect_pixels(samples, num_classes, show_progress=show_progress)
 
         # debug
-        # tprint("x.shape = ", x_fit.shape, "y.shape = ", y_fit.shape)
-        tprint(f"Debugging before fitting reducer:\n"
-               f"\tx_fit.shape = {x_fit.shape}, \n\ty_fit.shape = {y_fit.shape}\n")
+        # tprint(f"before reducer:\n"
+        #        f"\tx_fit.shape = {x_fit.shape}, \n\ty_fit.shape = {y_fit.shape}\n")
         if x_fit.size == 0:
             raise RuntimeError("failed to collect fit pixels for spectral reducer")
 
@@ -276,8 +220,9 @@ class SpectralReducer:
         self.pca_dim = pca_dim
         self.pca = PCA(n_components=self.pca_dim)
         self.pca.fit(x_fit)
-
         x_pca = self.pca.transform(x_fit)
+        
+        # lda after pca
         try:
             lda_dim = int(min(lda_dim, x_pca.shape[-1]))
             self.lda = LinearDiscriminantAnalysis(n_components=lda_dim)
@@ -289,14 +234,39 @@ class SpectralReducer:
         self.fitted = True
 
     def _do_kernel_lda(self, x_fit, y_fit) -> bool:
-        lda_dim = int(min(max(1, len(np.unique(y_fit)) - 1), self.output_dim))
-        tprint(f"Fitting kernel LDA spectral reducer with:\n" 
-               f"\tLDA dim = {lda_dim}\n")
-        self.lda = KernelLDA(n_components=lda_dim)
-        self.lda.fit(x_fit, y_fit)
-        self.lda_dim = lda_dim
+        if self.output_dim <= 1:
+            tprint("Warning: output_dim <= 1, skipping Kernel LDA and fitting PCA with output_dim=1")
+            self.pca_dim = min(1, x_fit.shape[-1])
+            self.pca = PCA(n_components=self.pca_dim)
+            self.pca.fit(x_fit)
+            self.lda = None
+            self.lda_dim = 0
+            self.fitted = True
+            return None
+        
+        lda_dim = int(min(max(1, len(np.unique(y_fit)) - 1), self.output_dim - 1))
+        pca_dim = int(min(self.output_dim - self.lda_dim, x_fit.shape[-1]))
+        pca_dim = max(1, pca_dim)
+        tprint(f"Fitting kernel LDA spectral reducer with:\n"
+               f"\tPCA dim = {pca_dim}\n", 
+               f"\tKernel LDA dim = {lda_dim}\n")
+        
+        self.pca_dim = pca_dim
+        self.pca = KernelPCA(input_dim=x_fit.shape[-1],
+                             output_dim=self.pca_dim)
+        x_pca = self.pca.transform(x_fit)
+        
+        # lda after k-pca
+        try:
+            lda_dim = int(min(lda_dim, x_pca.shape[-1]))
+            self.lda = LinearDiscriminantAnalysis(n_components=lda_dim)
+            self.lda.fit(x_pca, y_fit)
+            self.lda_dim = lda_dim
+        except Exception:
+            self.lda = None
+            self.lda_dim = 0
         self.fitted = True
-
+        
     def transform(self, image: np.ndarray) -> np.ndarray:
         """transform image channels.
 
@@ -313,7 +283,7 @@ class SpectralReducer:
         h, w, c = image.shape
         x = image.reshape(-1, c)
 
-        # debug
+        # # debug
         # print(image.shape, x.shape)
 
         parts: List[np.ndarray] = []

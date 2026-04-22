@@ -307,6 +307,8 @@ class Trainer:
             if first_batch_s is None:
                 first_batch_s = time.perf_counter() - epoch_t0
 
+            # # debug
+            # print("\n>>> BEFORE MODEL:", images.shape)
             images = images.to(self.device, non_blocking=True)
             masks = masks.to(self.device, non_blocking=True)
 

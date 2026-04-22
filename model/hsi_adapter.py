@@ -23,10 +23,11 @@ class SpectralEncoder(nn.Module):
             nn.Conv2d(in_channels, 64, 1),
             nn.BatchNorm2d(64),
             nn.GELU(),
-            nn.Conv2d(64, out_channels, 1),
-            nn.Conv2d(in_channels, 64, 1),
+            
+            nn.Conv2d(64, 64, 1),
             nn.BatchNorm2d(64),
             nn.GELU(),
+            
             nn.Conv2d(64, out_channels, 1),
             nn.BatchNorm2d(out_channels),
             nn.GELU(),
@@ -115,7 +116,7 @@ class HSIAdapter(nn.Module):
 
     def __init__(self, config: Munch) -> None:
         super().__init__()
-        in_channels = int(config.data.preprocess.get("output_dim"))
+        in_channels = int(config.data.preprocess.get("output_dim")) if config.data.preprocess.get("mode") != "none" else int(config.data.get("hsi_bands"))
         num_classes = int(config.data.get("num_classes"))
         spectral_dim = int(config.model.get("spectral_dim", 32))
         embed_dim = int(config.model.get("embed_dim", 128))
@@ -176,8 +177,8 @@ class HSIAdapter(nn.Module):
         output:
             feature map (b, d, h/4, w/4)
         """
+
         spectral_map = self.spectral_encoder(x)
-        spectral_map = self.spectral_se(spectral_map)
         spectral_map = self.spectral_se(spectral_map)
         return self._forward_features_from_spectral(spectral_map)
 
@@ -221,9 +222,15 @@ class HSIAdapter(nn.Module):
         output:
             logits (b, num_classes, h, w)
         """
+        
+        # ensure shape (b, c, h, w)
         if x.ndim != 4:
             raise ValueError(f"expected 4d input, got shape={tuple(x.shape)}")
-
+        if x.shape[1] != self.in_channels:
+            # (b, h, w, c) -> (b, c, h, w)
+            x = x.permute(0, 3, 1, 2).contiguous()
+        
+        # (b, c, h, w) -> (b, d, h/4, w/4) -> (b, num_classes, h, w)
         h, w = x.shape[2], x.shape[3]
         spectral_map = self.spectral_encoder(x)
         spectral_map = self.spectral_se(spectral_map)

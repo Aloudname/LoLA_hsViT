@@ -26,7 +26,7 @@ data:
     test: 0.10 # used in pipeline.dataset._split_subjects.
     seed: 350234 # used in pipeline.dataset and pipeline.core for deterministic behavior.
   preprocess:
-    mode: "lda_pca" # used in pipeline.dataset.SpectralReducer; options: none, supervised_pca, lda_pca.
+    mode: "none" # used in pipeline.dataset.SpectralReducer; options: none, supervised_pca, lda_pca, kernel_lda.
     output_dim: 8 # used in spectral reducer and hsi model input channels for method b.
     max_fit_pixels: 500000 # used in reducer fit sampling budget.
   synthetic:
@@ -50,7 +50,7 @@ model:
   use_pretrained: true # always enable. used in model.backbones.builder; true enables timm ViT blocks.
   pretrained_weights: true # used in timm.create_model(pretrained=...).
   backbone_name: "vit_small_patch16_224" # used in model.backbones.builder when use_pretrained=true.
-  spectral_dim: 32 # used in model.hsi_adapter.HSIAdapter.
+  spectral_dim: 32 # 32, used in model.hsi_adapter.HSIAdapter.
   embed_dim: 128 # used in all model backbones.
   depth: 4 # used in transformer encoder depth.
   num_heads: 4 # used in multi-head attention layers.
@@ -101,8 +101,6 @@ export:
 
 experiments:
   default_models: # used in run.py when --models is omitted.
-    # too memory costy.
-    # - "hsi_learn"
-    - "hsi_lda"
+    - "hsi"
     - "rgb"
     - "unet"

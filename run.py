@@ -15,9 +15,7 @@ from config import load_config, _to_munch, merge_args, tprint
 
 
 VALID_MODELS = [
-    # too memory costy
-    # "hsi_learn",
-    "hsi_lda",
+    "hsi",
     "rgb",
     "unet",
 ]
@@ -54,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     """parse command-line arguments."""
     parser = argparse.ArgumentParser(description="refactored hsi segmentation runner")
 
+    parser.add_argument("--tag", '-t', type=str, default=None, help="for dim reduction settings. `none`, `supervised_pca`, `lda_pca`, `kernel_lda`.")
     parser.add_argument("--config", '-c', type=str, default="config/config.yaml", help="path to yaml config")
     parser.add_argument("--models", '-m', nargs="+", default=None, help=f"models to run: {', '.join(VALID_MODELS)}")
     parser.add_argument("--epochs", '-e', type=int, default=None, help="override train.epochs")
@@ -63,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--set", action="append", default=[], help="extra override as key=value, supports dotted key")
 
     # for short debugging
-    parser.add_argument("--generate-synthetic", action="store_true", help="generate synthetic fisher/rgb dataset before run")
+    parser.add_argument("--generate-synthetic", '-gg', action="store_true", help="generate synthetic fisher/rgb dataset before run")
     parser.add_argument("--synthetic-root", type=str, default="./synthetic_data", help="synthetic dataset root")
     parser.add_argument("--synthetic-subjects", type=int, default=12, help="number of synthetic subjects")
     parser.add_argument("--synthetic-samples-per-subject", type=int, default=2, help="samples per synthetic subject")
@@ -94,18 +93,17 @@ def _parse_set_overrides(items: List[str]) -> Dict[str, Any]:
     return out
 
 
-def _apply_model_profile(config: Munch, model_key: str) -> Dict[str, Any]:
+def _apply_model_profile(config: Munch, model_key: str, tag_key: str) -> Dict[str, Any]:
     """apply experiment-specific profile from design document."""
     base = config.toDict() if hasattr(config, "toDict") else dict(config)
     cfg = copy.deepcopy(base)
 
-    if model_key == "hsi_learn":
+    if model_key == "hsi":
         cfg["model"]["family"] = "hsi_adapter"
-        cfg["data"]["preprocess"]["mode"] = "none"
-
-    elif model_key == "hsi_lda":
-        cfg["model"]["family"] = "hsi_adapter"
-        cfg["data"]["preprocess"]["mode"] = "lda_pca"
+        if tag_key == "kernel_lda":
+            cfg["data"]["preprocess"]["mode"] = "kernel_lda"
+        elif tag_key == "lda_pca":
+            cfg["data"]["preprocess"]["mode"] = "lda_pca"
 
     elif model_key == "rgb":
         cfg["model"]["family"] = "rgb_vit"
@@ -162,7 +160,10 @@ def _run(run_log_path, output_root, args, config):
 
     if args.generate_synthetic:
         _fake_data(config, args)
+        
+    # none: read config.
     models = args.models or list(config.experiments.default_models)
+    tag_key = args.tag or str(config.data.preprocess.mode)
     for m in models:
         if m not in VALID_MODELS:
             raise ValueError(f"invalid model '{m}', valid: {', '.join(VALID_MODELS)}")
@@ -173,7 +174,7 @@ def _run(run_log_path, output_root, args, config):
     for idx, model_key in enumerate(models, start=1):
         tprint(f"[{idx}/{len(models)}] start model: {model_key}")
 
-        run_cfg = _apply_model_profile(config, model_key)
+        run_cfg = _apply_model_profile(config, model_key, tag_key)
         run_cfg = _to_munch(run_cfg)
 
         print(
