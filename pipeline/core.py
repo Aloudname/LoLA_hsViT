@@ -66,27 +66,40 @@ class Pipeline:
 
         modality = "rgb" if self.model_key == "rgb" else "hsi"
 
+        # build dataloaders
         stage_t0 = time.perf_counter()
         tprint(f"stage[data]: build dataloaders (modality={modality})")
         loaders, prepared = build_dataloaders(self.config, modality=modality)
         tprint(f"stage[data] done in {time.perf_counter() - stage_t0:.2f}s\n")
 
+        # dataset visualizations
         stage_t0 = time.perf_counter()
         tprint("stage[data-viz]: dataset visualizations before training")
         self._run_dataset_visualizations(prepared=prepared)
         tprint(f"stage[data-viz] done in {time.perf_counter() - stage_t0:.2f}s\n")
 
+        # build model, resolve shape
         stage_t0 = time.perf_counter()
         in_channels = self._resolve_input_channels(modality)
         tprint(f"stage[model]: build model (in_channels={in_channels})")
         model = self._build_model(in_channels=in_channels)
         tprint(f"stage[model] done in {time.perf_counter() - stage_t0:.2f}s\n")
 
+        # init trainer
         stage_t0 = time.perf_counter()
         tprint("stage[trainer]: init trainer")
         trainer = Trainer(model=model, config=self.config, output_dir=str(self.output_dir))
         tprint(f"stage[trainer] done in {time.perf_counter() - stage_t0:.2f}s\n")
 
+        # plot t-SNE of initial features
+        if self.config.visualization.tsne_enabled:
+                stage_t0 = time.perf_counter()
+                tprint("stage[pre-tsne]: plot t-SNE of pre features")
+                init_features, init_labels = trainer.extract_features(loaders["train"], max_points=int(self.config.visualization.tsne_max_points))
+                self.visualizer.plot_tsne(features=init_features, labels=init_labels, title=f"{self.model_key} initial feature tsne")
+                tprint(f"stage[pre-tsne] done in {time.perf_counter() - stage_t0:.2f}s\n")
+        
+        # train/eval loop
         stage_t0 = time.perf_counter()
         tprint("stage[train]: fit train/eval")
         trainer_result = trainer.fit(
@@ -99,6 +112,7 @@ class Pipeline:
             f"\t(best_epoch={trainer_result.best_epoch}, best_eval_dice={trainer_result.best_metric:.4f}\n)"
         )
 
+        # test predictions
         stage_t0 = time.perf_counter()
         tprint("stage[test]: predict on test loader")
         pred_pack = trainer.predict(
@@ -108,6 +122,7 @@ class Pipeline:
         )
         tprint(f"stage[test] done in {time.perf_counter() - stage_t0:.2f}s\n")
 
+        # analyze metrics
         stage_t0 = time.perf_counter()
         tprint("stage[metrics]: compute analyzer metrics")
         metrics_bundle = self.analyzer.compute_metrics(
@@ -123,11 +138,13 @@ class Pipeline:
         metrics_path = self._save_metrics(metrics_bundle, trainer_result)
         tprint(f"stage[metrics-save] done in {time.perf_counter() - stage_t0:.2f}s")
 
+        # post-visualizations
         stage_t0 = time.perf_counter()
         tprint("stage[viz]: generate visualizations")
         self._run_visualizations(metrics_bundle, trainer_result, pred_pack, prepared, modality)
         tprint(f"stage[viz] done in {time.perf_counter() - stage_t0:.2f}s")
 
+        # model export
         stage_t0 = time.perf_counter()
         tprint("stage[export]: export onnx")
         onnx_path = self._export_onnx(trainer, in_channels=in_channels)
@@ -166,6 +183,8 @@ class Pipeline:
             model = RGBViT(self.config)
         elif self.model_key == "unet":
             model = UNet(self.config)
+        elif self.model_key == "light":
+            model = HSIAdapter(self.config)
         else:
             raise ValueError(f"unknown model_key: {self.model_key}")
 
@@ -226,6 +245,7 @@ class Pipeline:
         modality: str,
     ) -> None:
         """generate all required plots."""
+        
         tprint("visualization: training curves")
         self.visualizer.plot_training_curves(trainer_result.history)
         tprint("visualization: prf/confusion/roc")

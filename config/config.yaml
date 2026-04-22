@@ -104,3 +104,4 @@ experiments:
     - "hsi"
     - "rgb"
     - "unet"
+    - "light"

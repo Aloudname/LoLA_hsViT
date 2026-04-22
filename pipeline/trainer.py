@@ -254,7 +254,7 @@ class Trainer:
             if eval_dice > best_metric:
                 best_metric = eval_dice
                 best_epoch = epoch
-                self.save_checkpoint(str(best_ckpt), best_epoch=best_epoch, metric=best_metric)
+                self.save_checkpoint(str(best_ckpt), epoch=best_epoch, metric=best_metric)
         self.load_checkpoint(str(best_ckpt))
 
         # Clean temporary checkpoint so the run output is ONNX-oriented.
@@ -485,7 +485,7 @@ class Trainer:
 
             # collect feature vectors for tsne.
             if hasattr(model, "forward_features") and collected_features < keep_features:
-                feat = model.forward_features(images)
+                feat = model(images)
                 feat_np = feat.detach().cpu().numpy()
                 b, c, h, w = feat_np.shape
                 feat_flat = np.moveaxis(feat_np, 1, -1).reshape(-1, c)

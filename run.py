@@ -18,6 +18,7 @@ VALID_MODELS = [
     "hsi",
     "rgb",
     "unet",
+    "light"
 ]
 
 
@@ -112,6 +113,9 @@ def _apply_model_profile(config: Munch, model_key: str, tag_key: str) -> Dict[st
     elif model_key == "unet":
         cfg["model"]["family"] = "unet"
         cfg["data"]["preprocess"]["mode"] = "none"
+        
+    elif model_key == "light":
+        cfg["model"]["family"] = "light_adapter"
 
     else:
         raise ValueError(f"unknown model key: {model_key}")
@@ -155,7 +159,7 @@ def main() -> None:
 
 
 def _run(run_log_path, output_root, args, config):
-    tprint(f"\tcli log file: {run_log_path}\n"
+    tprint(f"cli log file: {run_log_path}\n"
            f"\toutput root: {output_root}\n")
 
     if args.generate_synthetic:
