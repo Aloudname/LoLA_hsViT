@@ -187,8 +187,10 @@ class HSIAdapter(nn.Module):
         spatial_map = self.patch_embed(spectral_map)
         hs, ws = spatial_map.shape[2], spatial_map.shape[3]
 
+        # spatial tokens: (b, d, hs, ws) -> (b, hs*ws, d)
         spatial_tokens = spatial_map.flatten(2).transpose(1, 2)
 
+        # spectral tokens: (b, s, h, w) -> (b, s, hs*ws) -> (b, hs*ws, d)
         spectral_tokens = spectral_map.flatten(2).transpose(1, 2)
         spectral_tokens = self.spectral_token_proj(spectral_tokens)
 
