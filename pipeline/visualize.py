@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 # visualization methods for experiment analysis and paper figures.
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -40,7 +41,7 @@ class Visualizer:
         axes[1].set_ylabel("dice")
         axes[1].grid(alpha=0.3)
         axes[1].legend(loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=2, frameon=False)
-
+        
         fig.subplots_adjust(bottom=0.28, wspace=0.28)
         self._save_fig(fig, "curves/loss_dice_curves.png")
 
@@ -63,8 +64,7 @@ class Visualizer:
         ax.set_ylabel("score")
         ax.set_title("precision + recall + f1")
         ax.grid(axis="y", alpha=0.3)
-        has_legend = self._apply_external_legend(fig, ax, anchor=(1.02, 0.5))
-        if has_legend:
+        if has_legend := self._apply_external_legend(fig, ax, anchor=(1.02, 0.5)):
             fig.tight_layout(rect=(0.0, 0.0, 0.82, 1.0))
         else:
             fig.tight_layout()
@@ -88,9 +88,8 @@ class Visualizer:
             ax.set_yticklabels(self.class_names)
             ax.set_xlabel("predicted")
             ax.set_ylabel("true")
-            for i in range(mat.shape[0]):
-                for j in range(mat.shape[1]):
-                    ax.text(j, i, fmt.format(mat[i, j]), ha="center", va="center", fontsize=8)
+            for i, j in itertools.product(range(mat.shape[0]), range(mat.shape[1])):
+                ax.text(j, i, fmt.format(mat[i, j]), ha="center", va="center", fontsize=8)
 
         fig.colorbar(im0, ax=axes[0], shrink=0.8)
         fig.colorbar(im1, ax=axes[1], shrink=0.8)
@@ -214,8 +213,9 @@ class Visualizer:
         ax.set_xlabel("band index")
         ax.set_ylabel("normalized intensity")
         ax.grid(alpha=0.3)
-        has_legend = self._apply_external_legend(fig, ax, anchor=(1.02, 0.5), ncol=1, fontsize=9)
-        if has_legend:
+        if has_legend := self._apply_external_legend(
+            fig, ax, anchor=(1.02, 0.5), ncol=1, fontsize=9
+        ):
             fig.tight_layout(rect=(0.0, 0.0, 0.8, 1.0))
         else:
             fig.tight_layout()
@@ -241,8 +241,9 @@ class Visualizer:
         ax.set_title(title)
         ax.set_xticks([])
         ax.set_yticks([])
-        has_legend = self._apply_external_legend(fig, ax, anchor=(1.02, 0.5), fontsize=8)
-        if has_legend:
+        if has_legend := self._apply_external_legend(
+            fig, ax, anchor=(1.02, 0.5), fontsize=8
+        ):
             fig.tight_layout(rect=(0.0, 0.0, 0.8, 1.0))
         else:
             fig.tight_layout()

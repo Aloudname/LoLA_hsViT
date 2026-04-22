@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 # dataset and preprocessing pipeline for hsi/rgb segmentation.
 import json
 import shutil
@@ -55,11 +56,79 @@ class PreparedData:
     stats: Dict[str, Any]
 
 
+class KernelLDA:
+    """
+    kernel PCA + LDA for spectral reduction.
+    """
+    def __init__(self, 
+                n_components: int,
+                gamma: float = 1.0,
+                reg: float = 1e-5):
+        self.n_components = n_components
+        self.gamma = gamma
+        self.reg = reg
+
+    def fit(self, X: np.ndarray, y:np.ndarray) -> None:
+        self.X_train = X
+        K = rbf_kernel(X, self.gamma)
+
+        N = K.shape[0]
+        classes = np.unique(y)
+
+        # overall mean
+        one_n = np.ones((N, N)) / N
+        K_centered = K - one_n @ K - K @ one_n + one_n @ K @ one_n
+
+        # within-class scatter
+        Sw = np.zeros((N, N))
+        Sb = np.zeros((N, N))
+
+        for c in classes:
+            idx = np.where(y == c)[0]
+            Nc = len(idx)
+
+            Kc = K_centered[:, idx]
+            mean_c = np.mean(Kc, axis=1, keepdims=True)
+
+            Sw += Kc @ Kc.T
+            Sb += Nc * (mean_c @ mean_c.T)
+
+        # regularization
+        Sw += self.reg * np.eye(N)
+
+        # generalized eigenvalue problem
+        eigvals, eigvecs = np.linalg.eig(
+            np.linalg.pinv(Sw) @ Sb
+        )
+
+        idx = np.argsort(eigvals)[::-1]
+        self.alphas = eigvecs[:, idx[:self.n_components]]
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        K = rbf_kernel(X, self.gamma)
+        return K @ self.alphas
+
+
+def rbf_kernel(X: np.ndarray, gamma=1.0) -> np.ndarray:
+    """
+    Define the RBF kernel function:
+    
+    ```
+    k(x, y) = exp(-gamma * ||x - y||^2)
+    ```
+    """
+    
+    sq_dists = (
+        np.sum(X**2, axis=1, keepdims=True)
+        + np.sum(X**2, axis=1, keepdims=True).T
+        - 2 * X @ X.T
+    )
+    return np.exp(-gamma * sq_dists)
+
+
 def _as_munch(config: Mapping[str, Any]) -> Munch:
     """convert mapping to munch."""
-    if isinstance(config, Munch):
-        return config
-    return Munch.fromDict(dict(config))
+    return config if isinstance(config, Munch) else Munch.fromDict(dict(config))
 
 
 def _safe_ratio_triplet(train_ratio: float, eval_ratio: float, test_ratio: float) -> Tuple[float, float, float]:
@@ -85,10 +154,7 @@ def _iter_patch_positions(height: int, width: int, patch_size: int, stride: int)
         xs = list(range(0, width - patch_size + 1, stride))
         if xs[-1] != width - patch_size:
             xs.append(width - patch_size)
-
-    for y in ys:
-        for x in xs:
-            yield y, x
+    yield from itertools.product(ys, xs)
 
 
 def _pad_to_patch(image: np.ndarray, mask: np.ndarray, patch_size: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -121,14 +187,16 @@ def _should_keep_patch(
     - precious_class exists, or
     - foreground ratio >= threshold and background ratio <= max_background_ratio.
     """
-    has_small_target = bool(np.any(mask_patch == int(precious_class)))
-    fg_ratio = float(np.mean(mask_patch > 0))
-    bg_ratio = float(np.mean(mask_patch == 0))
+    has_small_target = bool(np.any(mask_patch == precious_class))
     if has_small_target:
         return True
-    if bg_ratio > float(max_background_ratio):
-        return False
-    return fg_ratio >= foreground_ratio_threshold
+    bg_ratio = float(np.mean(mask_patch == 0))
+    fg_ratio = float(np.mean(mask_patch > 0))
+    return (
+        False
+        if bg_ratio > max_background_ratio
+        else fg_ratio >= foreground_ratio_threshold
+    )
 
 
 class SpectralReducer:
@@ -141,10 +209,10 @@ class SpectralReducer:
     """
 
     def __init__(self, mode: str, output_dim: int, max_fit_pixels: int, seed: int) -> None:
-        self.mode = str(mode).lower()
-        self.output_dim = int(output_dim)
-        self.max_fit_pixels = int(max_fit_pixels)
-        self.seed = int(seed)
+        self.mode = mode.lower()
+        self.output_dim = output_dim
+        self.max_fit_pixels = max_fit_pixels
+        self.seed = seed
 
         self.pca: Optional[PCA] = None
         self.lda: Optional[LinearDiscriminantAnalysis] = None
@@ -152,7 +220,9 @@ class SpectralReducer:
         self.lda_dim = 0
         self.fitted = False
 
-    def fit(self, samples: Sequence[SampleItem], num_classes: int, show_progress: bool = True) -> None:
+    def fit(self, 
+            samples: Sequence[SampleItem],
+            num_classes: int, show_progress: bool = True) -> None:
         """fit reducer from train split pixels.
 
         input:
@@ -164,7 +234,7 @@ class SpectralReducer:
             return
 
         x_fit, y_fit = self._collect_pixels(samples, num_classes, show_progress=show_progress)
-        
+
         # debug
         # tprint("x.shape = ", x_fit.shape, "y.shape = ", y_fit.shape)
         tprint(f"Debugging before fitting reducer:\n"
@@ -179,40 +249,53 @@ class SpectralReducer:
             return
 
         if self.mode == "lda_pca":
-            if self.output_dim <= 1:
-                tprint("Warning: output_dim <= 1, skipping LDA and fitting PCA with output_dim=1")
-                self.pca_dim = min(1, x_fit.shape[-1])
-                self.pca = PCA(n_components=self.pca_dim)
-                self.pca.fit(x_fit)
-                self.lda = None
-                self.lda_dim = 0
-                self.fitted = True
-                return
-            
-            lda_dim = int(min(max(1, len(np.unique(y_fit)) - 1), self.output_dim - 1))
-            pca_dim = int(min(self.output_dim - lda_dim, x_fit.shape[-1]))
-            pca_dim = max(1, pca_dim)
-            tprint(f"Fitting spectral reducer with:\n" 
-                   f"\tPCA dim = {pca_dim}\n", 
-                   f"\tLDA dim = {lda_dim}\n")
+            return self._do_lda_pca(x_fit, y_fit)
+        
+        if self.mode == "kernel_lda":
+            return self._do_kernel_lda(x_fit, y_fit)
+        raise ValueError(f"unknown reducer mode: {self.mode}")
 
-            self.pca_dim = pca_dim
+    def _do_lda_pca(self, x_fit, y_fit) -> bool:
+        if self.output_dim <= 1:
+            tprint("Warning: output_dim <= 1, skipping LDA and fitting PCA with output_dim=1")
+            self.pca_dim = min(1, x_fit.shape[-1])
             self.pca = PCA(n_components=self.pca_dim)
             self.pca.fit(x_fit)
-
-            x_pca = self.pca.transform(x_fit)
-            try:
-                lda_dim = int(min(lda_dim, x_pca.shape[-1]))
-                self.lda = LinearDiscriminantAnalysis(n_components=lda_dim)
-                self.lda.fit(x_pca, y_fit)
-                self.lda_dim = lda_dim
-            except Exception:
-                self.lda = None
-                self.lda_dim = 0
+            self.lda = None
+            self.lda_dim = 0
             self.fitted = True
-            return
+            return None
+        
+        lda_dim = int(min(max(1, len(np.unique(y_fit)) - 1), self.output_dim - 1))
+        pca_dim = int(min(self.output_dim - lda_dim, x_fit.shape[-1]))
+        pca_dim = max(1, pca_dim)
+        tprint(f"Fitting spectral reducer with:\n" 
+               f"\tPCA dim = {pca_dim}\n", 
+               f"\tLDA dim = {lda_dim}\n")
 
-        raise ValueError(f"unknown reducer mode: {self.mode}")
+        self.pca_dim = pca_dim
+        self.pca = PCA(n_components=self.pca_dim)
+        self.pca.fit(x_fit)
+
+        x_pca = self.pca.transform(x_fit)
+        try:
+            lda_dim = int(min(lda_dim, x_pca.shape[-1]))
+            self.lda = LinearDiscriminantAnalysis(n_components=lda_dim)
+            self.lda.fit(x_pca, y_fit)
+            self.lda_dim = lda_dim
+        except Exception:
+            self.lda = None
+            self.lda_dim = 0
+        self.fitted = True
+
+    def _do_kernel_lda(self, x_fit, y_fit) -> bool:
+        lda_dim = int(min(max(1, len(np.unique(y_fit)) - 1), self.output_dim))
+        tprint(f"Fitting kernel LDA spectral reducer with:\n" 
+               f"\tLDA dim = {lda_dim}\n")
+        self.lda = KernelLDA(n_components=lda_dim)
+        self.lda.fit(x_fit, y_fit)
+        self.lda_dim = lda_dim
+        self.fitted = True
 
     def transform(self, image: np.ndarray) -> np.ndarray:
         """transform image channels.
@@ -229,7 +312,7 @@ class SpectralReducer:
 
         h, w, c = image.shape
         x = image.reshape(-1, c)
-        
+
         # debug
         # print(image.shape, x.shape)
 
@@ -239,11 +322,9 @@ class SpectralReducer:
             if self.pca is None:
                 raise RuntimeError("spectral reducer PCA stage is missing")
             x_pca = self.pca.transform(x).astype(np.float32)
-            parts.append(x_pca)
-            parts.append(self.lda.transform(x_pca).astype(np.float32))
-        if self.pca is not None:
-            if x_pca is None:
-                parts.append(self.pca.transform(x).astype(np.float32))
+            parts.extend((x_pca, self.lda.transform(x_pca).astype(np.float32)))
+        if self.pca is not None and x_pca is None:
+            parts.append(self.pca.transform(x).astype(np.float32))
 
         if not parts:
             return image
@@ -439,8 +520,7 @@ def _build_patch_records(
     tracked_pre = np.zeros(num_classes, dtype=np.int64)
     tracked_post = np.zeros(num_classes, dtype=np.int64)
 
-    precious_repeat = max(1, int(precious_repeat))
-    precious_class = int(precious_class)
+    precious_repeat = max(1, precious_repeat)
 
     sample_iter = tqdm(
         enumerate(samples),
@@ -473,13 +553,12 @@ def _build_patch_records(
             if sample.sample_id in tracked_set:
                 tracked_pre += patch_hist_once
 
-            keep = _should_keep_patch(
+            if keep := _should_keep_patch(
                 patch_mask,
                 foreground_ratio_threshold,
                 max_background_ratio=max_background_ratio,
                 precious_class=precious_class,
-            )
-            if keep:
+            ):
                 repeat_count = precious_repeat if has_precious else 1
                 for _ in range(repeat_count):
                     records.append(PatchRecord(sample_index=sample_index, top=top, left=left))
@@ -663,10 +742,10 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
             "tracked_pre_hist": tracked_pre.tolist(),
             "tracked_post_hist": tracked_post.tolist(),
             "sampling_policy": {
-                "foreground_ratio_threshold": float(split_threshold),
+                "foreground_ratio_threshold": split_threshold,
                 "max_background_ratio": float(split_max_background_ratio),
                 "precious_repeat": int(split_precious_repeat),
-                "precious_class": int(precious_class),
+                "precious_class": precious_class,
             },
         }
 
@@ -706,7 +785,7 @@ class BasePatchDataset(Dataset):
         self.config = config
         self.split = split
         self.modality = modality
-        self.training = bool(training)
+        self.training = training
 
         self.prepared = prepared or prepare_data(self.config, modality=modality)
         self.samples = self.prepared.samples_by_split[split]
@@ -867,7 +946,7 @@ def build_dataloaders(config: Munch, modality: str) -> Tuple[Dict[str, DataLoade
     loader_kwargs: Dict[str, Any] = {
         "num_workers": num_workers,
         "pin_memory": bool(use_cuda),
-        "persistent_workers": bool(num_workers > 0),
+        "persistent_workers": num_workers > 0,
     }
     if num_workers > 0:
         loader_kwargs["prefetch_factor"] = prefetch_factor
@@ -1031,7 +1110,7 @@ def generate_synthetic_dataset(
 
         kernel = np.ones((3, 3), dtype=np.uint8)
         boundary = cv2.morphologyEx(mask_2d.astype(np.uint8), cv2.MORPH_GRADIENT, kernel) > 0
-        random_flip = sample_rng.random(size=mask_2d.shape) < float(label_noise_prob)
+        random_flip = sample_rng.random(size=mask_2d.shape) < label_noise_prob
         flip_mask = boundary & random_flip
         if not np.any(flip_mask):
             return mask_2d
@@ -1109,15 +1188,15 @@ def generate_synthetic_dataset(
 
     manifest = {
         "generator": "synthetic_hard_v2",
-        "seed": int(seed),
-        "num_subjects": int(num_subjects),
-        "samples_per_subject": int(samples_per_subject),
-        "image_size": int(image_size),
-        "num_bands": int(num_bands),
-        "domain_shift_strength": float(domain_shift_strength),
-        "noise_std": float(noise_std),
-        "boundary_mix_sigma": float(boundary_mix_sigma),
-        "label_noise_prob": float(label_noise_prob),
+        "seed": seed,
+        "num_subjects": num_subjects,
+        "samples_per_subject": samples_per_subject,
+        "image_size": image_size,
+        "num_bands": num_bands,
+        "domain_shift_strength": domain_shift_strength,
+        "noise_std": noise_std,
+        "boundary_mix_sigma": boundary_mix_sigma,
+        "label_noise_prob": label_noise_prob,
     }
     with (root / "synthetic_manifest.json").open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)

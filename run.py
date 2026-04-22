@@ -78,9 +78,7 @@ def _parse_value(raw: str) -> Any:
     if text.lower() in {"true", "false"}:
         return text.lower() == "true"
     try:
-        if "." in text:
-            return float(text)
-        return int(text)
+        return float(text) if "." in text else int(text)
     except ValueError:
         return text
 
@@ -155,88 +153,95 @@ def main() -> None:
     run_log_path = output_root / "logs" / f"run_{run_stamp}.log"
 
     with _capture_console(run_log_path):
-        tprint(f"\tcli log file: {run_log_path}\n"
-               f"\toutput root: {output_root}\n")
+        _run(run_log_path, output_root, args, config)
 
-        if args.generate_synthetic:
-            synth_cfg = getattr(config.data, "synthetic", None)
-            domain_shift_strength = float(getattr(synth_cfg, "domain_shift_strength", 0.12))
-            noise_std = float(getattr(synth_cfg, "noise_std", 0.03))
-            boundary_mix_sigma = float(getattr(synth_cfg, "boundary_mix_sigma", 1.2))
-            label_noise_prob = float(getattr(synth_cfg, "label_noise_prob", 0.01))
 
-            tprint(
-                "generate synthetic dataset: "
-                f"  root={args.synthetic_root}, subjects={int(args.synthetic_subjects)} "
-                f"  samples_per_subject={int(args.synthetic_samples_per_subject)} "
-                f"  image_size={int(args.synthetic_image_size)} "
-                f"  domain_shift_strength={domain_shift_strength}, noise_std={noise_std} "
-                f"  boundary_mix_sigma={boundary_mix_sigma}, label_noise_prob={label_noise_prob}\n"
-            )
-            synth_paths = generate_synthetic_dataset(
-                root_dir=args.synthetic_root,
-                num_subjects=int(args.synthetic_subjects),
-                samples_per_subject=int(args.synthetic_samples_per_subject),
-                image_size=int(args.synthetic_image_size),
-                num_bands=int(config.data.hsi_bands),
-                seed=int(config.runtime.seed),
-                domain_shift_strength=domain_shift_strength,
-                noise_std=noise_std,
-                boundary_mix_sigma=boundary_mix_sigma,
-                label_noise_prob=label_noise_prob,
-            )
-            config.path.hsi_dir = synth_paths["hsi_dir"]
-            config.path.label_dir = synth_paths["label_dir"]
-            config.path.rgb_dir = synth_paths["rgb_dir"]
+def _run(run_log_path, output_root, args, config):
+    tprint(f"\tcli log file: {run_log_path}\n"
+           f"\toutput root: {output_root}\n")
 
-        models = args.models or list(config.experiments.default_models)
-        for m in models:
-            if m not in VALID_MODELS:
-                raise ValueError(f"invalid model '{m}', valid: {', '.join(VALID_MODELS)}")
+    if args.generate_synthetic:
+        _fake_data(config, args)
+    models = args.models or list(config.experiments.default_models)
+    for m in models:
+        if m not in VALID_MODELS:
+            raise ValueError(f"invalid model '{m}', valid: {', '.join(VALID_MODELS)}")
 
-        summary: List[Dict[str, Any]] = []
-        tprint(f"run queue: {models}")
+    summary: List[Dict[str, Any]] = []
+    tprint(f"run queue: {models}")
 
-        for idx, model_key in enumerate(models, start=1):
-            tprint(f"[{idx}/{len(models)}] start model: {model_key}")
+    for idx, model_key in enumerate(models, start=1):
+        tprint(f"[{idx}/{len(models)}] start model: {model_key}")
 
-            run_cfg = _apply_model_profile(config, model_key)
-            run_cfg = _to_munch(run_cfg)
-            
-            print(
-                f"[{idx}/{len(models)}] profile:\n"
-                f"\tfamily={run_cfg.model.family}\n"
-                f"\tpreprocess={run_cfg.data.preprocess.mode}\n"
-                f"\tuse_pretrained={bool(run_cfg.model.get('use_pretrained', False))}\n"
-                f"\tpretrained_weights={bool(run_cfg.model.get('pretrained_weights', True))}\n"
-            )
-            pipeline = Pipeline(run_cfg, model_key=model_key)
-            result = pipeline.run()
+        run_cfg = _apply_model_profile(config, model_key)
+        run_cfg = _to_munch(run_cfg)
 
-            summary.append(
-                {
-                    "model": result.model_key,
-                    "output_dir": result.output_dir,
-                    "best_epoch": result.best_epoch,
-                    "best_eval_dice": result.best_eval_dice,
-                    "test_summary": result.test_summary,
-                    "metrics_json": result.metrics_json,
-                    "onnx_path": result.onnx_path,
-                    "onnx_note_path": result.onnx_note_path,
-                }
-            )
+        print(
+            f"[{idx}/{len(models)}] profile:\n"
+            f"\tfamily={run_cfg.model.family}\n"
+            f"\tpreprocess={run_cfg.data.preprocess.mode}\n"
+            f"\tuse_pretrained={bool(run_cfg.model.get('use_pretrained', False))}\n"
+            f"\tpretrained_weights={bool(run_cfg.model.get('pretrained_weights', True))}\n"
+        )
+        pipeline = Pipeline(run_cfg, model_key=model_key)
+        result = pipeline.run()
 
-            tprint(
-                f"[{idx}/{len(models)}] done model: {model_key}\n"
-                f"  best_eval_dice={result.best_eval_dice:.4f}"
-            )
+        summary.append(
+            {
+                "model": result.model_key,
+                "output_dir": result.output_dir,
+                "best_epoch": result.best_epoch,
+                "best_eval_dice": result.best_eval_dice,
+                "test_summary": result.test_summary,
+                "metrics_json": result.metrics_json,
+                "onnx_path": result.onnx_path,
+                "onnx_note_path": result.onnx_note_path,
+            }
+        )
 
-        output_root.mkdir(parents=True, exist_ok=True)
-        summary_path = output_root / "run_summary.json"
-        with summary_path.open("w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2, ensure_ascii=False)
+        tprint(
+            f"[{idx}/{len(models)}] done model: {model_key}\n"
+            f"  best_eval_dice={result.best_eval_dice:.4f}"
+        )
 
-        tprint(f"all done, summary saved to: {summary_path}")
+    output_root.mkdir(parents=True, exist_ok=True)
+    summary_path = output_root / "run_summary.json"
+    with summary_path.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    tprint(f"all done, summary saved to: {summary_path}")
+
+
+def _fake_data(config, args):
+    synth_cfg = getattr(config.data, "synthetic", None)
+    domain_shift_strength = float(getattr(synth_cfg, "domain_shift_strength", 0.12))
+    noise_std = float(getattr(synth_cfg, "noise_std", 0.03))
+    boundary_mix_sigma = float(getattr(synth_cfg, "boundary_mix_sigma", 1.2))
+    label_noise_prob = float(getattr(synth_cfg, "label_noise_prob", 0.01))
+
+    tprint(
+        "generate synthetic dataset: "
+        f"  root={args.synthetic_root}, subjects={int(args.synthetic_subjects)} "
+        f"  samples_per_subject={int(args.synthetic_samples_per_subject)} "
+        f"  image_size={int(args.synthetic_image_size)} "
+        f"  domain_shift_strength={domain_shift_strength}, noise_std={noise_std} "
+        f"  boundary_mix_sigma={boundary_mix_sigma}, label_noise_prob={label_noise_prob}\n"
+    )
+    synth_paths = generate_synthetic_dataset(
+        root_dir=args.synthetic_root,
+        num_subjects=int(args.synthetic_subjects),
+        samples_per_subject=int(args.synthetic_samples_per_subject),
+        image_size=int(args.synthetic_image_size),
+        num_bands=int(config.data.hsi_bands),
+        seed=int(config.runtime.seed),
+        domain_shift_strength=domain_shift_strength,
+        noise_std=noise_std,
+        boundary_mix_sigma=boundary_mix_sigma,
+        label_noise_prob=label_noise_prob,
+    )
+    config.path.hsi_dir = synth_paths["hsi_dir"]
+    config.path.label_dir = synth_paths["label_dir"]
+    config.path.rgb_dir = synth_paths["rgb_dir"]
 
 
 if __name__ == "__main__":

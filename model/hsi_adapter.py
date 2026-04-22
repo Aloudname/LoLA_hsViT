@@ -24,12 +24,17 @@ class SpectralEncoder(nn.Module):
             nn.BatchNorm2d(64),
             nn.GELU(),
             nn.Conv2d(64, out_channels, 1),
+            nn.Conv2d(in_channels, 64, 1),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.Conv2d(64, out_channels, 1),
             nn.BatchNorm2d(out_channels),
             nn.GELU(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(x)
+
 
 class SpectralSE(nn.Module):
     """Squeeze-and-Excitation for spectral-wise attention."""
@@ -51,6 +56,7 @@ class SpectralSE(nn.Module):
         y = self.pool(x).view(b, c)      # (b, c)
         y = self.fc(y).view(b, c, 1, 1) # (b, c, 1, 1)
         return x * y
+
 
 class CrossAttentionFusion(nn.Module):
     """cross attention from spatial tokens to spectral tokens.
@@ -172,6 +178,7 @@ class HSIAdapter(nn.Module):
         """
         spectral_map = self.spectral_encoder(x)
         spectral_map = self.spectral_se(spectral_map)
+        spectral_map = self.spectral_se(spectral_map)
         return self._forward_features_from_spectral(spectral_map)
 
     def _forward_features_from_spectral(self, spectral_map: torch.Tensor) -> torch.Tensor:
@@ -218,6 +225,7 @@ class HSIAdapter(nn.Module):
         h, w = x.shape[2], x.shape[3]
         spectral_map = self.spectral_encoder(x)
         spectral_map = self.spectral_se(spectral_map)
+        
         skip = self.skip_proj(spectral_map)
 
         feat_map = self._forward_features_from_spectral(spectral_map)
@@ -225,5 +233,4 @@ class HSIAdapter(nn.Module):
         dec = F.interpolate(dec, size=(h, w), mode="bilinear", align_corners=False)
 
         fused = torch.cat([dec, skip], dim=1)
-        logits = self.seg_head(self.fuse_head(fused))
-        return logits
+        return self.seg_head(self.fuse_head(fused))
