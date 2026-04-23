@@ -257,9 +257,11 @@ class Visualizer:
         explained_variance_ratio: Optional[np.ndarray] = None,
         pca_dim: Optional[int] = None,
         lda_dim: Optional[int] = None,
-        title: str = "PCA-LDA feature comparison",
+        title: str = "spectral reducer feature comparison",
+        pca_label: str = "PCA",
+        lda_label: str = "Reducer",
     ) -> None:
-        """plot paper-style comparison between PCA and PCA-LDA projections."""
+        """plot paper-style comparison between reference projection and reducer projection."""
         if pca_features.size == 0 or lda_features.size == 0 or labels.size == 0:
             return
 
@@ -338,7 +340,7 @@ class Visualizer:
                 ax.text(
                     0.04,
                     0.08,
-                    f"PCA dim = {mark_x}\nexplained = {mark_y:.3f}",
+                    f"{pca_label} dim = {mark_x}\nexplained = {mark_y:.3f}",
                     transform=ax.transAxes,
                     fontsize=9,
                     va="bottom",
@@ -349,7 +351,7 @@ class Visualizer:
             ax.set_ylim(0.0, 1.02)
         else:
             ax.text(0.5, 0.5, "PCA variance data unavailable", ha="center", va="center", transform=ax.transAxes)
-        ax.set_title("PCA variance retention")
+        ax.set_title(f"{pca_label} variance retention")
         ax.set_xlabel("principal component")
         ax.set_ylabel("cumulative variance")
         ax.grid(alpha=0.25)
@@ -399,15 +401,15 @@ class Visualizer:
             ax.set_aspect("equal", adjustable="datalim")
             ax.text(0.02, 0.97, panel_label, transform=ax.transAxes, ha="left", va="top", fontsize=11, fontweight="semibold")
 
-        _scatter_panel(flat_axes[1], pca_xy, pca_centroids, "(b)", "PCA projection", "PC")
-        _scatter_panel(flat_axes[2], lda_xy, lda_centroids, "(c)", "PCA + LDA projection", "LD")
+        _scatter_panel(flat_axes[1], pca_xy, pca_centroids, "(b)", f"{pca_label} projection", pca_label[:2].upper())
+        _scatter_panel(flat_axes[2], lda_xy, lda_centroids, "(c)", f"{lda_label} projection", lda_label[:2].upper())
 
         heat_ax = flat_axes[3]
         heat_ax.axis("off")
         heat_gs = heat_ax.get_subplotspec().subgridspec(1, 2, wspace=0.18)
         hm_axes = [fig.add_subplot(heat_gs[0, i]) for i in range(2)]
 
-        hm_titles = ["PCA centroid distance", "PCA + LDA centroid distance"]
+        hm_titles = [f"{pca_label} centroid distance", f"{lda_label} centroid distance"]
         hm_mats = [pca_dist, lda_dist]
         hm_texts = ["(d1)", "(d2)"]
         for idx, (hax, mat, htitle, htxt) in enumerate(zip(hm_axes, hm_mats, hm_titles, hm_texts)):

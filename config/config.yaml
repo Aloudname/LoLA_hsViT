@@ -26,9 +26,20 @@ data:
     test: 0.10 # used in pipeline.dataset._split_subjects.
     seed: 350234 # used in pipeline.dataset and pipeline.core for deterministic behavior.
   preprocess:
-    mode: "none" # used in pipeline.dataset.SpectralReducer; options: none, supervised_pca, lda_pca, kernel_lda.
-    output_dim: 8 # used in spectral reducer and hsi model input channels for method b.
-    max_fit_pixels: 500000 # used in reducer fit sampling budget.
+    mode: "none" # used in pipeline.dataset.SpectralReducer; options: none, supervised_pca, lda_pca, kernel_lda, pca_nca.
+    output_dim: 8 # final reduced HSI channels fed into HSIAdapter / vit backbone pipeline.
+    max_fit_pixels: 500000 # pixel budget for reducer fitting from real train split only.
+    snv: true # standard normal variate per pixel; suppresses illumination/amplitude drift common in medical HSI.
+    derivative_order: 1 # spectral derivative order before supervised compression; 1 is usually a strong default.
+    savgol_window: 7 # Savitzky-Golay window length for smooth derivative estimation.
+    savgol_polyorder: 2 # Savitzky-Golay polynomial order.
+    standardize: true # z-score each spectral feature across sampled training pixels before PCA/NCA.
+    pca_whiten: true # whiten PCA features before the discriminative stage.
+    pca_dim: 24 # intermediate PCA dimension before NCA; should be > output_dim.
+    nca_max_fit_pixels: 40000 # balanced pixel budget used specifically by NCA to keep fitting stable and efficient.
+    nca_max_iter: 200 # max iterations for Neighborhood Components Analysis.
+    nca_tol: 1.0e-5 # convergence tolerance for NCA.
+    nca_init: "pca" # NCA initialization; pca is typically more stable than random.
   synthetic:
     domain_shift_strength: 0.08 # medium difficulty: patient/sample spectral domain shift close to clinical acquisition variability.
     noise_std: 0.02 # medium difficulty: moderate sensor and per-pixel noise.

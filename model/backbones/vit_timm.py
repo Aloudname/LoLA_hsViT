@@ -1,112 +1,228 @@
-# import models from timm through huggingface.
-from __future__ import annotations
+import math
+from typing import Iterable, Optional, Sequence, Tuple
 
-from pathlib import Path
-from typing import Optional
+import timm
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from model.backbones.base import BaseBackbone
-import os, torch, torch.nn as nn, torch.nn.functional as F
+
+def _to_pattern_list(patterns: Optional[Iterable[str]]) -> Sequence[str]:
+    if patterns is None:
+        return []
+    if isinstance(patterns, str):
+        text = patterns.strip()
+        if not text:
+            return []
+        if text.startswith("[") and text.endswith("]"):
+            text = text[1:-1]
+        return [part.strip().strip("'"") for part in text.split(",") if part.strip()]
+    return [str(pattern).strip() for pattern in patterns if str(pattern).strip()]
 
 
-# internal mirror
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-
-class TimmViTBackbone(BaseBackbone):
-    """timm ViT block wrapper for token inputs [B, N, D].
-
-    timm ViT blocks do not add position embeddings by themselves. Position
-    embeddings are added manually before entering block stacks.
-    """
-
+class TimmViTBackbone(nn.Module):
     def __init__(
         self,
-        input_dim: int,
-        name: str = "vit_small_patch16_224",
+        model_name: str = "vit_base_patch16_224",
         pretrained: bool = True,
-        freeze: bool = True,
-        cache_dir: Optional[str] = None,
-    ) -> None:
+        embed_dim: Optional[int] = None,
+        drop_rate: float = 0.0,
+        attn_drop_rate: float = 0.0,
+        drop_path_rate: float = 0.0,
+        freeze: bool = False,
+        unfreeze_last_n: int = 0,
+        trainable_patterns: Optional[Iterable[str]] = None,
+        unfreeze_patterns: Optional[Iterable[str]] = None,
+        train_pos_embed: bool = False,
+        pos_embed_interp: str = "2d",
+        strict_input_dim: bool = False,
+    ):
         super().__init__()
+        self.vit = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            num_classes=0,
+            global_pool="",
+            drop_rate=drop_rate,
+            attn_drop_rate=attn_drop_rate,
+            drop_path_rate=drop_path_rate,
+        )
 
-        try:
-            import timm
-        except Exception as exc:  # pragma: no cover - environment specific
-            raise RuntimeError("timm is required for pretrained ViT backbone") from exc
+        self.model_name = model_name
+        self.vit_embed_dim = int(getattr(self.vit, "embed_dim"))
+        self.input_embed_dim = int(embed_dim or self.vit_embed_dim)
+        self.output_embed_dim = self.input_embed_dim
+        self.pos_embed_interp = str(pos_embed_interp).lower()
+        self.strict_input_dim = bool(strict_input_dim)
 
-        resolved_cache_dir: Optional[str] = None
-        if cache_dir is not None and str(cache_dir).strip() != "":
-            resolved_cache_dir = str(Path(cache_dir).expanduser())
-            Path(resolved_cache_dir).mkdir(parents=True, exist_ok=True)
+        self.input_proj = (
+            nn.Identity() if self.input_embed_dim == self.vit_embed_dim else nn.Linear(self.input_embed_dim, self.vit_embed_dim)
+        )
+        self.output_proj = (
+            nn.Identity() if self.output_embed_dim == self.vit_embed_dim else nn.Linear(self.vit_embed_dim, self.output_embed_dim)
+        )
 
-        vit = timm.create_model(name, pretrained=pretrained, cache_dir=resolved_cache_dir)
-        if not hasattr(vit, "blocks") or not hasattr(vit, "norm"):
-            raise ValueError(f"{name} is not a supported timm ViT-like model")
+        prefix_tokens = int(getattr(self.vit, "num_prefix_tokens", 0))
+        if prefix_tokens == 0:
+            prefix_tokens = 1 if getattr(self.vit, "cls_token", None) is not None else 0
+            if getattr(self.vit, "dist_token", None) is not None:
+                prefix_tokens += 1
+        self.num_prefix_tokens = prefix_tokens
 
-        vit_dim = int(getattr(vit, "embed_dim", input_dim))
-        self.input_dim = int(input_dim)
-        self.vit_dim = vit_dim
-        self.hidden_dim = self.input_dim
+        self._configure_trainability(
+            freeze=freeze,
+            unfreeze_last_n=unfreeze_last_n,
+            trainable_patterns=_to_pattern_list(trainable_patterns),
+            unfreeze_patterns=_to_pattern_list(unfreeze_patterns),
+            train_pos_embed=train_pos_embed,
+        )
 
-        self.in_proj = nn.Identity() if self.input_dim == self.vit_dim else nn.Linear(self.input_dim, self.vit_dim)
-        self.out_proj = nn.Identity() if self.vit_dim == self.input_dim else nn.Linear(self.vit_dim, self.input_dim)
-
-        self.blocks = vit.blocks
-        self.norm = vit.norm
-        self.pos_drop = vit.pos_drop if hasattr(vit, "pos_drop") else nn.Identity()
-
-        self.num_prefix_tokens = int(getattr(vit, "num_prefix_tokens", 1))
-
-        self.use_pos_embed = bool(hasattr(vit, "pos_embed") and (vit.pos_embed is not None))
-        if self.use_pos_embed:
-            pos_embed = vit.pos_embed.detach().clone()
-            if pos_embed.ndim != 3 or pos_embed.shape[-1] != self.vit_dim:
-                self.use_pos_embed = False
-            else:
-                if self.num_prefix_tokens > 0 and pos_embed.shape[1] > self.num_prefix_tokens:
-                    pos_embed = pos_embed[:, self.num_prefix_tokens :, :]
-                elif self.num_prefix_tokens > 0 and pos_embed.shape[1] <= self.num_prefix_tokens:
-                    self.use_pos_embed = False
-
-                if self.use_pos_embed and pos_embed.shape[1] > 0:
-                    self.register_buffer("base_pos_embed", pos_embed, persistent=False)
-                else:
-                    self.use_pos_embed = False
+    def _configure_trainability(
+        self,
+        freeze: bool,
+        unfreeze_last_n: int,
+        trainable_patterns: Sequence[str],
+        unfreeze_patterns: Sequence[str],
+        train_pos_embed: bool,
+    ) -> None:
+        for parameter in self.vit.parameters():
+            parameter.requires_grad = not freeze
 
         if freeze:
-            for p in self.blocks.parameters():
-                p.requires_grad_(False)
-            for p in self.norm.parameters():
-                p.requires_grad_(False)
+            if hasattr(self.vit, "blocks") and unfreeze_last_n > 0:
+                for block in self.vit.blocks[-int(unfreeze_last_n):]:
+                    for parameter in block.parameters():
+                        parameter.requires_grad = True
 
-    def _get_pos_embed(self, token_len: int, device: torch.device, dtype: torch.dtype) -> Optional[torch.Tensor]:
-        if not self.use_pos_embed:
+                if hasattr(self.vit, "norm"):
+                    for parameter in self.vit.norm.parameters():
+                        parameter.requires_grad = True
+
+            active_patterns = list(trainable_patterns) + list(unfreeze_patterns)
+            if active_patterns:
+                for name, parameter in self.vit.named_parameters():
+                    if any(pattern in name for pattern in active_patterns):
+                        parameter.requires_grad = True
+
+            if train_pos_embed:
+                for name in ("pos_embed", "cls_token", "dist_token"):
+                    tensor = getattr(self.vit, name, None)
+                    if isinstance(tensor, nn.Parameter):
+                        tensor.requires_grad = True
+
+        for parameter in self.input_proj.parameters():
+            parameter.requires_grad = True
+        for parameter in self.output_proj.parameters():
+            parameter.requires_grad = True
+
+    def _infer_source_grid(self, token_count: int) -> Optional[Tuple[int, int]]:
+        patch_embed = getattr(self.vit, "patch_embed", None)
+        grid_size = getattr(patch_embed, "grid_size", None)
+        if isinstance(grid_size, tuple) and len(grid_size) == 2 and grid_size[0] * grid_size[1] == token_count:
+            return int(grid_size[0]), int(grid_size[1])
+
+        side = int(round(math.sqrt(token_count)))
+        if side * side == token_count:
+            return side, side
+
+        for height in range(int(math.sqrt(token_count)), 0, -1):
+            if token_count % height == 0:
+                return height, token_count // height
+        return None
+
+    def _infer_target_grid(self, token_count: int) -> Optional[Tuple[int, int]]:
+        side = int(round(math.sqrt(token_count)))
+        if side * side == token_count:
+            return side, side
+
+        for height in range(int(math.sqrt(token_count)), 0, -1):
+            if token_count % height == 0:
+                return height, token_count // height
+        return None
+
+    def _resize_pos_embed(self, token_count: int, device: torch.device, dtype: torch.dtype) -> Optional[torch.Tensor]:
+        pos_embed = getattr(self.vit, "pos_embed", None)
+        if pos_embed is None:
             return None
 
-        pos = self.base_pos_embed.to(device=device, dtype=dtype)
-        if pos.shape[1] == token_len:
-            return pos
+        prefix_tokens = self.num_prefix_tokens
+        prefix = pos_embed[:, :prefix_tokens]
+        spatial = pos_embed[:, prefix_tokens:]
 
-        # 1D interpolation is robust for variable token lengths.
-        pos_1d = pos.transpose(1, 2)
-        pos_1d = F.interpolate(pos_1d, size=token_len, mode="linear", align_corners=False)
-        return pos_1d.transpose(1, 2)
+        if spatial.shape[1] == token_count:
+            full_pos = torch.cat([prefix, spatial], dim=1)
+            return full_pos.to(device=device, dtype=dtype)
+
+        source_grid = self._infer_source_grid(spatial.shape[1])
+        target_grid = self._infer_target_grid(token_count)
+
+        use_2d = (
+            self.pos_embed_interp in {"2d", "bicubic", "bilinear"}
+            and source_grid is not None
+            and target_grid is not None
+            and source_grid[0] * source_grid[1] == spatial.shape[1]
+            and target_grid[0] * target_grid[1] == token_count
+        )
+
+        if use_2d:
+            mode = "bicubic" if self.pos_embed_interp in {"2d", "bicubic"} else "bilinear"
+            spatial = spatial.reshape(1, source_grid[0], source_grid[1], -1).permute(0, 3, 1, 2)
+            spatial = F.interpolate(spatial, size=target_grid, mode=mode, align_corners=False)
+            spatial = spatial.permute(0, 2, 3, 1).reshape(1, token_count, -1)
+        else:
+            spatial = spatial.transpose(1, 2)
+            spatial = F.interpolate(spatial, size=token_count, mode="linear", align_corners=False)
+            spatial = spatial.transpose(1, 2)
+
+        full_pos = torch.cat([prefix, spatial], dim=1)
+        return full_pos.to(device=device, dtype=dtype)
+
+    def _prefix_tokens(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        prefixes = []
+        cls_token = getattr(self.vit, "cls_token", None)
+        if cls_token is not None:
+            prefixes.append(cls_token.expand(batch_size, -1, -1))
+        dist_token = getattr(self.vit, "dist_token", None)
+        if dist_token is not None:
+            prefixes.append(dist_token.expand(batch_size, -1, -1))
+        if not prefixes:
+            return torch.empty(batch_size, 0, self.vit_embed_dim, device=device, dtype=dtype)
+        return torch.cat(prefixes, dim=1).to(device=device, dtype=dtype)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         if tokens.ndim != 3:
-            raise ValueError(f"expected [B, N, D] tokens, got shape={tuple(tokens.shape)}")
-        if tokens.shape[-1] != self.input_dim:
+            raise ValueError(f"TimmViTBackbone expects [B, N, D] tokens, got shape {tuple(tokens.shape)}")
+
+        if self.strict_input_dim and tokens.shape[-1] != self.input_embed_dim:
             raise ValueError(
-                f"expected token dim D={self.input_dim}, got D={tokens.shape[-1]}"
+                f"Expected token dim {self.input_embed_dim}, received {tokens.shape[-1]} for backbone {self.model_name}."
             )
 
-        x = self.in_proj(tokens)
-        pos_embed = self._get_pos_embed(token_len=x.shape[1], device=x.device, dtype=x.dtype)
-        if pos_embed is not None:
+        x = self.input_proj(tokens)
+        batch_size, token_count, _ = x.shape
+
+        prefix = self._prefix_tokens(batch_size, x.device, x.dtype)
+        if prefix.shape[1] > 0:
+            x = torch.cat([prefix, x], dim=1)
+
+        pos_embed = self._resize_pos_embed(token_count, x.device, x.dtype)
+        if pos_embed is not None and pos_embed.shape[1] == x.shape[1]:
             x = x + pos_embed
 
-        x = self.pos_drop(x)
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.norm(x)
-        x = self.out_proj(x)
+        if hasattr(self.vit, "pos_drop"):
+            x = self.vit.pos_drop(x)
+
+        if hasattr(self.vit, "patch_drop"):
+            x = self.vit.patch_drop(x)
+
+        for block in self.vit.blocks:
+            x = block(x)
+
+        if hasattr(self.vit, "norm"):
+            x = self.vit.norm(x)
+
+        if prefix.shape[1] > 0:
+            x = x[:, prefix.shape[1] :, :]
+
+        x = self.output_proj(x)
         return x

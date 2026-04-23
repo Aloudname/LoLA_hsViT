@@ -4,11 +4,14 @@ from tqdm import tqdm
 from munch import Munch
 from pathlib import Path
 from scipy.linalg import eig
+from scipy.signal import savgol_filter
 from dataclasses import dataclass
 from sklearn.decomposition import PCA
 from tqdm import TqdmExperimentalWarning
 from torch.utils.data import DataLoader, Dataset
+from sklearn.preprocessing import StandardScaler
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.neighbors import NeighborhoodComponentsAnalysis
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from pipeline.monitor import tprint
@@ -151,129 +154,331 @@ class SpectralReducer:
     - none: identity.
     - supervised_pca: pca on class-balanced train pixels.
     - lda_pca: pca first, then lda on pca features.
+    - kernel_lda: random fourier feature projection + lda.
+    - pca_nca: optional spectral normalization/derivative, then pca + neighborhood components analysis.
     """
 
-    def __init__(self, mode: str, output_dim: int, max_fit_pixels: int, seed: int) -> None:
+    def __init__(
+        self,
+        mode: str,
+        output_dim: int,
+        max_fit_pixels: int,
+        seed: int,
+        preprocess_cfg: Optional[Mapping[str, Any]] = None,
+    ) -> None:
         self.mode = mode.lower()
         self.output_dim = output_dim
         self.max_fit_pixels = max_fit_pixels
         self.seed = seed
 
-        self.pca: Optional[PCA] = None
+        cfg = _as_munch(preprocess_cfg or {})
+        self.enable_snv = bool(getattr(cfg, "snv", self.mode == "pca_nca"))
+        self.derivative_order = max(0, int(getattr(cfg, "derivative_order", 1 if self.mode == "pca_nca" else 0)))
+        self.savgol_window = max(3, int(getattr(cfg, "savgol_window", 7)))
+        self.savgol_polyorder = max(1, int(getattr(cfg, "savgol_polyorder", 2)))
+        self.enable_standardize = bool(getattr(cfg, "standardize", self.mode == "pca_nca"))
+        self.pca_whiten = bool(getattr(cfg, "pca_whiten", self.mode == "pca_nca"))
+        self.pca_dim_override = max(0, int(getattr(cfg, "pca_dim", 0)))
+        self.nca_max_fit_pixels = max(256, int(getattr(cfg, "nca_max_fit_pixels", min(max_fit_pixels, 40000))))
+        self.nca_max_iter = max(20, int(getattr(cfg, "nca_max_iter", 200)))
+        self.nca_tol = float(getattr(cfg, "nca_tol", 1e-5))
+        self.nca_init = str(getattr(cfg, "nca_init", "pca"))
+
+        self.scaler: Optional[StandardScaler] = None
+        self.pca: Optional[Any] = None
         self.lda: Optional[LinearDiscriminantAnalysis] = None
+        self.nca: Optional[NeighborhoodComponentsAnalysis] = None
         self.pca_dim = 0
         self.lda_dim = 0
+        self.final_dim = 0
+        self.reference_projection_name = "PCA"
+        self.reduced_projection_name = "Reducer"
         self.fitted = False
 
-    def fit(self, 
-            samples: Sequence[SampleItem],
-            num_classes: int, show_progress: bool = True) -> None:
-        """fit reducer from train split pixels.
-
-        input:
-            samples: training samples.
-            num_classes: class count.
-        """
+    def fit(
+        self,
+        samples: Sequence[SampleItem],
+        num_classes: int,
+        show_progress: bool = True,
+    ) -> None:
+        """fit reducer from train split pixels."""
         if self.mode == "none":
             self.fitted = True
+            self.reference_projection_name = "Raw spectra"
+            self.reduced_projection_name = "Raw spectra"
             return
 
         x_fit, y_fit = self._collect_pixels(samples, num_classes, show_progress=show_progress)
-
-        # debug
-        # tprint(f"before reducer:\n"
-        #        f"\tx_fit.shape = {x_fit.shape}, \n\ty_fit.shape = {y_fit.shape}\n")
         if x_fit.size == 0:
             raise RuntimeError("failed to collect fit pixels for spectral reducer")
 
+        x_fit = self._prepare_features(x_fit, fit=True)
+
         if self.mode == "supervised_pca":
-            self.pca = PCA(n_components=min(self.output_dim, x_fit.shape[-1]))
+            self.pca_dim = min(self.output_dim, x_fit.shape[-1])
+            self.pca = PCA(n_components=self.pca_dim, whiten=self.pca_whiten)
             self.pca.fit(x_fit)
+            self.final_dim = self.pca_dim
+            self.reference_projection_name = "PCA"
+            self.reduced_projection_name = "PCA"
             self.fitted = True
             return
 
         if self.mode == "lda_pca":
             return self._do_lda_pca(x_fit, y_fit)
-        
+
         if self.mode == "kernel_lda":
             return self._do_kernel_lda(x_fit, y_fit)
+
+        if self.mode == "pca_nca":
+            return self._do_pca_nca(x_fit, y_fit)
+
         raise ValueError(f"unknown reducer mode: {self.mode}")
 
-    def _do_lda_pca(self, x_fit, y_fit) -> bool:
+    def _resolve_savgol_window(self, num_bands: int) -> int:
+        window = min(self.savgol_window, num_bands)
+        if window % 2 == 0:
+            window -= 1
+        min_window = self.savgol_polyorder + 2
+        if min_window % 2 == 0:
+            min_window += 1
+        window = max(window, min_window)
+        if window > num_bands:
+            window = num_bands if num_bands % 2 == 1 else max(1, num_bands - 1)
+        return max(1, window)
+
+    def _prepare_features(self, x: np.ndarray, fit: bool = False) -> np.ndarray:
+        feats = np.asarray(x, dtype=np.float32)
+        if feats.ndim != 2:
+            raise ValueError(f"expected 2d pixel matrix, got shape={tuple(feats.shape)}")
+
+        if self.enable_snv:
+            mean = feats.mean(axis=1, keepdims=True)
+            std = feats.std(axis=1, keepdims=True)
+            feats = (feats - mean) / np.maximum(std, 1e-6)
+
+        if self.derivative_order > 0:
+            window = self._resolve_savgol_window(feats.shape[1])
+            polyorder = min(self.savgol_polyorder, max(1, window - 1))
+            if window >= 3 and self.derivative_order <= polyorder:
+                feats = savgol_filter(
+                    feats,
+                    window_length=window,
+                    polyorder=polyorder,
+                    deriv=self.derivative_order,
+                    axis=1,
+                    mode="interp",
+                ).astype(np.float32)
+            else:
+                grad = feats
+                for _ in range(self.derivative_order):
+                    grad = np.gradient(grad, axis=1).astype(np.float32)
+                feats = grad
+
+        feats = np.asarray(feats, dtype=np.float32)
+
+        if self.enable_standardize:
+            if fit or self.scaler is None:
+                self.scaler = StandardScaler(with_mean=True, with_std=True)
+                feats = self.scaler.fit_transform(feats).astype(np.float32)
+            else:
+                feats = self.scaler.transform(feats).astype(np.float32)
+
+        return feats
+
+    def _fit_pca(self, x_fit: np.ndarray, target_dim: int) -> np.ndarray:
+        self.pca_dim = int(min(max(1, target_dim), x_fit.shape[-1], max(1, x_fit.shape[0] - 1)))
+        self.pca = PCA(n_components=self.pca_dim, whiten=self.pca_whiten)
+        self.pca.fit(x_fit)
+        return self.pca.transform(x_fit).astype(np.float32)
+
+    def _balanced_subsample(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        budget: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        if x.shape[0] <= budget:
+            return x, y
+
+        rng = np.random.default_rng(self.seed)
+        classes = np.unique(y)
+        per_class = max(32, budget // max(1, len(classes)))
+        chosen_parts: List[np.ndarray] = []
+
+        for cls_idx in classes:
+            idx = np.where(y == cls_idx)[0]
+            if idx.size == 0:
+                continue
+            take = min(idx.size, per_class)
+            chosen_parts.append(rng.choice(idx, size=take, replace=False))
+
+        if not chosen_parts:
+            chosen = rng.choice(x.shape[0], size=budget, replace=False)
+            return x[chosen], y[chosen]
+
+        chosen = np.concatenate(chosen_parts, axis=0)
+        if chosen.shape[0] > budget:
+            chosen = rng.choice(chosen, size=budget, replace=False)
+        elif chosen.shape[0] < budget:
+            remaining = np.setdiff1d(np.arange(x.shape[0]), chosen, assume_unique=False)
+            if remaining.size > 0:
+                extra = rng.choice(remaining, size=min(budget - chosen.shape[0], remaining.size), replace=False)
+                chosen = np.concatenate([chosen, extra], axis=0)
+
+        rng.shuffle(chosen)
+        return x[chosen], y[chosen]
+
+    def _do_lda_pca(self, x_fit: np.ndarray, y_fit: np.ndarray) -> bool:
         if self.output_dim <= 1:
             tprint("Warning: output_dim <= 1, skipping LDA and fitting PCA with output_dim=1")
             self.pca_dim = min(1, x_fit.shape[-1])
-            self.pca = PCA(n_components=self.pca_dim)
+            self.pca = PCA(n_components=self.pca_dim, whiten=self.pca_whiten)
             self.pca.fit(x_fit)
             self.lda = None
             self.lda_dim = 0
+            self.final_dim = self.pca_dim
+            self.reference_projection_name = "PCA"
+            self.reduced_projection_name = "PCA"
             self.fitted = True
             return None
-        
+
         lda_dim = int(min(max(1, len(np.unique(y_fit)) - 1), self.output_dim - 1))
         pca_dim = int(min(self.output_dim - lda_dim, x_fit.shape[-1]))
         pca_dim = max(1, pca_dim)
-        tprint(f"Fitting spectral reducer with:\n" 
-               f"\tPCA dim = {pca_dim}\n", 
-               f"\tLDA dim = {lda_dim}\n")
+        tprint(
+            "Fitting spectral reducer with:\n"
+            f"\tPCA dim = {pca_dim}\n"
+            f"\tLDA dim = {lda_dim}\n"
+        )
 
-        self.pca_dim = pca_dim
-        self.pca = PCA(n_components=self.pca_dim)
-        self.pca.fit(x_fit)
-        x_pca = self.pca.transform(x_fit)
-        
-        # lda after pca
+        x_pca = self._fit_pca(x_fit, target_dim=pca_dim)
+
         try:
             lda_dim = int(min(lda_dim, x_pca.shape[-1]))
             self.lda = LinearDiscriminantAnalysis(n_components=lda_dim)
             self.lda.fit(x_pca, y_fit)
             self.lda_dim = lda_dim
-        except Exception:
+        except Exception as exc:
+            tprint(f"Warning: LDA fit failed, fallback to PCA only. reason={exc}")
             self.lda = None
             self.lda_dim = 0
+
+        self.final_dim = self.pca_dim + self.lda_dim if self.lda is not None else self.pca_dim
+        self.reference_projection_name = "PCA"
+        self.reduced_projection_name = "PCA + LDA" if self.lda is not None else "PCA"
         self.fitted = True
 
-    def _do_kernel_lda(self, x_fit, y_fit) -> bool:
+    def _do_kernel_lda(self, x_fit: np.ndarray, y_fit: np.ndarray) -> bool:
         if self.output_dim <= 1:
             tprint("Warning: output_dim <= 1, skipping Kernel LDA and fitting PCA with output_dim=1")
             self.pca_dim = min(1, x_fit.shape[-1])
-            self.pca = PCA(n_components=self.pca_dim)
+            self.pca = PCA(n_components=self.pca_dim, whiten=self.pca_whiten)
             self.pca.fit(x_fit)
             self.lda = None
             self.lda_dim = 0
+            self.final_dim = self.pca_dim
+            self.reference_projection_name = "Kernel PCA"
+            self.reduced_projection_name = "Kernel PCA"
             self.fitted = True
             return None
-        
+
         lda_dim = int(min(max(1, len(np.unique(y_fit)) - 1), self.output_dim - 1))
-        pca_dim = int(min(self.output_dim - self.lda_dim, x_fit.shape[-1]))
+        pca_dim = int(min(self.output_dim - lda_dim, x_fit.shape[-1]))
         pca_dim = max(1, pca_dim)
-        tprint(f"Fitting kernel LDA spectral reducer with:\n"
-               f"\tPCA dim = {pca_dim}\n", 
-               f"\tKernel LDA dim = {lda_dim}\n")
-        
+        tprint(
+            "Fitting kernel LDA spectral reducer with:\n"
+            f"\tKernel PCA dim = {pca_dim}\n"
+            f"\tKernel LDA dim = {lda_dim}\n"
+        )
+
         self.pca_dim = pca_dim
-        self.pca = KernelPCA(input_dim=x_fit.shape[-1],
-                             output_dim=self.pca_dim)
-        x_pca = self.pca.transform(x_fit)
-        
-        # lda after k-pca
+        self.pca = KernelPCA(input_dim=x_fit.shape[-1], output_dim=self.pca_dim)
+        x_pca = self.pca.transform(x_fit).astype(np.float32)
+
         try:
             lda_dim = int(min(lda_dim, x_pca.shape[-1]))
             self.lda = LinearDiscriminantAnalysis(n_components=lda_dim)
             self.lda.fit(x_pca, y_fit)
             self.lda_dim = lda_dim
-        except Exception:
+        except Exception as exc:
+            tprint(f"Warning: Kernel LDA fit failed, fallback to Kernel PCA only. reason={exc}")
             self.lda = None
             self.lda_dim = 0
+
+        self.final_dim = self.pca_dim + self.lda_dim if self.lda is not None else self.pca_dim
+        self.reference_projection_name = "Kernel PCA"
+        self.reduced_projection_name = "Kernel PCA + LDA" if self.lda is not None else "Kernel PCA"
         self.fitted = True
-        
+
+    def _do_pca_nca(self, x_fit: np.ndarray, y_fit: np.ndarray) -> bool:
+        base_dim = self.pca_dim_override if self.pca_dim_override > 0 else max(self.output_dim * 4, self.output_dim + 8)
+        pca_dim = int(min(max(self.output_dim, base_dim), x_fit.shape[-1], max(1, x_fit.shape[0] - 1)))
+        tprint(
+            "Fitting PCA + NCA spectral reducer with:\n"
+            f"\tSNV={self.enable_snv}, derivative_order={self.derivative_order}, standardize={self.enable_standardize}\n"
+            f"\tPCA dim = {pca_dim}\n"
+            f"\tNCA dim = {self.output_dim}\n"
+            f"\tNCA fit budget = {self.nca_max_fit_pixels}\n"
+        )
+
+        x_pca = self._fit_pca(x_fit, target_dim=pca_dim)
+        x_nca_fit, y_nca_fit = self._balanced_subsample(x_pca, y_fit, budget=self.nca_max_fit_pixels)
+
+        try:
+            nca_dim = int(min(self.output_dim, x_pca.shape[-1]))
+            self.nca = NeighborhoodComponentsAnalysis(
+                n_components=nca_dim,
+                init=self.nca_init,
+                max_iter=self.nca_max_iter,
+                tol=self.nca_tol,
+                random_state=self.seed,
+            )
+            self.nca.fit(x_nca_fit, y_nca_fit)
+            self.final_dim = nca_dim
+            self.reduced_projection_name = "PCA + NCA"
+        except Exception as exc:
+            tprint(f"Warning: NCA fit failed, fallback to PCA only. reason={exc}")
+            self.nca = None
+            self.final_dim = min(self.output_dim, x_pca.shape[-1])
+            self.reduced_projection_name = "PCA"
+
+        self.reference_projection_name = "PCA"
+        self.lda = None
+        self.lda_dim = 0
+        self.fitted = True
+
+    def project_pixels(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """project flat spectral vectors for visualization or debugging."""
+        if self.mode == "none":
+            x_arr = np.asarray(x, dtype=np.float32)
+            return x_arr, x_arr
+        if not self.fitted:
+            raise RuntimeError("spectral reducer must be fitted before projection")
+
+        feats = self._prepare_features(x, fit=False)
+        if self.pca is None:
+            return feats, feats
+
+        x_ref = self.pca.transform(feats).astype(np.float32)
+
+        if self.mode == "pca_nca":
+            if self.nca is None:
+                return x_ref, x_ref[:, : min(self.output_dim, x_ref.shape[1])]
+            return x_ref, self.nca.transform(x_ref).astype(np.float32)
+
+        if self.lda is not None:
+            return x_ref, self.lda.transform(x_ref).astype(np.float32)
+
+        return x_ref, x_ref[:, : min(self.output_dim, x_ref.shape[1])]
+
     def transform(self, image: np.ndarray) -> np.ndarray:
         """transform image channels.
 
         input:
             image: (h, w, c).
         output:
-            transformed image: (h, w, c_new).
+            transformed image: (c_new, h, w) for reducer modes, raw image for none.
         """
         if self.mode == "none":
             return image
@@ -282,31 +487,19 @@ class SpectralReducer:
 
         h, w, c = image.shape
         x = image.reshape(-1, c)
+        x_ref, x_red = self.project_pixels(x)
 
-        # # debug
-        # print(image.shape, x.shape)
+        if self.mode in {"lda_pca", "kernel_lda"} and self.lda is not None:
+            y = np.concatenate([x_ref, x_red], axis=1).astype(np.float32)
+        else:
+            y = np.asarray(x_red, dtype=np.float32)
 
-        parts: List[np.ndarray] = []
-        x_pca: Optional[np.ndarray] = None
-        if self.lda is not None:
-            if self.pca is None:
-                raise RuntimeError("spectral reducer PCA stage is missing")
-            x_pca = self.pca.transform(x).astype(np.float32)
-            parts.extend((x_pca, self.lda.transform(x_pca).astype(np.float32)))
-        if self.pca is not None and x_pca is None:
-            parts.append(self.pca.transform(x).astype(np.float32))
-
-        if not parts:
-            return image
-
-        y = np.concatenate(parts, axis=1)
         if y.shape[1] < self.output_dim:
             pad = np.zeros((y.shape[0], self.output_dim - y.shape[1]), dtype=np.float32)
             y = np.concatenate([y, pad], axis=1)
         if y.shape[1] > self.output_dim:
             y = y[:, : self.output_dim]
 
-        # (h*w, c) -> (h, w, c) -> (c, h, w)
         return y.reshape(h, w, self.output_dim).transpose(2, 0, 1)
 
     def _collect_pixels(
@@ -335,9 +528,7 @@ class SpectralReducer:
             mask = np.load(sample.mask_path).astype(np.int64)
             cube, mask = _pad_to_patch(cube, mask, patch_size=1)
 
-            # h, w also mask.shape
             h, w, c = cube.shape
-
             flat = cube.reshape(-1, c)
             y = mask.reshape(-1)
 
@@ -654,6 +845,7 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
         output_dim=int(cfg.data.preprocess.output_dim),
         max_fit_pixels=int(cfg.data.preprocess.max_fit_pixels),
         seed=seed,
+        preprocess_cfg=dict(cfg.data.preprocess),
     )
     if modality == "hsi":
         tprint(

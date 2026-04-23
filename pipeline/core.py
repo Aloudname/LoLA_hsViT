@@ -283,27 +283,29 @@ class Pipeline:
         self.visualizer.plot_distribution(prepared.stats)
 
         if prepared.modality == "hsi":
-            tprint("visualization: pca/lda comparison")
-            pca_payload = self._collect_pca_lda_points(
+            tprint("visualization: spectral reducer comparison")
+            reducer_payload = self._collect_reducer_points(
                 prepared=prepared,
                 max_points=int(self.config.visualization.tsne_max_points),
             )
-            if pca_payload is not None:
-                pca_features, lda_features, pca_labels = pca_payload
+            if reducer_payload is not None:
+                ref_features, reduced_features, reducer_labels = reducer_payload
                 self.visualizer.plot_pca_lda_comparison(
-                    pca_features=pca_features,
-                    lda_features=lda_features,
-                    labels=pca_labels,
+                    pca_features=ref_features,
+                    lda_features=reduced_features,
+                    labels=reducer_labels,
                     explained_variance_ratio=getattr(prepared.reducer.pca, "explained_variance_ratio_", None),
                     pca_dim=getattr(prepared.reducer, "pca_dim", None),
-                    lda_dim=getattr(prepared.reducer, "lda_dim", None),
-                    title=f"{self.model_key} PCA-LDA comparison",
+                    lda_dim=getattr(prepared.reducer, "final_dim", None),
+                    title=f"{self.model_key} spectral reducer comparison",
+                    pca_label=getattr(prepared.reducer, "reference_projection_name", "PCA"),
+                    lda_label=getattr(prepared.reducer, "reduced_projection_name", "Reducer"),
                 )
 
-    def _collect_pca_lda_points(self, prepared: Any, max_points: int) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """collect balanced pixels for PCA-LDA comparison plots."""
+    def _collect_reducer_points(self, prepared: Any, max_points: int) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """collect balanced pixels for spectral reducer comparison plots."""
         reducer = getattr(prepared, "reducer", None)
-        if reducer is None or getattr(reducer, "pca", None) is None or getattr(reducer, "lda", None) is None:
+        if reducer is None or not hasattr(reducer, "project_pixels"):
             return None
 
         samples = list(prepared.samples_by_split.get("train", []))
@@ -348,14 +350,10 @@ class Pipeline:
             x_raw = x_raw[chosen]
             y_raw = y_raw[chosen]
 
-        pca = reducer.pca
-        lda = reducer.lda
-        if pca is None or lda is None:
+        ref_features, reduced_features = reducer.project_pixels(x_raw)
+        if ref_features.size == 0 or reduced_features.size == 0:
             return None
-
-        x_pca = pca.transform(x_raw).astype(np.float32)
-        x_lda = lda.transform(x_pca).astype(np.float32)
-        return x_pca, x_lda, y_raw
+        return ref_features, reduced_features, y_raw
 
     def _collect_spectral_curves(self, pred_pack: Mapping[str, Any], max_points: int) -> Dict[str, Any]:
         """estimate spectral mean/std from retained image samples and gt masks."""

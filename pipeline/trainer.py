@@ -1,604 +1,815 @@
-from __future__ import annotations
-
-import contextlib
-# trainer for segmentation models with dice/focal/tversky losses.
 import copy
-import os
+import json
+import math
 import time
-import warnings
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from munch import Munch
-from tqdm import tqdm
-from tqdm import TqdmExperimentalWarning
-
-from pipeline.monitor import tprint
 
 
-os.environ.setdefault("TORCH_DISABLE_DYNAMO", "1")
-warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
+def _cfg_get(config, path, default=None):
+    current = config
+    for part in path.split("."):
+        if current is None:
+            return default
+        if isinstance(current, dict):
+            current = current.get(part, None)
+        else:
+            current = getattr(current, part, None)
+    return default if current is None else current
 
 
-def set_trainable_layers(model: nn.Module, config: Munch) -> None:
-    """Optionally unfreeze last N backbone blocks from trainer side."""
-    cfg = config
-    n = int(getattr(cfg.model, "unfreeze_last_n", 0))
-    if n <= 0:
-        return
-
-    backbone = getattr(model, "backbone", None)
-    if backbone is None or not hasattr(backbone, "blocks"):
-        return
-
-    blocks = list(backbone.blocks)
-    if not blocks:
-        return
-
-    n = min(n, len(blocks))
-    for blk in blocks[-n:]:
-        for p in blk.parameters():
-            p.requires_grad_(True)
-
-    if hasattr(backbone, "norm"):
-        for p in backbone.norm.parameters():
-            p.requires_grad_(True)
-
-class CompositeSegLoss(nn.Module):
-    """composite segmentation loss = dice + focal + tversky."""
-
-    def __init__(self, config: Munch, num_classes: int) -> None:
-        super().__init__()
-        cfg = config
-        self.num_classes = num_classes
-
-        self.dice_weight = float(cfg.loss.dice_weight)
-        self.focal_weight = float(cfg.loss.focal_weight)
-        self.tversky_weight = float(cfg.loss.tversky_weight)
-
-        self.focal_gamma = float(cfg.loss.focal_gamma)
-        self.tversky_alpha = float(cfg.loss.tversky_alpha)
-        self.tversky_beta = float(cfg.loss.tversky_beta)
-
-        class_weights = np.asarray(cfg.loss.class_weights, dtype=np.float32)
-        if class_weights.size != self.num_classes:
-            class_weights = np.ones(self.num_classes, dtype=np.float32)
-        self.register_buffer("class_weights", torch.from_numpy(class_weights))
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        dice = self._dice_loss(logits, targets)
-        focal = self._focal_loss(logits, targets)
-        tversky = self._tversky_loss(logits, targets)
-        return self.dice_weight * dice + self.focal_weight * focal + self.tversky_weight * tversky
-
-    def _dice_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        probs = F.softmax(logits, dim=1)
-        one_hot = F.one_hot(targets, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
-
-        reduce_dims = (0, 2, 3)
-        inter = torch.sum(probs * one_hot, dim=reduce_dims)
-        den = torch.sum(probs, dim=reduce_dims) + torch.sum(one_hot, dim=reduce_dims)
-        dice = (2.0 * inter + 1e-6) / (den + 1e-6)
-
-        # foreground mean dice for better small-target emphasis.
-        fg = dice[1:] if dice.numel() > 1 else dice
-        return 1.0 - fg.mean()
-
-    def _focal_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        ce = F.cross_entropy(logits, targets, reduction="none", weight=self.class_weights)
-        pt = torch.exp(-ce)
-        focal = ((1.0 - pt) ** self.focal_gamma) * ce
-        return focal.mean()
-
-    def _tversky_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        probs = F.softmax(logits, dim=1)
-        one_hot = F.one_hot(targets, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
-
-        reduce_dims = (0, 2, 3)
-        tp = torch.sum(probs * one_hot, dim=reduce_dims)
-        fp = torch.sum(probs * (1.0 - one_hot), dim=reduce_dims)
-        fn = torch.sum((1.0 - probs) * one_hot, dim=reduce_dims)
-
-        score = (tp + 1e-6) / (tp + self.tversky_alpha * fp + self.tversky_beta * fn + 1e-6)
-        fg = score[1:] if score.numel() > 1 else score
-        return 1.0 - fg.mean()
+def _to_serializable(value):
+    if isinstance(value, dict):
+        return {k: _to_serializable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_serializable(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if torch.is_tensor(value):
+        if value.numel() == 1:
+            return float(value.detach().cpu().item())
+        return value.detach().cpu().tolist()
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    return value
 
 
 class ModelEMA:
-    """exponential moving average model wrapper."""
-
-    def __init__(self, model: nn.Module, decay: float) -> None:
-        self.decay = decay
-        self.ema_model = self._clone_model(model)
-
-    def _clone_model(self, model: nn.Module) -> nn.Module:
-        clone = copy.deepcopy(model)
-        clone.to(next(model.parameters()).device)
-        clone.eval()
-        for p in clone.parameters():
-            p.requires_grad_(False)
-        return clone
+    def __init__(self, model, decay=0.999):
+        self.ema = copy.deepcopy(model).eval()
+        self.decay = float(decay)
+        for param in self.ema.parameters():
+            param.requires_grad_(False)
 
     @torch.no_grad()
-    def update(self, model: nn.Module) -> None:
-        ema_state = self.ema_model.state_dict()
+    def update(self, model):
         model_state = model.state_dict()
-        for key in ema_state.keys():
-            if torch.is_floating_point(ema_state[key]):
-                ema_state[key].mul_(self.decay).add_(model_state[key], alpha=1.0 - self.decay)
+        for name, ema_param in self.ema.state_dict().items():
+            model_param = model_state[name].detach()
+            if not torch.is_floating_point(ema_param):
+                ema_param.copy_(model_param)
             else:
-                ema_state[key].copy_(model_state[key])
+                ema_param.mul_(self.decay).add_(model_param, alpha=1.0 - self.decay)
 
 
-@dataclass
-class TrainerResult:
-    """trainer output summary."""
+class CompositeSegLoss(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.num_classes = int(_cfg_get(config, "model.num_classes", _cfg_get(config, "data.num_classes", 2)))
+        self.include_background = bool(_cfg_get(config, "loss.include_background", False))
+        self.smooth = float(_cfg_get(config, "loss.smooth", 1e-6))
+        self.ce_weight = float(_cfg_get(config, "loss.ce_weight", 1.0))
+        self.focal_weight = float(_cfg_get(config, "loss.focal_weight", 0.5))
+        self.dice_weight = float(_cfg_get(config, "loss.dice_weight", 1.0))
+        self.tversky_weight = float(_cfg_get(config, "loss.tversky_weight", 0.0))
+        self.focal_gamma = float(_cfg_get(config, "loss.focal_gamma", 2.0))
+        self.tversky_alpha = float(_cfg_get(config, "loss.tversky_alpha", 0.3))
+        self.tversky_beta = float(_cfg_get(config, "loss.tversky_beta", 0.7))
+        self.label_smoothing = float(_cfg_get(config, "loss.label_smoothing", 0.0))
+        self.class_weights = self._build_class_weights()
 
-    best_metric: float
-    best_epoch: int
-    best_ckpt_path: str
-    history: Dict[str, List[float]]
+    def _build_class_weights(self):
+        weights = torch.ones(self.num_classes, dtype=torch.float32)
+        configured = _cfg_get(self.config, "loss.class_weights", None)
+        if configured is not None:
+            configured = list(configured)
+            limit = min(len(configured), self.num_classes)
+            weights[:limit] = torch.tensor(configured[:limit], dtype=torch.float32)
+
+        rare_indices = _cfg_get(self.config, "loss.rare_class_indices", None)
+        if rare_indices is None:
+            class_names = _cfg_get(self.config, "data.class_names", None) or []
+            rare_indices = [idx for idx, name in enumerate(class_names) if str(name).lower() == "pg"]
+        rare_boost = float(_cfg_get(self.config, "loss.rare_class_boost", 1.0))
+        if rare_boost > 0 and rare_indices is not None:
+            for idx in rare_indices:
+                if 0 <= int(idx) < self.num_classes:
+                    weights[int(idx)] *= rare_boost
+
+        bg_weight = _cfg_get(self.config, "loss.background_weight", None)
+        if bg_weight is not None and self.num_classes > 0:
+            weights[0] = float(bg_weight)
+
+        weights = torch.clamp(weights, min=1e-6)
+        weights = weights / weights.mean().clamp_min(1e-6)
+        return weights
+
+    def _get_weights(self, device):
+        return self.class_weights.to(device)
+
+    def _foreground_indices(self, device):
+        start = 0 if self.include_background else 1
+        if start >= self.num_classes:
+            start = 0
+        return torch.arange(start, self.num_classes, device=device)
+
+    def _standard_focal_loss(self, logits, targets, class_weights):
+        log_probs = F.log_softmax(logits, dim=1)
+        probs = log_probs.exp()
+        target_log_probs = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        target_probs = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        alpha = class_weights.gather(0, targets.view(-1)).view_as(target_probs)
+        focal = -alpha * torch.pow(1.0 - target_probs.clamp(0.0, 1.0), self.focal_gamma) * target_log_probs
+        return focal.mean()
+
+    def _masked_class_mean(self, values, mask, weights=None):
+        if weights is not None:
+            weights = weights * mask.float()
+            denom = weights.sum()
+            if denom <= 0:
+                return values.new_tensor(0.0)
+            return (values * weights).sum() / denom
+        mask_values = values[mask]
+        if mask_values.numel() == 0:
+            return values.new_tensor(0.0)
+        return mask_values.mean()
+
+    def _dice_loss(self, probs, targets_one_hot, class_weights):
+        dims = (0, 2, 3)
+        intersection = (probs * targets_one_hot).sum(dim=dims)
+        cardinality = probs.sum(dim=dims) + targets_one_hot.sum(dim=dims)
+        dice = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
+
+        fg_idx = self._foreground_indices(probs.device)
+        fg_dice = dice[fg_idx]
+        fg_target = targets_one_hot.sum(dim=dims)[fg_idx]
+        fg_mask = fg_target > 0
+        if not fg_mask.any():
+            return probs.new_tensor(0.0)
+        fg_weights = class_weights[fg_idx]
+        return 1.0 - self._masked_class_mean(fg_dice, fg_mask, fg_weights)
+
+    def _tversky_loss(self, probs, targets_one_hot, class_weights):
+        dims = (0, 2, 3)
+        tp = (probs * targets_one_hot).sum(dim=dims)
+        fp = (probs * (1.0 - targets_one_hot)).sum(dim=dims)
+        fn = ((1.0 - probs) * targets_one_hot).sum(dim=dims)
+        tversky = (tp + self.smooth) / (tp + self.tversky_alpha * fp + self.tversky_beta * fn + self.smooth)
+
+        fg_idx = self._foreground_indices(probs.device)
+        fg_tversky = tversky[fg_idx]
+        fg_target = targets_one_hot.sum(dim=dims)[fg_idx]
+        fg_mask = fg_target > 0
+        if not fg_mask.any():
+            return probs.new_tensor(0.0)
+        fg_weights = class_weights[fg_idx]
+        return 1.0 - self._masked_class_mean(fg_tversky, fg_mask, fg_weights)
+
+    def compute(self, logits, targets):
+        if logits.ndim != 4:
+            raise ValueError(f"Expected logits with shape [B, C, H, W], got {tuple(logits.shape)}")
+        if targets.ndim != 3:
+            raise ValueError(f"Expected targets with shape [B, H, W], got {tuple(targets.shape)}")
+
+        class_weights = self._get_weights(logits.device)
+        probs = F.softmax(logits, dim=1)
+        targets_one_hot = F.one_hot(targets.long(), num_classes=logits.shape[1]).permute(0, 3, 1, 2).float()
+
+        ce_loss = F.cross_entropy(
+            logits,
+            targets.long(),
+            weight=class_weights,
+            reduction="mean",
+            label_smoothing=self.label_smoothing,
+        )
+        focal_loss = self._standard_focal_loss(logits, targets.long(), class_weights)
+        dice_loss = self._dice_loss(probs, targets_one_hot, class_weights)
+        tversky_loss = self._tversky_loss(probs, targets_one_hot, class_weights)
+
+        total = (
+            self.ce_weight * ce_loss
+            + self.focal_weight * focal_loss
+            + self.dice_weight * dice_loss
+            + self.tversky_weight * tversky_loss
+        )
+
+        loss_dict = {
+            "ce": float(ce_loss.detach().cpu().item()),
+            "focal": float(focal_loss.detach().cpu().item()),
+            "dice": float(dice_loss.detach().cpu().item()),
+            "tversky": float(tversky_loss.detach().cpu().item()),
+            "total": float(total.detach().cpu().item()),
+        }
+        return total, loss_dict
+
+    def forward(self, logits, targets):
+        total, _ = self.compute(logits, targets)
+        return total
 
 
 class Trainer:
-    """training loop manager with grad accumulation and ema."""
-
-    def __init__(self, model: nn.Module, config: Munch, output_dir: str) -> None:
+    def __init__(self, model, config, output_dir):
         self.model = model
         self.config = config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.show_progress = bool(getattr(self.config.runtime, "progress_bar", True))
-
-        device_name = str(self.config.runtime.device).lower()
-        if device_name == "auto":
-            device_name = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = torch.device(device_name)
-
+        requested_device = _cfg_get(config, "runtime.device", None)
+        if requested_device is not None:
+            self.device = torch.device(requested_device)
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
-        set_trainable_layers(self.model, self.config)
-        self.loss_fn = CompositeSegLoss(self.config, num_classes=int(self.config.data.num_classes)).to(self.device)
 
-        params = [p for p in self.model.parameters() if p.requires_grad] or list(self.model.parameters())
-        self.optimizer = torch.optim.AdamW(
-            params,
-            lr=float(self.config.train.lr),
-            weight_decay=float(self.config.train.weight_decay),
-        )
+        self.num_classes = int(_cfg_get(config, "model.num_classes", _cfg_get(config, "data.num_classes", 2)))
+        self.class_names = list(_cfg_get(config, "data.class_names", []))
+        if not self.class_names:
+            self.class_names = [f"class_{i}" for i in range(self.num_classes)]
+        elif len(self.class_names) < self.num_classes:
+            self.class_names = self.class_names + [f"class_{i}" for i in range(len(self.class_names), self.num_classes)]
 
-        self.use_amp = bool(self.config.train.amp) and self.device.type == "cuda"
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.rare_class_indices = _cfg_get(config, "loss.rare_class_indices", None)
+        if self.rare_class_indices is None:
+            self.rare_class_indices = [idx for idx, name in enumerate(self.class_names) if str(name).lower() == "pg"]
+        self.rare_class_indices = [int(idx) for idx in self.rare_class_indices if 0 <= int(idx) < self.num_classes]
 
-        self.grad_clip = float(self.config.train.grad_clip)
-        self.grad_accum_steps = max(1, int(self.config.train.grad_accum_steps))
+        self.criterion = CompositeSegLoss(config)
+        self.optimizer = self._build_optimizer()
+        self.scheduler = None
+        self.scheduler_mode = "none"
+        self.scheduler_step_on = "epoch"
 
-        ema_decay = float(self.config.train.ema_decay)
-        self.ema = ModelEMA(self.model, decay=ema_decay) if ema_decay > 0 else None
+        ema_decay = float(_cfg_get(config, "train.ema_decay", 0.0))
+        self.use_ema = bool(_cfg_get(config, "train.use_ema", ema_decay > 0 and bool(_cfg_get(config, "train.ema_decay", None) is not None)))
+        self.ema = ModelEMA(self.model, decay=ema_decay) if self.use_ema and ema_decay > 0 else None
 
-        self.max_train_steps = int(self.config.train.max_train_steps_per_epoch)
-        self.max_eval_steps = int(self.config.train.max_eval_steps)
+        self.use_amp = bool(_cfg_get(config, "runtime.use_amp", _cfg_get(config, "train.use_amp", self.device.type == "cuda")))
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp and self.device.type == "cuda")
+        self.grad_accum_steps = max(1, int(_cfg_get(config, "train.grad_accum_steps", 1)))
+        self.max_grad_norm = float(_cfg_get(config, "train.max_grad_norm", 0.0))
+        self.aux_loss_weight = float(_cfg_get(config, "train.aux_loss_weight", _cfg_get(config, "loss.aux_weight", 0.0)))
 
-        total_params = int(sum(p.numel() for p in self.model.parameters()))
-        trainable_params = int(sum(p.numel() for p in self.model.parameters() if p.requires_grad))
-        tprint(
-            "trainer init:\n"
-            f"\tdevice={self.device} amp={self.use_amp} ema_decay={ema_decay}\n"
-            f"\ttrainable_params={trainable_params} total_params={total_params}\n"
-        )
-        tprint(
-            "optimizer:\n"
-            f"\tAdamW(lr={float(self.config.train.lr):.6g},\n"
-            f"\tweight_decay={float(self.config.train.weight_decay):.6g},\n"
-            f"\tgrad_clip={self.grad_clip}, grad_accum_steps={self.grad_accum_steps})"
-        )
-
-    def fit(self, train_loader, eval_loader, epochs: int) -> TrainerResult:
-        """train model and keep best checkpoint by eval dice."""
-        history = {
+        self.history = {
             "train_loss": [],
-            "eval_loss": [],
+            "val_loss": [],
             "train_dice": [],
-            "eval_dice": [],
+            "val_dice": [],
+            "lr": [],
+            "learning_rate": [],
+            "train_macro_dice": [],
+            "val_macro_dice": [],
+            "train_min_fg_dice": [],
+            "val_min_fg_dice": [],
+            "train_presence_recall": [],
+            "val_presence_recall": [],
+            "train_rare_dice": [],
+            "val_rare_dice": [],
+            "train_fg_distribution_gap": [],
+            "val_fg_distribution_gap": [],
+            "train_fg_dominant_ratio": [],
+            "val_fg_dominant_ratio": [],
+            "train_per_class_dice": [],
+            "val_per_class_dice": [],
+            "train_loss_components": [],
+            "val_loss_components": [],
+            "epochs": [],
         }
+        self.best_val_dice = -float("inf")
 
-        best_metric = -1.0
-        best_epoch = 0
-        # Keep .pt checkpoint as a temporary training artifact only.
-        # Final deployment artifact is exported as ONNX by pipeline.core.
-        best_ckpt = self.output_dir / ".cache" / "best_model.pt"
-        best_ckpt.parent.mkdir(parents=True, exist_ok=True)
+    def _build_optimizer(self):
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        optimizer_cfg = _cfg_get(self.config, "train.optimizer", "adamw")
+        if isinstance(optimizer_cfg, str):
+            optimizer_name = optimizer_cfg.lower()
+        else:
+            optimizer_name = str(_cfg_get(self.config, "train.optimizer.name", "adamw")).lower()
 
-        # # debug
-        # an iterable may cause unexpectedly long time cost.
-        # sample_batch = next(iter(train_loader))
-        # img, masks = sample_batch[0]
-        # shapes = (img.shape, masks.shape)
+        lr = float(_cfg_get(self.config, "train.lr", _cfg_get(self.config, "train.optimizer.lr", 3e-4)))
+        weight_decay = float(_cfg_get(self.config, "train.weight_decay", _cfg_get(self.config, "train.optimizer.weight_decay", 1e-4)))
 
-        tprint(
-            "fit start:\n"
-            f"\tepochs = {epochs}\n"
-            f"\ttrain batches = {len(train_loader)}, eval batches = {len(eval_loader)} \n"
-            # f"\tbatch shape = {shapes}\n"
-        )
-
-        for epoch in range(1, epochs + 1):
-            tprint(f"epoch {epoch:03d}/{epochs:03d} start")
-            epoch_t0 = time.perf_counter()
-            train_loss, train_dice, train_t = self.train_one_epoch(train_loader, epoch=epoch, total_epochs=epochs)
-            eval_loss, eval_dice, eval_t = self.validate(eval_loader, phase="eval", epoch=epoch, total_epochs=epochs)
-            epoch_total = time.perf_counter() - epoch_t0
-
-            history["train_loss"].append(train_loss)
-            history["eval_loss"].append(eval_loss)
-            history["train_dice"].append(train_dice)
-            history["eval_dice"].append(eval_dice)
-
-            tprint(
-                f"epoch {epoch:03d}:\n"
-                f"\ttrain_loss = {train_loss:.4f}, eval_loss = {eval_loss:.4f}\n"
-                f"\ttrain_dice = {train_dice:.4f}, eval_dice = {eval_dice:.4f}\n"
-            )
-            tprint(
-                "epoch timing:\n"
-                f"\ttrain_total={train_t['total_s']:.2f}s, train_first_batch={train_t['first_batch_s']:.2f}s\n"
-                f"\teval_total={eval_t['total_s']:.2f}s, eval_first_batch={eval_t['first_batch_s']:.2f}s\n"
-                f"\tepoch_total={epoch_total:.2f}s"
+        if optimizer_name == "sgd":
+            momentum = float(_cfg_get(self.config, "train.optimizer.momentum", 0.9))
+            nesterov = bool(_cfg_get(self.config, "train.optimizer.nesterov", True))
+            return torch.optim.SGD(
+                trainable_params,
+                lr=lr,
+                momentum=momentum,
+                nesterov=nesterov,
+                weight_decay=weight_decay,
             )
 
-            if eval_dice > best_metric:
-                best_metric = eval_dice
-                best_epoch = epoch
-                self.save_checkpoint(str(best_ckpt), epoch=best_epoch, metric=best_metric)
-        self.load_checkpoint(str(best_ckpt))
-
-        # Clean temporary checkpoint so the run output is ONNX-oriented.
-        if best_ckpt.exists():
-            with contextlib.suppress(OSError):
-                best_ckpt.unlink()
-        if best_ckpt.parent.exists():
-            try:
-                next(best_ckpt.parent.iterdir())
-            except StopIteration:
-                with contextlib.suppress(OSError):
-                    best_ckpt.parent.rmdir()
-        return TrainerResult(
-            best_metric=best_metric,
-            best_epoch=best_epoch,
-            best_ckpt_path=str(best_ckpt),
-            history=history,
+        betas = tuple(_cfg_get(self.config, "train.optimizer.betas", [0.9, 0.999]))
+        eps = float(_cfg_get(self.config, "train.optimizer.eps", 1e-8))
+        return torch.optim.AdamW(
+            trainable_params,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
         )
 
-    @staticmethod
-    def _planned_steps(dataloader, max_steps: int) -> Optional[int]:
-        total = len(dataloader)
-        return min(total, max_steps) if max_steps > 0 else total
+    def _build_scheduler(self, train_loader, num_epochs):
+        scheduler_cfg = _cfg_get(self.config, "train.scheduler", "none")
+        if isinstance(scheduler_cfg, str):
+            scheduler_name = scheduler_cfg.lower()
+        else:
+            scheduler_name = str(_cfg_get(self.config, "train.scheduler.name", "none")).lower()
 
-    def train_one_epoch(self, dataloader, epoch: int, total_epochs: int) -> Tuple[float, float, Dict[str, float]]:
-        """run one train epoch and return loss/dice."""
+        self.scheduler_mode = scheduler_name
+        self.scheduler_step_on = "epoch"
+        if scheduler_name in {"none", "", "null"}:
+            self.scheduler = None
+            return
+
+        steps_per_epoch = max(1, math.ceil(len(train_loader) / self.grad_accum_steps))
+        total_steps = max(1, steps_per_epoch * int(num_epochs))
+        warmup_epochs = float(_cfg_get(self.config, "train.scheduler.warmup_epochs", 0.0))
+        warmup_steps = int(_cfg_get(self.config, "train.scheduler.warmup_steps", round(warmup_epochs * steps_per_epoch)))
+        min_lr_ratio = float(_cfg_get(self.config, "train.scheduler.min_lr_ratio", 0.01))
+        power = float(_cfg_get(self.config, "train.scheduler.power", 0.9))
+
+        if scheduler_name in {"warmup_cosine", "cosine", "cosine_warmup"}:
+            self.scheduler_step_on = "step"
+
+            def lr_lambda(step):
+                if warmup_steps > 0 and step < warmup_steps:
+                    return float(step + 1) / float(max(1, warmup_steps))
+                progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+                progress = min(max(progress, 0.0), 1.0)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+            self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_lambda)
+            return
+
+        if scheduler_name == "poly":
+            self.scheduler_step_on = "step"
+
+            def lr_lambda(step):
+                if warmup_steps > 0 and step < warmup_steps:
+                    return float(step + 1) / float(max(1, warmup_steps))
+                progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+                progress = min(max(progress, 0.0), 1.0)
+                return max(min_lr_ratio, (1.0 - progress) ** power)
+
+            self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_lambda)
+            return
+
+        if scheduler_name == "step":
+            step_size = int(_cfg_get(self.config, "train.scheduler.step_size", max(1, int(num_epochs) // 3)))
+            gamma = float(_cfg_get(self.config, "train.scheduler.gamma", 0.1))
+            self.scheduler_step_on = "epoch"
+            self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=step_size, gamma=gamma)
+            return
+
+        self.scheduler = None
+        self.scheduler_mode = "none"
+
+    def _current_lr(self):
+        if not self.optimizer.param_groups:
+            return 0.0
+        return float(self.optimizer.param_groups[0]["lr"])
+
+    def _autocast_context(self):
+        return torch.cuda.amp.autocast(enabled=self.use_amp and self.device.type == "cuda")
+
+    def _unpack_batch(self, batch):
+        if isinstance(batch, dict):
+            images = batch.get("image", batch.get("images", batch.get("x", batch.get("inputs"))))
+            masks = batch.get("mask", batch.get("masks", batch.get("y", batch.get("target", batch.get("targets")))))
+            meta = {k: v for k, v in batch.items() if k not in {"image", "images", "x", "inputs", "mask", "masks", "y", "target", "targets"}}
+            return images, masks, meta
+        if isinstance(batch, (list, tuple)):
+            if len(batch) == 0:
+                raise ValueError("Received empty batch.")
+            images = batch[0]
+            masks = batch[1] if len(batch) > 1 else None
+            meta = batch[2:] if len(batch) > 2 else None
+            return images, masks, meta
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+    def _normalize_aux_outputs(self, aux_outputs):
+        if aux_outputs is None:
+            return {}
+        if torch.is_tensor(aux_outputs):
+            return {"aux_0": aux_outputs}
+        if isinstance(aux_outputs, dict):
+            normalized = {}
+            for key, value in aux_outputs.items():
+                if torch.is_tensor(value):
+                    normalized[key] = value
+                elif isinstance(value, (list, tuple)):
+                    for idx, tensor in enumerate(value):
+                        if torch.is_tensor(tensor):
+                            normalized[f"{key}_{idx}"] = tensor
+            return normalized
+        if isinstance(aux_outputs, (list, tuple)):
+            return {f"aux_{idx}": value for idx, value in enumerate(aux_outputs) if torch.is_tensor(value)}
+        return {}
+
+    def _forward_with_aux(self, images):
+        aux_outputs = {}
+        if hasattr(self.model, "forward_with_aux"):
+            result = self.model.forward_with_aux(images)
+            if isinstance(result, tuple):
+                logits = result[0]
+                aux_outputs = self._normalize_aux_outputs(result[1] if len(result) > 1 else None)
+            elif isinstance(result, dict):
+                logits = result.get("logits", result.get("main"))
+                aux_outputs = self._normalize_aux_outputs({k: v for k, v in result.items() if k not in {"logits", "main"}})
+            else:
+                logits = result
+        else:
+            logits = self.model(images)
+            if hasattr(self.model, "get_aux_outputs"):
+                aux_outputs = self._normalize_aux_outputs(self.model.get_aux_outputs())
+            elif hasattr(self.model, "get_spectral_supervision_tensors"):
+                aux_outputs = self._normalize_aux_outputs(self.model.get_spectral_supervision_tensors())
+        return logits, aux_outputs
+
+    def _compute_aux_loss(self, aux_outputs, targets):
+        if self.aux_loss_weight <= 0 or not aux_outputs:
+            return targets.new_tensor(0.0, dtype=torch.float32), {}
+
+        total_aux = None
+        used = 0
+        details = {}
+        for name, aux_tensor in aux_outputs.items():
+            if not torch.is_tensor(aux_tensor) or aux_tensor.ndim != 4:
+                continue
+            if aux_tensor.shape[1] != self.num_classes:
+                continue
+            if aux_tensor.shape[-2:] != targets.shape[-2:]:
+                aux_tensor = F.interpolate(aux_tensor, size=targets.shape[-2:], mode="bilinear", align_corners=False)
+            aux_loss, aux_loss_dict = self.criterion.compute(aux_tensor, targets)
+            total_aux = aux_loss if total_aux is None else total_aux + aux_loss
+            used += 1
+            details[f"{name}_total"] = float(aux_loss_dict["total"])
+
+        if used == 0:
+            return targets.new_tensor(0.0, dtype=torch.float32), {}
+        total_aux = total_aux / used
+        details["aux_total"] = float(total_aux.detach().cpu().item())
+        return total_aux, details
+
+    def _confusion_matrix(self, preds, targets):
+        preds = preds.view(-1).to(torch.int64)
+        targets = targets.view(-1).to(torch.int64)
+        valid = (targets >= 0) & (targets < self.num_classes)
+        preds = preds[valid]
+        targets = targets[valid]
+        index = targets * self.num_classes + preds
+        conf = torch.bincount(index, minlength=self.num_classes * self.num_classes)
+        return conf.view(self.num_classes, self.num_classes).cpu()
+
+    def _metrics_from_confusion(self, confusion):
+        confusion = confusion.to(torch.float64)
+        tp = torch.diag(confusion)
+        fp = confusion.sum(dim=0) - tp
+        fn = confusion.sum(dim=1) - tp
+        support = confusion.sum(dim=1)
+        pred_support = confusion.sum(dim=0)
+        total = confusion.sum().clamp_min(1.0)
+
+        dice = (2.0 * tp + 1e-8) / (2.0 * tp + fp + fn + 1e-8)
+        iou = (tp + 1e-8) / (tp + fp + fn + 1e-8)
+        precision = (tp + 1e-8) / (tp + fp + 1e-8)
+        recall = (tp + 1e-8) / (tp + fn + 1e-8)
+
+        fg_start = 0 if _cfg_get(self.config, "loss.include_background", False) else 1
+        if fg_start >= self.num_classes:
+            fg_start = 0
+        fg_slice = slice(fg_start, self.num_classes)
+
+        fg_support = support[fg_slice]
+        fg_pred_support = pred_support[fg_slice]
+        fg_dice = dice[fg_slice]
+        fg_recall = recall[fg_slice]
+        fg_present = fg_support > 0
+
+        if fg_present.any():
+            fg_macro_dice = float(fg_dice[fg_present].mean().item())
+            fg_macro_recall = float(fg_recall[fg_present].mean().item())
+            fg_min_dice = float(fg_dice[fg_present].min().item())
+            fg_presence_recall = float((torch.diag(confusion)[fg_slice][fg_present] > 0).double().mean().item())
+        else:
+            fg_macro_dice = float(fg_dice.mean().item()) if fg_dice.numel() > 0 else float(dice.mean().item())
+            fg_macro_recall = float(fg_recall.mean().item()) if fg_recall.numel() > 0 else float(recall.mean().item())
+            fg_min_dice = float(fg_dice.min().item()) if fg_dice.numel() > 0 else float(dice.min().item())
+            fg_presence_recall = 0.0
+
+        pred_ratio = (pred_support / total).cpu().numpy()
+        true_ratio = (support / total).cpu().numpy()
+        if len(pred_ratio[fg_start:]) > 0:
+            fg_pred = pred_ratio[fg_start:]
+            fg_true = true_ratio[fg_start:]
+            fg_mass = float(np.clip(fg_pred.sum(), 1e-8, None))
+            fg_dominant_ratio = float(np.max(fg_pred) / fg_mass) if fg_pred.size > 0 else 0.0
+            fg_distribution_gap = float(np.mean(np.abs(fg_pred - fg_true))) if fg_pred.size > 0 else 0.0
+        else:
+            fg_dominant_ratio = 0.0
+            fg_distribution_gap = 0.0
+
+        per_class = {}
+        for idx in range(self.num_classes):
+            per_class[self.class_names[idx]] = {
+                "dice": float(dice[idx].item()),
+                "iou": float(iou[idx].item()),
+                "precision": float(precision[idx].item()),
+                "recall": float(recall[idx].item()),
+                "support": float(support[idx].item()),
+                "pred_support": float(pred_support[idx].item()),
+            }
+
+        rare_values = [float(dice[idx].item()) for idx in self.rare_class_indices if support[idx] > 0]
+        rare_macro_dice = float(np.mean(rare_values)) if rare_values else fg_macro_dice
+
+        summary = {
+            "dice": fg_macro_dice,
+            "macro_dice": fg_macro_dice,
+            "macro_recall": fg_macro_recall,
+            "min_fg_dice": fg_min_dice,
+            "presence_recall": fg_presence_recall,
+            "rare_dice": rare_macro_dice,
+            "fg_distribution_gap": fg_distribution_gap,
+            "fg_dominant_ratio": fg_dominant_ratio,
+            "pixel_accuracy": float(tp.sum().item() / total.item()),
+        }
+        return {"summary": summary, "per_class": per_class, "pred_ratio": pred_ratio.tolist(), "true_ratio": true_ratio.tolist()}
+
+    def _batch_dice(self, outputs, targets):
+        preds = torch.argmax(outputs, dim=1)
+        confusion = self._confusion_matrix(preds, targets)
+        metrics = self._metrics_from_confusion(confusion)
+        return float(metrics["summary"]["dice"])
+
+    def train_one_epoch(self, train_loader):
         self.model.train()
-
-        losses: List[float] = []
-        dice_scores: List[float] = []
-
-        self.optimizer.zero_grad(set_to_none=True)
-        epoch_t0 = time.perf_counter()
-        first_batch_s: Optional[float] = None
-
-        train_iter = tqdm(
-            enumerate(dataloader, start=1),
-            total=self._planned_steps(dataloader, self.max_train_steps),
-            desc=f"train {epoch:03d}/{total_epochs:03d}",
-            dynamic_ncols=True,
-            leave=False,
-            disable=not self.show_progress,
-            mininterval=0.2,
-        )
-
-        for step, (images, masks) in train_iter:
-            if self.max_train_steps > 0 and step > self.max_train_steps:
-                break
-
-            if first_batch_s is None:
-                first_batch_s = time.perf_counter() - epoch_t0
-
-            # # debug
-            # print("\n>>> BEFORE MODEL:", images.shape)
-            images = images.to(self.device, non_blocking=True)
-            masks = masks.to(self.device, non_blocking=True)
-
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
-                logits = self.model(images)
-                loss = self.loss_fn(logits, masks) / self.grad_accum_steps
-
-            self.scaler.scale(loss).backward()
-
-            if step % self.grad_accum_steps == 0:
-                self._unscale_optimizer()
-            losses.append(float(loss.item() * self.grad_accum_steps))
-            dice_scores.append(float(self._batch_dice(logits, masks)))
-
-            train_iter.set_postfix(
-                loss=f"{losses[-1]:.4f}",
-                dice=f"{dice_scores[-1]:.4f}",
-                refresh=False,
-            )
-
-        train_iter.close()
-        total_s = time.perf_counter() - epoch_t0
-
-        if not losses:
-            return 0.0, 0.0, {
-                "total_s": float(total_s),
-                "first_batch_s": float(first_batch_s if first_batch_s is not None else total_s),
-            }
-
-        return float(np.mean(losses)), float(np.mean(dice_scores)), {
-            "total_s": float(total_s),
-            "first_batch_s": float(first_batch_s if first_batch_s is not None else total_s),
-        }
-
-    # TODO Rename this here and in `train_one_epoch`
-    def _unscale_optimizer(self):
-        """unscale gradients, optionally clip, step optimizer, and update ema."""
-        self.scaler.unscale_(self.optimizer)
-        if self.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
 
-        if self.ema is not None:
-            self.ema.update(self.model)
+        epoch_confusion = torch.zeros((self.num_classes, self.num_classes), dtype=torch.int64)
+        total_loss = 0.0
+        num_batches = 0
+        running_loss_components = {}
+        optimizer_steps = 0
+
+        for step, batch in enumerate(train_loader):
+            images, targets, _ = self._unpack_batch(batch)
+            images = images.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True).long()
+
+            with self._autocast_context():
+                logits, aux_outputs = self._forward_with_aux(images)
+                main_loss, loss_dict = self.criterion.compute(logits, targets)
+                aux_loss, aux_loss_dict = self._compute_aux_loss(aux_outputs, targets)
+                total_batch_loss = main_loss + self.aux_loss_weight * aux_loss
+
+            scaled_loss = total_batch_loss / self.grad_accum_steps
+            self.scaler.scale(scaled_loss).backward()
+
+            should_step = ((step + 1) % self.grad_accum_steps == 0) or ((step + 1) == len(train_loader))
+            if should_step:
+                if self.max_grad_norm > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad(set_to_none=True)
+                optimizer_steps += 1
+
+                if self.scheduler is not None and self.scheduler_step_on == "step":
+                    self.scheduler.step()
+                if self.ema is not None:
+                    self.ema.update(self.model)
+
+            preds = torch.argmax(logits.detach(), dim=1)
+            epoch_confusion += self._confusion_matrix(preds.cpu(), targets.detach().cpu())
+            total_loss += float(total_batch_loss.detach().cpu().item())
+            num_batches += 1
+
+            merged_loss_dict = dict(loss_dict)
+            if aux_loss_dict:
+                merged_loss_dict.update(aux_loss_dict)
+            merged_loss_dict["total"] = float(total_batch_loss.detach().cpu().item())
+            for key, value in merged_loss_dict.items():
+                running_loss_components[key] = running_loss_components.get(key, 0.0) + float(value)
+
+        if self.scheduler is not None and self.scheduler_step_on == "epoch":
+            self.scheduler.step()
+
+        avg_loss = total_loss / max(1, num_batches)
+        metrics = self._metrics_from_confusion(epoch_confusion)
+        avg_loss_components = {k: v / max(1, num_batches) for k, v in running_loss_components.items()}
+        metrics["loss"] = avg_loss
+        metrics["loss_components"] = avg_loss_components
+        metrics["optimizer_steps"] = optimizer_steps
+        return metrics
 
     @torch.no_grad()
-    def validate(self, dataloader, phase: str, epoch: int, total_epochs: int) -> Tuple[float, float, Dict[str, float]]:
-        """run one validation epoch and return loss/dice."""
-        model = self.ema.ema_model if self.ema is not None else self.model
+    def validate(self, val_loader):
+        model = self.ema.ema if self.ema is not None else self.model
         model.eval()
 
-        losses: List[float] = []
-        dice_scores: List[float] = []
-        eval_t0 = time.perf_counter()
-        first_batch_s: Optional[float] = None
+        epoch_confusion = torch.zeros((self.num_classes, self.num_classes), dtype=torch.int64)
+        total_loss = 0.0
+        num_batches = 0
+        running_loss_components = {}
 
-        eval_iter = tqdm(
-            enumerate(dataloader, start=1),
-            total=self._planned_steps(dataloader, self.max_eval_steps),
-            desc=f"{phase}  {epoch:03d}/{total_epochs:03d}",
-            dynamic_ncols=True,
-            leave=False,
-            disable=not self.show_progress,
-            mininterval=0.2,
-        )
-
-        for step, (images, masks) in eval_iter:
-            if self.max_eval_steps > 0 and step > self.max_eval_steps:
-                break
-
-            if first_batch_s is None:
-                first_batch_s = time.perf_counter() - eval_t0
-
+        for batch in val_loader:
+            images, targets, _ = self._unpack_batch(batch)
             images = images.to(self.device, non_blocking=True)
-            masks = masks.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True).long()
 
-            logits = model(images)
-            loss = self.loss_fn(logits, masks)
-
-            losses.append(float(loss.item()))
-            dice_scores.append(float(self._batch_dice(logits, masks)))
-
-            eval_iter.set_postfix(
-                loss=f"{losses[-1]:.4f}",
-                dice=f"{dice_scores[-1]:.4f}",
-                refresh=False,
-            )
-
-        eval_iter.close()
-        total_s = time.perf_counter() - eval_t0
-
-        if not losses:
-            return 0.0, 0.0, {
-                "total_s": float(total_s),
-                "first_batch_s": float(first_batch_s if first_batch_s is not None else total_s),
-            }
-
-        return float(np.mean(losses)), float(np.mean(dice_scores)), {
-            "total_s": float(total_s),
-            "first_batch_s": float(first_batch_s if first_batch_s is not None else total_s),
-        }
-
-    @torch.no_grad()
-    def predict(
-        self,
-        dataloader,
-        keep_images: int = 3,
-        keep_features: int = 3000,
-    ) -> Dict[str, Any]:
-        """
-        predict masks and collect arrays for analysis/visualization.
-        
-        Return Dict keys:
-        - `pred_masks`: `list` of predicted mask `np.ndarray`.
-        - `gt_masks`: `list` of ground truth mask `np.ndarray`.
-        - `prob_maps`: `list` of predicted probability map `np.ndarray`.
-        - `image_samples`: `list` of input image `np.ndarray` (up to keep_images).
-        - `features`: `np.ndarray` of collected feature vectors (up to keep_features).
-        - `feature_labels`: `np.ndarray` of corresponding feature labels.
-        - `attention_map`: `np.ndarray` of optional attention map array if model provides it.
-        """
-        model = self.ema.ema_model if self.ema is not None else self.model
-        model.eval()
-
-        pred_masks: List[np.ndarray] = []
-        gt_masks: List[np.ndarray] = []
-        prob_maps: List[np.ndarray] = []
-        image_samples: List[np.ndarray] = []
-        feature_bank: List[np.ndarray] = []
-        label_bank: List[np.ndarray] = []
-        attention_map: Optional[np.ndarray] = None
-
-        collected_features = 0
-
-        test_iter = tqdm(
-            enumerate(dataloader, start=1),
-            total=self._planned_steps(dataloader, self.max_eval_steps),
-            desc="test  predict",
-            dynamic_ncols=True,
-            leave=False,
-            disable=not self.show_progress,
-            mininterval=0.2,
-        )
-
-        for step, (images, masks) in test_iter:
-            if self.max_eval_steps > 0 and step > self.max_eval_steps:
-                break
-
-            images = images.to(self.device, non_blocking=True)
-            masks = masks.to(self.device, non_blocking=True)
-
-            logits = model(images)
-            probs = F.softmax(logits, dim=1)
-            preds = torch.argmax(probs, dim=1)
-
-            if attention_map is None and hasattr(model, "get_attention_map"):
-                attn = model.get_attention_map()
-                if attn is not None:
-                    attention_map = attn.detach().cpu().numpy()
-
-            pred_np = preds.detach().cpu().numpy()
-            mask_np = masks.detach().cpu().numpy()
-            prob_np = probs.detach().cpu().numpy()
-
-            pred_masks.extend(list(pred_np))
-            gt_masks.extend(list(mask_np))
-            prob_maps.extend(list(prob_np))
-
-            if len(image_samples) < keep_images:
-                remain = keep_images - len(image_samples)
-                image_samples.extend(list(images.detach().cpu().numpy()[:remain]))
-
-            # collect feature vectors for tsne.
-            if hasattr(model, "forward_features") and collected_features < keep_features:
-                feat = model.forward_features(images)
-                feat_np = feat.detach().cpu().numpy()
-                b, c, h, w = feat_np.shape
-                feat_flat = np.moveaxis(feat_np, 1, -1).reshape(-1, c)
-
-                mask_small = F.interpolate(masks.unsqueeze(1).float(), size=(h, w), mode="nearest")
-                mask_flat = mask_small.squeeze(1).long().detach().cpu().numpy().reshape(-1)
-
-                need = max(0, keep_features - collected_features)
-                if feat_flat.shape[0] > need:
-                    idx = np.random.choice(feat_flat.shape[0], size=need, replace=False)
-                    feat_flat = feat_flat[idx]
-                    mask_flat = mask_flat[idx]
-
-                feature_bank.append(feat_flat)
-                label_bank.append(mask_flat)
-                collected_features += feat_flat.shape[0]
-
-            test_iter.set_postfix(
-                kept_imgs=f"{len(image_samples)}/{keep_images}",
-                feat_pts=collected_features,
-                refresh=False,
-            )
-
-        test_iter.close()
-
-        return {
-            "pred_masks": pred_masks,
-            "gt_masks": gt_masks,
-            "prob_maps": prob_maps,
-            "image_samples": image_samples,
-            "features": np.concatenate(feature_bank, axis=0) if feature_bank else np.empty((0, 0), dtype=np.float32),
-            "feature_labels": np.concatenate(label_bank, axis=0) if label_bank else np.empty((0,), dtype=np.int64),
-            "attention_map": attention_map,
-        }
-
-    def save_checkpoint(self, path: str, epoch: int, metric: float) -> None:
-        """save checkpoint with model and optimizer state."""
-        ckpt_path = Path(path)
-        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-
-        payload = {
-            "epoch": epoch,
-            "metric": metric,
-            "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-        }
-        if self.ema is not None:
-            payload["ema_model"] = self.ema.ema_model.state_dict()
-        torch.save(payload, str(ckpt_path))
-
-    def load_checkpoint(self, path: str) -> None:
-        """load checkpoint into model and ema."""
-        payload = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(payload["model"])
-        if self.ema is not None and "ema_model" in payload:
-            self.ema.ema_model.load_state_dict(payload["ema_model"])
-
-    def extract_features(self, dataloader, max_points: int = 3000) -> Tuple[np.ndarray, np.ndarray]:
-        """extract feature vectors and labels from the dataLoader for pre-train t-SNE."""
-        model = self.ema.ema_model if self.ema is not None else self.model
-        model.eval()
-
-        feature_bank: List[np.ndarray] = []
-        label_bank: List[np.ndarray] = []
-        collected_points = 0
-
-        with torch.no_grad():
-            for images, masks in dataloader:
-                if collected_points >= max_points:
-                    break
-
-                images = images.to(self.device, non_blocking=True)
-                masks = masks.to(self.device, non_blocking=True)
-
-                if hasattr(model, "forward_features"):
-                    feat = model.forward_features(images)
+            with self._autocast_context():
+                if hasattr(model, "forward_with_aux"):
+                    result = model.forward_with_aux(images)
+                    if isinstance(result, tuple):
+                        logits = result[0]
+                        aux_outputs = self._normalize_aux_outputs(result[1] if len(result) > 1 else None)
+                    elif isinstance(result, dict):
+                        logits = result.get("logits", result.get("main"))
+                        aux_outputs = self._normalize_aux_outputs({k: v for k, v in result.items() if k not in {"logits", "main"}})
+                    else:
+                        logits = result
+                        aux_outputs = {}
                 else:
-                    feat = model(images)
+                    logits = model(images)
+                    aux_outputs = {}
+                    if hasattr(model, "get_aux_outputs"):
+                        aux_outputs = self._normalize_aux_outputs(model.get_aux_outputs())
+                    elif hasattr(model, "get_spectral_supervision_tensors"):
+                        aux_outputs = self._normalize_aux_outputs(model.get_spectral_supervision_tensors())
 
-                feat_np = feat.detach().cpu().numpy()
-                b, c, h, w = feat_np.shape
-                feat_flat = np.moveaxis(feat_np, 1, -1).reshape(-1, c)
+                main_loss, loss_dict = self.criterion.compute(logits, targets)
+                aux_loss, aux_loss_dict = self._compute_aux_loss(aux_outputs, targets)
+                total_batch_loss = main_loss + self.aux_loss_weight * aux_loss
 
-                mask_small = F.interpolate(masks.unsqueeze(1).float(), size=(h, w), mode="nearest")
-                mask_flat = mask_small.squeeze(1).long().detach().cpu().numpy().reshape(-1)
+            preds = torch.argmax(logits, dim=1)
+            epoch_confusion += self._confusion_matrix(preds.cpu(), targets.cpu())
+            total_loss += float(total_batch_loss.detach().cpu().item())
+            num_batches += 1
 
-                need = max(0, max_points - collected_points)
-                if feat_flat.shape[0] > need:
-                    idx = np.random.choice(feat_flat.shape[0], size=need, replace=False)
-                    feat_flat = feat_flat[idx]
-                    mask_flat = mask_flat[idx]
+            merged_loss_dict = dict(loss_dict)
+            if aux_loss_dict:
+                merged_loss_dict.update(aux_loss_dict)
+            merged_loss_dict["total"] = float(total_batch_loss.detach().cpu().item())
+            for key, value in merged_loss_dict.items():
+                running_loss_components[key] = running_loss_components.get(key, 0.0) + float(value)
 
-                feature_bank.append(feat_flat)
-                label_bank.append(mask_flat)
-                collected_points += feat_flat.shape[0]
+        avg_loss = total_loss / max(1, num_batches)
+        metrics = self._metrics_from_confusion(epoch_confusion)
+        avg_loss_components = {k: v / max(1, num_batches) for k, v in running_loss_components.items()}
+        metrics["loss"] = avg_loss
+        metrics["loss_components"] = avg_loss_components
+        return metrics
 
-        features = np.concatenate(feature_bank, axis=0) if feature_bank else np.empty((0, 0), dtype=np.float32)
-        labels = np.concatenate(label_bank, axis=0) if label_bank else np.empty((0,), dtype=np.int64)
-        return features, labels
+    def _save_checkpoint(self, epoch, is_best=False):
+        checkpoint = {
+            "epoch": int(epoch),
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "history": self.history,
+            "best_val_dice": self.best_val_dice,
+            "config": _to_serializable(self.config),
+        }
+        if self.scheduler is not None:
+            checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
+        if self.ema is not None:
+            checkpoint["ema_state_dict"] = self.ema.ema.state_dict()
 
-    @staticmethod
-    def _batch_dice(logits: torch.Tensor, targets: torch.Tensor) -> float:
-        """compute foreground mean dice for one batch."""
-        num_classes = logits.shape[1]
-        preds = torch.argmax(logits, dim=1)
+        last_path = self.output_dir / "last_checkpoint.pt"
+        torch.save(checkpoint, last_path)
+        if is_best:
+            torch.save(checkpoint, self.output_dir / "best_checkpoint.pt")
+            torch.save(self.model.state_dict(), self.output_dir / "best_model.pt")
+            if self.ema is not None:
+                torch.save(self.ema.ema.state_dict(), self.output_dir / "best_model_ema.pt")
 
-        dices: List[torch.Tensor] = []
-        for cls_idx in range(1, num_classes):
-            pred_c = (preds == cls_idx)
-            tgt_c = (targets == cls_idx)
-            inter = torch.sum(pred_c & tgt_c).float()
-            den = torch.sum(pred_c).float() + torch.sum(tgt_c).float()
-            dice = (2.0 * inter + 1e-6) / (den + 1e-6)
-            dices.append(dice)
+    def _save_history(self):
+        with open(self.output_dir / "history.json", "w", encoding="utf-8") as f:
+            json.dump(_to_serializable(self.history), f, indent=2)
 
-        return float(torch.mean(torch.stack(dices)).item()) if dices else 0.0
+    def fit(self, train_loader, val_loader=None, num_epochs=None):
+        if num_epochs is None:
+            num_epochs = int(_cfg_get(self.config, "train.epochs", 1))
+        self._build_scheduler(train_loader, num_epochs)
+
+        start_epoch = len(self.history["epochs"])
+        for epoch in range(start_epoch, start_epoch + int(num_epochs)):
+            epoch_start = time.time()
+            train_metrics = self.train_one_epoch(train_loader)
+            val_metrics = self.validate(val_loader) if val_loader is not None else train_metrics
+
+            train_summary = train_metrics["summary"]
+            val_summary = val_metrics["summary"]
+
+            self.history["epochs"].append(epoch + 1)
+            self.history["lr"].append(self._current_lr())
+            self.history["learning_rate"].append(self._current_lr())
+            self.history["train_loss"].append(float(train_metrics["loss"]))
+            self.history["val_loss"].append(float(val_metrics["loss"]))
+            self.history["train_dice"].append(float(train_summary["dice"]))
+            self.history["val_dice"].append(float(val_summary["dice"]))
+            self.history["train_macro_dice"].append(float(train_summary["macro_dice"]))
+            self.history["val_macro_dice"].append(float(val_summary["macro_dice"]))
+            self.history["train_min_fg_dice"].append(float(train_summary["min_fg_dice"]))
+            self.history["val_min_fg_dice"].append(float(val_summary["min_fg_dice"]))
+            self.history["train_presence_recall"].append(float(train_summary["presence_recall"]))
+            self.history["val_presence_recall"].append(float(val_summary["presence_recall"]))
+            self.history["train_rare_dice"].append(float(train_summary["rare_dice"]))
+            self.history["val_rare_dice"].append(float(val_summary["rare_dice"]))
+            self.history["train_fg_distribution_gap"].append(float(train_summary["fg_distribution_gap"]))
+            self.history["val_fg_distribution_gap"].append(float(val_summary["fg_distribution_gap"]))
+            self.history["train_fg_dominant_ratio"].append(float(train_summary["fg_dominant_ratio"]))
+            self.history["val_fg_dominant_ratio"].append(float(val_summary["fg_dominant_ratio"]))
+            self.history["train_per_class_dice"].append({k: float(v["dice"]) for k, v in train_metrics["per_class"].items()})
+            self.history["val_per_class_dice"].append({k: float(v["dice"]) for k, v in val_metrics["per_class"].items()})
+            self.history["train_loss_components"].append(train_metrics.get("loss_components", {}))
+            self.history["val_loss_components"].append(val_metrics.get("loss_components", {}))
+
+            is_best = float(val_summary["dice"]) >= float(self.best_val_dice)
+            if is_best:
+                self.best_val_dice = float(val_summary["dice"])
+
+            self._save_checkpoint(epoch + 1, is_best=is_best)
+            self._save_history()
+
+            epoch_time = time.time() - epoch_start
+            print(
+                f"Epoch {epoch + 1}/{start_epoch + int(num_epochs)} "
+                f"- lr: {self._current_lr():.6e} "
+                f"- train_loss: {train_metrics['loss']:.4f} "
+                f"- val_loss: {val_metrics['loss']:.4f} "
+                f"- train_dice: {train_summary['dice']:.4f} "
+                f"- val_dice: {val_summary['dice']:.4f} "
+                f"- val_min_fg_dice: {val_summary['min_fg_dice']:.4f} "
+                f"- val_presence_recall: {val_summary['presence_recall']:.4f} "
+                f"- val_rare_dice: {val_summary['rare_dice']:.4f} "
+                f"- val_fg_gap: {val_summary['fg_distribution_gap']:.4f} "
+                f"- val_fg_dom: {val_summary['fg_dominant_ratio']:.4f} "
+                f"- time: {epoch_time:.1f}s"
+            )
+
+        return self.history
+
+    @torch.no_grad()
+    def predict(self, data_loader):
+        model = self.ema.ema if self.ema is not None else self.model
+        model.eval()
+
+        probabilities = []
+        predictions = []
+        targets_all = []
+
+        for batch in data_loader:
+            images, targets, _ = self._unpack_batch(batch)
+            images = images.to(self.device, non_blocking=True)
+
+            with self._autocast_context():
+                logits = model(images)
+                probs = F.softmax(logits, dim=1)
+
+            probabilities.append(probs.detach().cpu().numpy())
+            predictions.append(torch.argmax(probs, dim=1).detach().cpu().numpy())
+            if targets is not None:
+                targets_all.append(targets.detach().cpu().numpy())
+
+        result = {
+            "probabilities": np.concatenate(probabilities, axis=0) if probabilities else np.empty((0, self.num_classes, 0, 0)),
+            "predictions": np.concatenate(predictions, axis=0) if predictions else np.empty((0, 0, 0), dtype=np.int64),
+        }
+        if targets_all:
+            result["targets"] = np.concatenate(targets_all, axis=0)
+            confusion = np.zeros((self.num_classes, self.num_classes), dtype=np.int64)
+            preds = result["predictions"]
+            targets = result["targets"]
+            for pred_map, target_map in zip(preds, targets):
+                pred_t = torch.from_numpy(pred_map)
+                target_t = torch.from_numpy(target_map)
+                confusion += self._confusion_matrix(pred_t, target_t).numpy()
+            result["metrics"] = self._metrics_from_confusion(torch.from_numpy(confusion))
+        return result
+
+    @torch.no_grad()
+    def extract_features(self, data_loader):
+        model = self.ema.ema if self.ema is not None else self.model
+        model.eval()
+
+        features = []
+        targets_all = []
+
+        for batch in data_loader:
+            images, targets, _ = self._unpack_batch(batch)
+            images = images.to(self.device, non_blocking=True)
+
+            if not hasattr(model, "forward_features"):
+                raise AttributeError("Model does not implement forward_features().")
+
+            with self._autocast_context():
+                feats = model.forward_features(images)
+
+            features.append(feats.detach().cpu().numpy())
+            if targets is not None:
+                targets_all.append(targets.detach().cpu().numpy())
+
+        result = {
+            "features": np.concatenate(features, axis=0) if features else np.empty((0, 0, 0, 0)),
+        }
+        if targets_all:
+            result["targets"] = np.concatenate(targets_all, axis=0)
+        return result
