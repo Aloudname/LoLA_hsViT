@@ -1,7 +1,7 @@
-import math
+from munch import Munch
 from typing import Any, Dict, Optional, Sequence, Tuple
 
-import torch
+import math, torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -178,10 +178,24 @@ class LightSpectralTransformerBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
+    def _safe_attention(self, x: torch.Tensor) -> torch.Tensor:
+        try:
+            return self.attn(x, x, x, need_weights=False)[0]
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            sdp_err = ("invalid configuration argument" in msg) or ("scaled_dot_product_attention" in msg)
+            if x.is_cuda and sdp_err and hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "sdp_kernel"):
+                # Fallback to math SDP with fp32 to avoid CUDA kernel launch issues on some driver/runtime combos.
+                with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+                    x32 = x.float()
+                    out = self.attn(x32, x32, x32, need_weights=False)[0]
+                return out.to(dtype=x.dtype)
+            raise
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x = self.norm1(x)
-        x, _ = self.attn(x, x, x, need_weights=False)
+        x = self._safe_attention(x)
         x = residual + self.dropout(x)
 
         residual = x
@@ -332,21 +346,25 @@ class MultiScaleSpectralTokens(nn.Module):
 
 
 class HSIAdapter(nn.Module):
-    def __init__(self, config: Any):
+    def __init__(self, config: Munch):
         super().__init__()
         self.config = config
 
-        self.in_channels = int(_cfg_first(config, ["model.in_channels", "in_channels"], 96))
-        self.num_classes = int(_cfg_first(config, ["model.num_classes", "num_classes"], 2))
+        preprocess_mode = str(_cfg_first(config, ["data.preprocess.mode"], "none")).lower()
+        configured_in_channels = _cfg_first(config, ["model.in_channels"], None)
+        if configured_in_channels is not None:
+            self.in_channels = int(configured_in_channels)
+        else:
+            reduced_channels = int(_cfg_first(config, ["data.preprocess.output_dim"], _cfg_first(config, ["data.hsi_bands"], 96)))
+            raw_channels = int(_cfg_first(config, ["data.hsi_bands"], 96))
+            self.in_channels = reduced_channels if preprocess_mode != "none" else raw_channels
+
+        self.num_classes = int(_cfg_first(config, ["model.num_classes", "data.num_classes", "num_classes"], 2))
         self.embed_dim = int(_cfg_first(config, ["model.embed_dim", "model.hidden_dim"], 256))
         self.decoder_dim = int(_cfg_first(config, ["model.decoder_dim"], self.embed_dim))
 
-        spectral_encoder_type = str(
-            _cfg_first(config, ["model.spectral_encoder.type", "model.spectral_encoder"], "spectral_transformer")
-        ).lower()
-        spectral_hidden_dim = int(
-            _cfg_first(config, ["model.spectral_encoder.hidden_dim"], max(self.embed_dim // 2, 64))
-        )
+        spectral_encoder_type = str(_cfg_first(config, ["model.spectral_encoder.type"], "spectral_transformer")).lower()
+        spectral_hidden_dim = int(_cfg_first(config, ["model.spectral_encoder.hidden_dim"], max(self.embed_dim // 2, 64)))
         spectral_tokens = int(_cfg_first(config, ["model.spectral_encoder.spectral_tokens"], 12))
         spectral_conv_depth = int(_cfg_first(config, ["model.spectral_encoder.conv_depth"], 2))
         spectral_transformer_depth = int(_cfg_first(config, ["model.spectral_encoder.transformer_depth"], 1))
@@ -354,7 +372,7 @@ class HSIAdapter(nn.Module):
         spectral_kernel = int(_cfg_first(config, ["model.spectral_encoder.kernel_size"], 7))
         spectral_dropout = float(_cfg_first(config, ["model.spectral_encoder.dropout"], 0.0))
 
-        if spectral_encoder_type in {"simple", "simple_conv"}:
+        if spectral_encoder_type in {"simple"}:
             self.spectral_encoder = SimpleSpectralEncoder(
                 in_channels=self.in_channels,
                 embed_dim=self.embed_dim,

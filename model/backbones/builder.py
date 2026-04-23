@@ -1,9 +1,7 @@
-from typing import Any, Iterable, Optional
-
 import torch.nn as nn
 
 from .vit_timm import TimmViTBackbone
-
+from typing import Any, Iterable, Optional
 
 def _cfg_get(cfg: Any, path: str, default: Any = None) -> Any:
     current = cfg
@@ -51,24 +49,25 @@ def build_backbone(config: Any, embed_dim: Optional[int] = None) -> nn.Module:
 
     model_name = _cfg_first(
         config,
-        ["model.backbone.name", "model.backbone_name", "model.vit_name"],
+        ["model.backbone_name", "model.backbone.name", "model.vit_name"],
         "vit_base_patch16_224",
     )
-    pretrained = bool(_cfg_first(config, ["model.backbone.pretrained", "model.pretrained_backbone"], True))
-    freeze = bool(_cfg_first(config, ["model.backbone.freeze", "model.freeze_backbone"], False))
-    unfreeze_last_n = int(_cfg_first(config, ["model.backbone.unfreeze_last_n"], 0))
-
-    trainable_patterns = _cfg_first(config, ["model.backbone.trainable_patterns"], None)
-    unfreeze_patterns = _cfg_first(config, ["model.backbone.unfreeze_patterns"], None)
-    train_pos_embed = bool(_cfg_first(config, ["model.backbone.train_pos_embed"], False))
-    pos_embed_interp = str(_cfg_first(config, ["model.backbone.pos_embed_interp"], "2d"))
-    strict_input_dim = bool(_cfg_first(config, ["model.backbone.strict_input_dim"], False))
-
+    pretrained = bool(
+        _cfg_first(
+            config,
+            ["model.pretrained_weights", "model.backbone.pretrained_weights", "model.pretrained_backbone"],
+            True,
+        )
+    )
+    freeze = bool(_cfg_first(config, ["model.freeze_backbone", "model.backbone.freeze"], False))
+    unfreeze_last_n = int(_cfg_first(config, ["model.unfreeze_last_n", "model.backbone.unfreeze_last_n"], 0))
+    pretrained_cache_dir = _cfg_first(config, ["path.pretrained_cache_dir"], None)
+    pretrained_local_path = _cfg_first(config, ["model.pretrained_local_path", "model.backbone.pretrained_local_path"], None)
+    grad_checkpointing = bool(_cfg_first(config, ["model.backbone.grad_checkpointing"], False))
+    target_embed_dim = embed_dim or int(_cfg_first(config, ["model.embed_dim", "model.hidden_dim"], 256))
     drop_rate = float(_cfg_first(config, ["model.backbone.drop_rate"], 0.0))
     attn_drop_rate = float(_cfg_first(config, ["model.backbone.attn_drop_rate"], 0.0))
     drop_path_rate = float(_cfg_first(config, ["model.backbone.drop_path_rate"], 0.0))
-
-    target_embed_dim = embed_dim or int(_cfg_first(config, ["model.embed_dim", "model.hidden_dim"], 256))
 
     return TimmViTBackbone(
         model_name=model_name,
@@ -79,9 +78,12 @@ def build_backbone(config: Any, embed_dim: Optional[int] = None) -> nn.Module:
         drop_path_rate=drop_path_rate,
         freeze=freeze,
         unfreeze_last_n=unfreeze_last_n,
-        trainable_patterns=trainable_patterns,
-        unfreeze_patterns=unfreeze_patterns,
-        train_pos_embed=train_pos_embed,
-        pos_embed_interp=pos_embed_interp,
-        strict_input_dim=strict_input_dim,
+        trainable_patterns=None,
+        unfreeze_patterns=None,
+        train_pos_embed=False,
+        pos_embed_interp="2d",
+        strict_input_dim=False,
+        pretrained_cache_dir=pretrained_cache_dir,
+        pretrained_local_path=pretrained_local_path,
+        grad_checkpointing=grad_checkpointing,
     )

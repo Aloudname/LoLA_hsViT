@@ -27,7 +27,11 @@ class Visualizer:
         fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.5))
 
         axes[0].plot(epochs, history.get("train_loss", []), label="train_loss", color="#1f77b4")
-        axes[0].plot(epochs, history.get("eval_loss", []), label="eval_loss", color="#d62728")
+        val_loss = history.get("eval_loss", history.get("val_loss", []))
+        axes[0].plot(epochs, val_loss, label="eval_loss", color="#d62728")
+        stage1_total = [comp.get("stage1_total", np.nan) for comp in history.get("train_loss_components", [])]
+        if len(stage1_total) == len(epochs):
+            axes[0].plot(epochs, stage1_total, label="stage1_total", color="#17becf", alpha=0.8)
         axes[0].set_title("loss curve")
         axes[0].set_xlabel("epoch")
         axes[0].set_ylabel("loss")
@@ -35,15 +39,55 @@ class Visualizer:
         axes[0].legend(loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=2, frameon=False)
 
         axes[1].plot(epochs, history.get("train_dice", []), label="train_dice", color="#2ca02c")
-        axes[1].plot(epochs, history.get("eval_dice", []), label="eval_dice", color="#9467bd")
+        val_dice = history.get("eval_dice", history.get("val_dice", []))
+        axes[1].plot(epochs, val_dice, label="eval_dice", color="#9467bd")
         axes[1].set_title("dice curve")
         axes[1].set_xlabel("epoch")
         axes[1].set_ylabel("dice")
         axes[1].grid(alpha=0.3)
         axes[1].legend(loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=2, frameon=False)
         
+        stage_spans = history.get("stage_spans", [])
+        stage_colors = ["#d9edf7", "#dff0d8", "#fcf8e3", "#f5e6ff"]
+        for idx, span in enumerate(stage_spans):
+            start = float(span.get("start", 1))
+            end = float(span.get("end", start))
+            color = stage_colors[idx % len(stage_colors)]
+            for ax in axes:
+                ax.axvspan(start - 0.5, end + 0.5, color=color, alpha=0.25, linewidth=0)
         fig.subplots_adjust(bottom=0.28, wspace=0.28)
         self._save_fig(fig, "curves/loss_dice_curves.png")
+
+    def plot_sampling_stats(self, stats: Mapping[str, Any]) -> None:
+        """plot sampling distribution comparison"""
+        split = stats.get("split", {}).get("train", {})
+        class_names = list(stats.get("class_names", self.class_names))
+        raw_hist = np.asarray(split.get("raw_pixel_hist", []), dtype=np.float64)
+        kept_hist = np.asarray(split.get("kept_patch_pixel_hist", []), dtype=np.float64)
+        sampled_hist = np.asarray(split.get("sampled_patch_pixel_hist", []), dtype=np.float64)
+        if raw_hist.size == 0 or kept_hist.size == 0:
+            return
+
+        n_cls = len(class_names)
+        raw_hist = np.pad(raw_hist[:n_cls], (0, max(0, n_cls - raw_hist[:n_cls].size)))
+        kept_hist = np.pad(kept_hist[:n_cls], (0, max(0, n_cls - kept_hist[:n_cls].size)))
+        sampled_hist = np.pad(sampled_hist[:n_cls], (0, max(0, n_cls - sampled_hist[:n_cls].size)))
+
+        x = np.arange(n_cls)
+        w = 0.25
+        fig, ax = plt.subplots(figsize=(11.2, 4.5))
+        ax.bar(x - w, raw_hist / np.maximum(raw_hist.sum(), 1.0), width=w, label="raw", color="#4e79a7")
+        ax.bar(x, kept_hist / np.maximum(kept_hist.sum(), 1.0), width=w, label="kept", color="#f28e2b")
+        ax.bar(x + w, sampled_hist / np.maximum(sampled_hist.sum(), 1.0), width=w, label="sampled", color="#59a14f")
+        ax.set_xticks(x)
+        ax.set_xticklabels(class_names)
+        ax.set_ylim(0.0, 1.0)
+        ax.set_ylabel("ratio")
+        ax.set_title("train sampling distribution")
+        ax.grid(axis="y", alpha=0.3)
+        ax.legend(frameon=False)
+        fig.tight_layout()
+        self._save_fig(fig, "data/sampling_distribution.png")
 
     def plot_prf(self, bundle: MetricsBundle) -> None:
         """plot precision/recall/f1 grouped bars by class."""

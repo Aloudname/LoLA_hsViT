@@ -35,6 +35,19 @@ class BandAttentionEncoder(nn.Module):
         )
         self.norm2 = nn.LayerNorm(out_channels)
 
+    def _safe_attention(self, x: torch.Tensor) -> torch.Tensor:
+        try:
+            return self.attn(x, x, x, need_weights=False)[0]
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            sdp_err = ("invalid configuration argument" in msg) or ("scaled_dot_product_attention" in msg)
+            if x.is_cuda and sdp_err and hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "sdp_kernel"):
+                with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+                    x32 = x.float()
+                    out = self.attn(x32, x32, x32, need_weights=False)[0]
+                return out.to(dtype=x.dtype)
+            raise
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, H, W)
         x = self.stem(x)
@@ -45,7 +58,7 @@ class BandAttentionEncoder(nn.Module):
 
         x_conv = x.reshape(B, C, H * W).transpose(1, 2)  # (B, N, C)
         x_conv = self.norm(x_conv)
-        attn_out, _ = self.attn(x_conv, x_conv, x_conv)
+        attn_out = self._safe_attention(x_conv)
         x_conv = x_conv + attn_out
         x_conv = self.norm2(x_conv)
         ffn_out = self.ffn(x_conv)

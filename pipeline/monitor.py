@@ -12,13 +12,21 @@ Dependencies:
 
 # Optional NVML (multi-GPU)
 from datetime import datetime
-import os, time, psutil, pynvml, argparse, platform
-
+import os, time, psutil, argparse, platform
 
 try:
-    pynvml.nvmlInit()
-    NVML_AVAILABLE = True
+    import pynvml  # type: ignore
 except Exception:
+    pynvml = None
+
+
+if pynvml is not None:
+    try:
+        pynvml.nvmlInit()
+        NVML_AVAILABLE = True
+    except Exception:
+        NVML_AVAILABLE = False
+else:
     NVML_AVAILABLE = False
 
 def tprint(*args, **kwargs) -> None:

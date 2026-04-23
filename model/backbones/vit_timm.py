@@ -1,10 +1,16 @@
 import math
+from pathlib import Path
 from typing import Iterable, Optional, Sequence, Tuple
 
 import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+    from safetensors.torch import load_file as load_safetensors_file
+except Exception:
+    load_safetensors_file = None
 
 
 def _to_pattern_list(patterns: Optional[Iterable[str]]) -> Sequence[str]:
@@ -16,7 +22,7 @@ def _to_pattern_list(patterns: Optional[Iterable[str]]) -> Sequence[str]:
             return []
         if text.startswith("[") and text.endswith("]"):
             text = text[1:-1]
-        return [part.strip().strip("'"") for part in text.split(",") if part.strip()]
+        return [part.strip().strip("'\"") for part in text.split(",") if part.strip()]
     return [str(pattern).strip() for pattern in patterns if str(pattern).strip()]
 
 
@@ -36,17 +42,29 @@ class TimmViTBackbone(nn.Module):
         train_pos_embed: bool = False,
         pos_embed_interp: str = "2d",
         strict_input_dim: bool = False,
+        pretrained_cache_dir: Optional[str] = None,
+        pretrained_local_path: Optional[str] = None,
+        grad_checkpointing: bool = False,
     ):
         super().__init__()
+        use_pretrained = bool(pretrained and not pretrained_local_path)
+        timm_kwargs = {
+            "pretrained": use_pretrained,
+            "num_classes": 0,
+            "global_pool": "",
+            "drop_rate": drop_rate,
+            "attn_drop_rate": attn_drop_rate,
+            "drop_path_rate": drop_path_rate,
+        }
+        if pretrained_cache_dir:
+            timm_kwargs["cache_dir"] = str(pretrained_cache_dir)
         self.vit = timm.create_model(
             model_name,
-            pretrained=pretrained,
-            num_classes=0,
-            global_pool="",
-            drop_rate=drop_rate,
-            attn_drop_rate=attn_drop_rate,
-            drop_path_rate=drop_path_rate,
+            **timm_kwargs,
         )
+        if pretrained_local_path:
+            local_state_path = self._resolve_local_weights_path(pretrained_local_path)
+            self._load_local_pretrained(local_state_path)
 
         self.model_name = model_name
         self.vit_embed_dim = int(getattr(self.vit, "embed_dim"))
@@ -68,6 +86,8 @@ class TimmViTBackbone(nn.Module):
             if getattr(self.vit, "dist_token", None) is not None:
                 prefix_tokens += 1
         self.num_prefix_tokens = prefix_tokens
+        if grad_checkpointing and hasattr(self.vit, "set_grad_checkpointing"):
+            self.vit.set_grad_checkpointing(True)
 
         self._configure_trainability(
             freeze=freeze,
@@ -76,6 +96,44 @@ class TimmViTBackbone(nn.Module):
             unfreeze_patterns=_to_pattern_list(unfreeze_patterns),
             train_pos_embed=train_pos_embed,
         )
+
+    @staticmethod
+    def _resolve_local_weights_path(pretrained_local_path: str) -> Path:
+        path = Path(pretrained_local_path).expanduser()
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        if path.is_dir():
+            candidates = [
+                path / "model.safetensors",
+                path / "pytorch_model.bin",
+                path / "pytorch_model.pt",
+            ]
+            for candidate in candidates:
+                if candidate.exists():
+                    return candidate
+            raise FileNotFoundError(f"no supported weights file found in directory: {path}")
+        if not path.exists():
+            fallback_hidden = (Path.cwd() / ".pretrained" / path.name).resolve()
+            if fallback_hidden.exists():
+                return fallback_hidden
+            raise FileNotFoundError(f"local pretrained weights not found: {path}")
+        return path
+
+    def _load_local_pretrained(self, local_state_path: Path) -> None:
+        suffix = local_state_path.suffix.lower()
+        if suffix == ".safetensors":
+            if load_safetensors_file is None:
+                raise RuntimeError("safetensors is required to load .safetensors weights")
+            state_dict = load_safetensors_file(str(local_state_path), device="cpu")
+        else:
+            payload = torch.load(str(local_state_path), map_location="cpu")
+            if isinstance(payload, dict) and "state_dict" in payload and isinstance(payload["state_dict"], dict):
+                state_dict = payload["state_dict"]
+            elif isinstance(payload, dict):
+                state_dict = payload
+            else:
+                raise RuntimeError(f"unsupported checkpoint payload type: {type(payload)}")
+        self.vit.load_state_dict(state_dict, strict=False)
 
     def _configure_trainability(
         self,

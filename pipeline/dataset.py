@@ -4,18 +4,19 @@ from tqdm import tqdm
 from munch import Munch
 from pathlib import Path
 from scipy.linalg import eig
-from scipy.signal import savgol_filter
 from dataclasses import dataclass
 from sklearn.decomposition import PCA
+from scipy.signal import savgol_filter
 from tqdm import TqdmExperimentalWarning
-from torch.utils.data import DataLoader, Dataset
 from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.neighbors import NeighborhoodComponentsAnalysis
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from pipeline.monitor import tprint
-import cv2, json, torch, shutil, warnings, itertools, numpy as np
+import os, cv2, json, torch, shutil, hashlib, warnings, itertools, numpy as np
 
 warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 
@@ -38,6 +39,11 @@ class PatchRecord:
     sample_index: int
     top: int
     left: int
+    weight: float = 1.0
+    has_precious: bool = False
+    fg_ratio: float = 0.0
+    bg_ratio: float = 1.0
+    is_hard_bg: bool = False
 
 
 @dataclass
@@ -203,9 +209,15 @@ class SpectralReducer:
     ) -> None:
         """fit reducer from train split pixels."""
         if self.mode == "none":
+            # simple norm for none-mode
+            x_fit, _ = self._collect_pixels(samples, num_classes, show_progress=show_progress)
+            if x_fit.size == 0:
+                raise RuntimeError("failed to collect fit pixels for none-mode normalization")
+            _ = self._prepare_features(x_fit, fit=True)
+            
             self.fitted = True
             self.reference_projection_name = "Raw spectra"
-            self.reduced_projection_name = "Raw spectra"
+            self.reduced_projection_name = "Normalized spectra"
             return
 
         x_fit, y_fit = self._collect_pixels(samples, num_classes, show_progress=show_progress)
@@ -478,10 +490,15 @@ class SpectralReducer:
         input:
             image: (h, w, c).
         output:
-            transformed image: (c_new, h, w) for reducer modes, raw image for none.
+            transformed image: (c, h, w) for reducer modes,
         """
         if self.mode == "none":
-            return image
+            # do simple norm for none-mode
+            h, w, c = image.shape
+            x = image.reshape(-1, c).astype(np.float32)
+            x = self._prepare_features(x, fit=False)
+            # expected output: (c, h, w)
+            return x.reshape(h, w, c).transpose(2, 0, 1).astype(np.float32)
         if not self.fitted:
             raise RuntimeError("spectral reducer must be fitted before transform")
 
@@ -663,21 +680,29 @@ def _build_patch_records(
     max_background_ratio: float = 1.0,
     precious_repeat: int = 1,
     precious_class: int = 1,
-) -> Tuple[List[PatchRecord], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    advanced_sampling: Optional[Mapping[str, Any]] = None,
+) -> Tuple[List[PatchRecord], np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """build patch index list and class histograms.
-
-    output:
-        records: kept patch indices.
-        raw_hist: full-image pixel histogram.
-        patch_hist: kept-patch pixel histogram.
-        tracked_pre: tracked sample histogram before filtering.
-        tracked_post: tracked sample histogram after filtering.
+    input:
+        samples: list of SampleItem.
+        patch_size: int.
+        stride: int.
+        foreground_ratio_threshold: float.
+        num_classes: int.
+        tracked_sample_ids: list of sample ids.
+        split_name: str.
+        show_progress: bool.
+        max_background_ratio: float.
+        precious_repeat: int.
+        precious_class: int.
+        advanced_sampling: dict.
     """
     tracked_set = set(tracked_sample_ids)
     records: List[PatchRecord] = []
 
     raw_hist = np.zeros(num_classes, dtype=np.int64)
     patch_hist = np.zeros(num_classes, dtype=np.int64)
+    sampled_hist = np.zeros(num_classes, dtype=np.float64)
     tracked_pre = np.zeros(num_classes, dtype=np.int64)
     tracked_post = np.zeros(num_classes, dtype=np.int64)
 
@@ -692,6 +717,15 @@ def _build_patch_records(
         disable=not show_progress,
         mininterval=0.2,
     )
+
+    adv = _as_munch(advanced_sampling or {})
+    use_weighted_sampler = bool(getattr(adv, "use_weighted_sampler", False)) and split_name == "train"
+    rho = float(getattr(adv, "rho", 0.35))
+    pg_min_ratio = float(getattr(adv, "pg_min_ratio", 0.12))
+    hard_bg_ratio = float(getattr(adv, "hard_bg_ratio", 0.20))
+    weight_caps = getattr(adv, "weight_caps", [0.5, 8.0])
+    w_min = float(weight_caps[0]) if isinstance(weight_caps, (list, tuple)) and len(weight_caps) > 0 else 0.5
+    w_max = float(weight_caps[1]) if isinstance(weight_caps, (list, tuple)) and len(weight_caps) > 1 else 8.0
 
     for sample_index, sample in sample_iter:
         mask = np.load(sample.mask_path).astype(np.int64)
@@ -711,6 +745,9 @@ def _build_patch_records(
             patch_mask = mask[top : top + patch_size, left : left + patch_size]
             patch_hist_once = _compute_hist(patch_mask, num_classes)
             has_precious = bool(np.any(patch_mask == precious_class))
+            fg_ratio = float(np.mean(patch_mask > 0))
+            bg_ratio = float(np.mean(patch_mask == 0))
+            is_hard_bg = bool(bg_ratio >= 0.85 and fg_ratio > 0.0 and fg_ratio <= hard_bg_ratio)
             if sample.sample_id in tracked_set:
                 tracked_pre += patch_hist_once
 
@@ -721,9 +758,27 @@ def _build_patch_records(
                 precious_class=precious_class,
             ):
                 repeat_count = precious_repeat if has_precious else 1
+                weight = 1.0
+                if use_weighted_sampler:
+                    # mix original and balanced targets while enforcing pg emphasis
+                    pg_bonus = max(pg_min_ratio, rho) if has_precious else 0.0
+                    weight = 1.0 + 2.5 * pg_bonus + rho * fg_ratio + 0.8 * float(is_hard_bg)
+                    weight = float(np.clip(weight, w_min, w_max))
                 for _ in range(repeat_count):
-                    records.append(PatchRecord(sample_index=sample_index, top=top, left=left))
+                    records.append(
+                        PatchRecord(
+                            sample_index=sample_index,
+                            top=top,
+                            left=left,
+                            weight=weight,
+                            has_precious=has_precious,
+                            fg_ratio=fg_ratio,
+                            bg_ratio=bg_ratio,
+                            is_hard_bg=is_hard_bg,
+                        )
+                    )
                     patch_hist += patch_hist_once
+                    sampled_hist += patch_hist_once.astype(np.float64) * float(weight)
                     sample_kept += 1
                 if sample.sample_id in tracked_set:
                     tracked_post += patch_hist_once
@@ -735,9 +790,29 @@ def _build_patch_records(
             patch_hist_once = _compute_hist(patch_mask, num_classes)
             has_precious = bool(np.any(patch_mask == precious_class))
             repeat_count = precious_repeat if has_precious else 1
+            fg_ratio = float(np.mean(patch_mask > 0))
+            bg_ratio = float(np.mean(patch_mask == 0))
+            is_hard_bg = bool(bg_ratio >= 0.85 and fg_ratio > 0.0 and fg_ratio <= hard_bg_ratio)
+            weight = 1.0
+            if use_weighted_sampler:
+                pg_bonus = max(pg_min_ratio, rho) if has_precious else 0.0
+                weight = 1.0 + 2.5 * pg_bonus + rho * fg_ratio + 0.8 * float(is_hard_bg)
+                weight = float(np.clip(weight, w_min, w_max))
             for _ in range(repeat_count):
-                records.append(PatchRecord(sample_index=sample_index, top=center_top, left=center_left))
+                records.append(
+                    PatchRecord(
+                        sample_index=sample_index,
+                        top=center_top,
+                        left=center_left,
+                        weight=weight,
+                        has_precious=has_precious,
+                        fg_ratio=fg_ratio,
+                        bg_ratio=bg_ratio,
+                        is_hard_bg=is_hard_bg,
+                    )
+                )
                 patch_hist += patch_hist_once
+                sampled_hist += patch_hist_once.astype(np.float64) * float(weight)
             if sample.sample_id in tracked_set:
                 tracked_post += patch_hist_once
 
@@ -745,7 +820,7 @@ def _build_patch_records(
 
     sample_iter.close()
 
-    return records, raw_hist, patch_hist, tracked_pre, tracked_post
+    return records, raw_hist, patch_hist, tracked_pre, tracked_post, sampled_hist.astype(np.float64)
 
 
 def _pick_tracked_samples(samples: Sequence[SampleItem], ratio: float, seed: int) -> List[str]:
@@ -792,6 +867,168 @@ def _build_cache_key(config: Munch, modality: str) -> str:
     return json.dumps(payload, sort_keys=True)
 
 
+def _cache_signature(samples_by_split: Mapping[str, Sequence[SampleItem]]) -> Dict[str, Any]:
+    """build signature for preprocessed samples cache"""
+    signature: Dict[str, Any] = {}
+    for split_name, split_samples in samples_by_split.items():
+        rows = []
+        for sample in split_samples:
+            st = sample.hsi_path.stat()
+            rows.append(
+                {
+                    "sample_id": sample.sample_id,
+                    "hsi_path": str(sample.hsi_path),
+                    "mtime_ns": int(st.st_mtime_ns),
+                    "size": int(st.st_size),
+                }
+            )
+        signature[split_name] = rows
+    return signature
+
+
+def _prepare_none_mode_cache(
+    cfg: Munch,
+    samples_by_split: Mapping[str, Sequence[SampleItem]],
+    reducer: SpectralReducer,
+    show_progress: bool,
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    """
+    prepare cached none-mode normed cubes.
+    use multi-threading to speed up.
+    """
+    cache_cfg = _as_munch(getattr(getattr(cfg.data, "preprocess", Munch()), "cache", Munch()))
+    cache_enabled = bool(getattr(cache_cfg, "enabled", True))
+    if not cache_enabled:
+        return {}, {"enabled": False, "reason": "cache disabled"}
+
+    cached_root = Path(getattr(cfg.path, "cached_dir", "./cached_hsi"))
+    try:
+        cached_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        tprint(
+            "Warning: cached_dir is not writable\n"
+            f"\trequested={cached_root}\n"
+            f"\treason={exc}"
+        )
+        raise RuntimeError(f"cached_dir is not writable: {cached_root}") from exc
+
+    manifest_path = cached_root / "cache_manifest.json"
+    norm_root = cached_root / "normed"
+    stats_root = cached_root / "stats"
+    norm_root.mkdir(parents=True, exist_ok=True)
+    stats_root.mkdir(parents=True, exist_ok=True)
+
+    key_payload = {
+        "seed": int(cfg.data.split.seed),
+        "version_tag": str(getattr(cache_cfg, "version_tag", "v1")),
+        "mode": str(cfg.data.preprocess.mode),
+        "preprocess": dict(cfg.data.preprocess),
+        "signature": _cache_signature(samples_by_split),
+    }
+    key_raw = json.dumps(key_payload, sort_keys=True)
+    cache_key = hashlib.sha256(key_raw.encode("utf-8")).hexdigest()[:20]
+
+    norm_dir = norm_root / cache_key
+    stats_dir = stats_root / cache_key
+    stats_dir.mkdir(parents=True, exist_ok=True)
+    stats_path = stats_dir / "train_stats.npz"
+    strict_manifest = bool(getattr(cache_cfg, "strict_manifest", True))
+
+    existing_manifest = {}
+    if manifest_path.exists():
+        with manifest_path.open("r", encoding="utf-8") as f:
+            existing_manifest = json.load(f)
+
+    all_samples = [s for split in samples_by_split.values() for s in split]
+    if strict_manifest:
+        # check if cache valid
+        matched = existing_manifest.get(cache_key, None)
+        if matched is not None and norm_dir.exists() and stats_path.exists():
+            all_ok = True
+            for sample in all_samples:
+                if not (norm_dir / f"{sample.sample_id}.npy").exists():
+                    all_ok = False
+                    break
+            if all_ok:
+                return (
+                    {sample.sample_id: str(norm_dir / f"{sample.sample_id}.npy") for sample in all_samples},
+                    {"enabled": True, "cache_key": cache_key, "cache_hit": True, "stats_path": str(stats_path)},
+                )
+
+    # collect train pixels for normed cube standardization
+    if reducer.enable_standardize and reducer.scaler is None:
+        train_samples = list(samples_by_split.get("train", []))
+        x_fit, _ = reducer._collect_pixels(train_samples, num_classes=int(cfg.data.num_classes), show_progress=show_progress)
+        if x_fit.size == 0:
+            raise RuntimeError("failed to collect train pixels for none-mode cache standardization")
+        reducer._prepare_features(x_fit, fit=True)
+
+    reserve_cores = max(1, int(getattr(cache_cfg, "reserve_cores", 2)))
+    user_workers = max(1, int(getattr(cache_cfg, "num_workers", 4)))
+    cpu_total = os.cpu_count() or 4
+    workers = max(1, min(user_workers, max(1, cpu_total - reserve_cores)))
+
+    norm_dir.mkdir(parents=True, exist_ok=True)
+    if reducer.scaler is not None:
+        np.savez(
+            stats_path,
+            mean_=reducer.scaler.mean_.astype(np.float32),
+            scale_=reducer.scaler.scale_.astype(np.float32),
+        )
+
+    def _process_one(sample: SampleItem) -> str:
+        cube = np.load(sample.hsi_path).astype(np.float32)
+        h, w, c = cube.shape
+        flat = cube.reshape(-1, c)
+        norm_flat = reducer._prepare_features(flat, fit=False)
+        out_path = norm_dir / f"{sample.sample_id}.npy"
+        np.save(out_path, norm_flat.reshape(h, w, c).astype(np.float32))
+        return str(out_path)
+
+    cache_paths: Dict[str, str] = {}
+    try:
+        # context manager for thread pool
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_process_one, sample): sample for sample in all_samples}
+            # progress bar for threading
+            iterator = tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="none-cache",
+                dynamic_ncols=True,
+                leave=False,
+                disable=not show_progress,
+            )
+            for future in iterator:
+                sample = futures[future]
+                cache_paths[sample.sample_id] = future.result()
+    except Exception as exc:
+        tprint(f"Warning: threaded none-mode cache failed, fallback to single-thread. reason={exc}")
+        cache_paths = {}
+        for sample in tqdm(
+            all_samples,
+            desc="none-cache-fallback",
+            dynamic_ncols=True,
+            leave=False,
+            disable=not show_progress,
+        ):
+            cache_paths[sample.sample_id] = _process_one(sample)
+
+    # update manifest
+    existing_manifest[cache_key] = {
+        "key_payload": key_payload,
+        "norm_dir": str(norm_dir),
+        "stats_path": str(stats_path),
+        "num_samples": len(all_samples),
+    }
+    with manifest_path.open("w", encoding="utf-8") as f:
+        json.dump(existing_manifest, f, indent=2, ensure_ascii=False)
+    return (
+        cache_paths,
+        {"enabled": True, "cache_key": cache_key, "cache_hit": False, "stats_path": str(stats_path), "workers": workers},
+    )
+
+
 def prepare_data(config: Munch, modality: str) -> PreparedData:
     """prepare split, patch records, and reducer once."""
     cfg = config
@@ -833,6 +1070,7 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
     seed = int(cfg.data.split.seed)
     track_ratio = float(cfg.data.track_sample_ratio)
     sampling_cfg = getattr(cfg.data, "sampling", Munch())
+    advanced_sampling_cfg = _as_munch(getattr(sampling_cfg, "advanced", Munch()))
 
     train_fg_threshold = float(getattr(sampling_cfg, "train_fg_ratio_threshold", threshold))
     train_max_background_ratio = float(getattr(sampling_cfg, "train_max_background_ratio", 1.0))
@@ -859,6 +1097,21 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
         reducer.fitted = True
         tprint("spectral reducer skipped for rgb modality")
 
+    cached_hsi_paths: Dict[str, str] = {}
+    none_cache_meta: Dict[str, Any] = {"enabled": False}
+    if modality == "hsi" and reducer.mode == "none":
+        cached_hsi_paths, none_cache_meta = _prepare_none_mode_cache(
+            cfg=cfg,
+            samples_by_split=samples_by_split,
+            reducer=reducer,
+            show_progress=show_progress,
+        )
+        tprint(
+            "none-mode cache:\n"
+            f"\tenabled={none_cache_meta.get('enabled', False)}, hit={none_cache_meta.get('cache_hit', False)}\n"
+            f"\tkey={none_cache_meta.get('cache_key', 'n/a')}"
+        )
+
     patches_by_split: Dict[str, List[PatchRecord]] = {}
     split_stats: Dict[str, Any] = {}
 
@@ -874,7 +1127,7 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
             split_max_background_ratio = train_max_background_ratio
             split_precious_repeat = train_precious_repeat
 
-        records, raw_hist, patch_hist, tracked_pre, tracked_post = _build_patch_records(
+        records, raw_hist, patch_hist, tracked_pre, tracked_post, sampled_hist = _build_patch_records(
             samples=split_samples,
             patch_size=patch_size,
             stride=stride,
@@ -886,6 +1139,7 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
             max_background_ratio=split_max_background_ratio,
             precious_repeat=split_precious_repeat,
             precious_class=precious_class,
+            advanced_sampling=dict(advanced_sampling_cfg),
         )
 
         tprint(
@@ -900,6 +1154,7 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
             "num_patches": len(records),
             "raw_pixel_hist": raw_hist.tolist(),
             "kept_patch_pixel_hist": patch_hist.tolist(),
+            "sampled_patch_pixel_hist": sampled_hist.tolist(),
             "tracked_sample_ids": tracked_ids,
             "tracked_pre_hist": tracked_pre.tolist(),
             "tracked_post_hist": tracked_post.tolist(),
@@ -908,7 +1163,9 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
                 "max_background_ratio": float(split_max_background_ratio),
                 "precious_repeat": int(split_precious_repeat),
                 "precious_class": precious_class,
+                "advanced": dict(advanced_sampling_cfg),
             },
+            "sampled_pg_patch_ratio": float(np.mean([1.0 if r.has_precious else 0.0 for r in records])) if records else 0.0,
         }
 
     prepared = PreparedData(
@@ -920,6 +1177,8 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
             "split": split_stats,
             "class_names": list(cfg.data.class_names),
             "num_classes": num_classes,
+            "cached_hsi_paths": cached_hsi_paths,
+            "none_cache_meta": none_cache_meta,
         },
     )
 
@@ -1003,7 +1262,12 @@ class BasePatchDataset(Dataset):
 
         if sample.sample_id not in self._cube_cache:
             if self.modality == "hsi":
-                cube = np.load(sample.hsi_path, mmap_mode="r")
+                cached_paths = self.prepared.stats.get("cached_hsi_paths", {})
+                cached_path = cached_paths.get(sample.sample_id, None)
+                if cached_path is not None and Path(cached_path).exists():
+                    cube = np.load(cached_path, mmap_mode="r")
+                else:
+                    cube = np.load(sample.hsi_path, mmap_mode="r")
             else:
                 if sample.rgb_path is None:
                     raise FileNotFoundError(f"rgb file not found for sample: {sample.sample_id}")
@@ -1113,8 +1377,19 @@ def build_dataloaders(config: Munch, modality: str) -> Tuple[Dict[str, DataLoade
     if num_workers > 0:
         loader_kwargs["prefetch_factor"] = prefetch_factor
 
+    advanced_sampling_cfg = _as_munch(getattr(getattr(cfg.data, "sampling", Munch()), "advanced", Munch()))
+    use_weighted_sampler = bool(getattr(advanced_sampling_cfg, "use_weighted_sampler", False))
+    train_sampler = None
+    if use_weighted_sampler and modality == "hsi" and len(train_ds.records) > 0:
+        weights = np.asarray([max(1e-6, float(getattr(rec, "weight", 1.0))) for rec in train_ds.records], dtype=np.float64)
+        train_sampler = WeightedRandomSampler(
+            weights=torch.from_numpy(weights).double(),
+            num_samples=len(train_ds.records),
+            replacement=True,
+        )
+
     loaders = {
-        "train": DataLoader(train_ds, batch_size=train_bs, shuffle=True, **loader_kwargs),
+        "train": DataLoader(train_ds, batch_size=train_bs, shuffle=(train_sampler is None), sampler=train_sampler, **loader_kwargs),
         "eval": DataLoader(eval_ds, batch_size=eval_bs, shuffle=False, **loader_kwargs),
         "test": DataLoader(test_ds, batch_size=eval_bs, shuffle=False, **loader_kwargs),
     }
@@ -1125,6 +1400,7 @@ def build_dataloaders(config: Munch, modality: str) -> Tuple[Dict[str, DataLoade
         f"\ttrain_batches={len(loaders['train'])}, eval_batches={len(loaders['eval'])}, test_batches={len(loaders['test'])}\n"
         f"\tbatch_size(train/eval)={train_bs}/{eval_bs}, workers={num_workers}, prefetch={prefetch_factor}\n"
         f"\tpin_memory={loader_kwargs['pin_memory']}, persistent_workers={loader_kwargs['persistent_workers']}\n"
+        f"\tweighted_sampler={train_sampler is not None}\n"
     )
     return loaders, prepared
 

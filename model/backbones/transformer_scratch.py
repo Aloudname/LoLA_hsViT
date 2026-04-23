@@ -28,6 +28,21 @@ class ScratchEncoderBlock(nn.Module):
         self.fc2 = nn.Linear(ff_dim, embed_dim)
         self.drop2 = nn.Dropout(dropout)
 
+    def _safe_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        try:
+            return self.attn(q, k, v, need_weights=False)[0]
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            sdp_err = ("invalid configuration argument" in msg) or ("scaled_dot_product_attention" in msg)
+            if q.is_cuda and sdp_err and hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "sdp_kernel"):
+                with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+                    q32 = q.float()
+                    k32 = k.float()
+                    v32 = v.float()
+                    out = self.attn(q32, k32, v32, need_weights=False)[0]
+                return out.to(dtype=q.dtype)
+            raise
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         q = self.norm1(x)
         # During ONNX export, avoid native fastpath by passing distinct tensors.
@@ -37,7 +52,7 @@ class ScratchEncoderBlock(nn.Module):
         else:
             k = q
             v = q
-        attn_out = self.attn(q, k, v, need_weights=False)[0]
+        attn_out = self._safe_attention(q, k, v)
         x = x + self.drop1(attn_out)
 
         y = self.norm2(x)

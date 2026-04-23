@@ -5,7 +5,8 @@ path:
   label_dir: "/data/chenhaoran/bishe/fisher" # used in pipeline.dataset._discover_hsi_samples to locate *_gt.npy files.
   rgb_dir: "/data/chenhaoran/bishe/rgb" # used in pipeline.dataset._discover_hsi_samples to locate rgb comparison images.
   output_dir: "./outputs" # used in pipeline.core.Pipeline to create timestamped experiment folders.
-  pretrained_cache_dir: "./pretrained" # used in model.backbones.vit_timm via timm.create_model(cache_dir=...); empty means default cache.
+  pretrained_cache_dir: "./pretrained" # used in model.backbones.vit_timm via timm.create_model(cache_dir=...)
+  cached_dir: "/data/chenhaoran/bishe/fisher_normed" # used in pipeline.dataset，for normed data cache in preprocess.mode=none.
 
 data:
   num_classes: 4 # used in dataset/analyzer/trainer for segmentation label space.
@@ -20,6 +21,12 @@ data:
     train_max_background_ratio: 0.96 # used in pipeline.dataset._should_keep_patch to suppress overly background-dominant train patches.
     train_precious_repeat: 5 # used in pipeline.dataset._build_patch_records to oversample class-1 train patches.
     precious_class: 1 # used in pipeline.dataset sampling rules for small-target emphasis.
+    advanced:
+      use_weighted_sampler: true # enable weighted sampler for train dataloader.
+      rho: 0.40 # interpolation factor between original distribution and balanced target.
+      pg_min_ratio: 0.15 # minimum rare-class target ratio used by weighting.
+      hard_bg_ratio: 0.20 # target ratio for hard background patches.
+      weight_caps: [0.5, 8.0] # clamp range for patch sampling weights.
   split:
     train: 0.70 # used in pipeline.dataset._split_subjects.
     eval: 0.20 # used in pipeline.dataset._split_subjects.
@@ -40,6 +47,12 @@ data:
     nca_max_iter: 200 # max iterations for Neighborhood Components Analysis.
     nca_tol: 1.0e-5 # convergence tolerance for NCA.
     nca_init: "pca" # NCA initialization; pca is typically more stable than random.
+    cache:
+      enabled: true # cache none-mode normalized cubes and stats.
+      version_tag: "v1" # manual cache invalidation key.
+      num_workers: 4 # preprocessing workers for cache creation.
+      reserve_cores: 2 # keep cpu cores free for other users.
+      strict_manifest: true # require manifest consistency before using cache.
   synthetic:
     domain_shift_strength: 0.08 # medium difficulty: patient/sample spectral domain shift close to clinical acquisition variability.
     noise_std: 0.02 # medium difficulty: moderate sensor and per-pixel noise.
@@ -58,9 +71,9 @@ augment:
 
 model:
   family: "hsi_adapter" # used in pipeline.core._build_model.
-  use_pretrained: true # always enable. used in model.backbones.builder; true enables timm ViT blocks.
-  pretrained_weights: true # used in timm.create_model(pretrained=...).
-  backbone_name: "vit_small_patch16_224" # used in model.backbones.builder when use_pretrained=true.
+  pretrained_weights: true # canonical pretrained switch used in model.backbones.builder.
+  pretrained_local_path: "./.pretrained/model.safetensors" # optional local checkpoint path (file or directory) for offline loading.
+  backbone_name: "vit_small_patch16_224" # canonical backbone model name used in model.backbones.builder.
   spectral_dim: 32 # 32, used in model.hsi_adapter.HSIAdapter.
   embed_dim: 128 # used in all model backbones.
   depth: 4 # used in transformer encoder depth.
@@ -68,23 +81,117 @@ model:
   mlp_ratio: 4.0 # used in transformer feed-forward width.
   decoder_dim: 96 # used in decoder channels.
   dropout: 0.05 # used in backbone and decoder.
-  freeze_backbone: true # used in model constructors for overfitting control.
-  unfreeze_last_n: 1 # used in pipeline.trainer.set_trainable_layers.
+  freeze_backbone: true # canonical freeze switch used in model.backbones.builder.
+  unfreeze_last_n: 1 # canonical staged-unfreeze switch used in model.backbones.builder.
+  spectral_encoder:
+    type: "spectral_transformer" # 'spectral_transformer' or 'simple'.
+    hidden_dim: 64 # used in model.hsi_adapter.SpectralTransformerEncoder, hidden dimension for spectral encoder.
+    spectral_tokens: 12 # used in model.hsi_adapter.SpectralTransformerEncoder, number of spectral tokens.
+    conv_depth: 2 # used in model.hsi_adapter.SpectralTransformerEncoder, number of convolutional layers.
+    transformer_depth: 1 # used in model.hsi_adapter.SpectralTransformerEncoder, number of transformer layers.
+    num_heads: 4 # used in model.hsi_adapter.SpectralTransformerEncoder, number of attention heads.
+    kernel_size: 7 # used in model.hsi_adapter.SpectralTransformerEncoder, kernel size for convolutional layers.
+    dropout: 0.0 # used in model.hsi_adapter.SpectralTransformerEncoder, dropout rate for convolutional layers.
+  backbone: # advanced backbone-only namespace (kept consistent with canonical model.* keys above).
+    type: "timm_vit"
+    grad_checkpointing: true # reduce activation memory in backbone blocks.
+    train_pos_embed: false
+    pos_embed_interp: "2d"
+    strict_input_dim: false
+    drop_rate: 0.0
+    attn_drop_rate: 0.0
+    drop_path_rate: 0.0
   base_channels: 32 # used only in unet. embed_dim // 4.
 
 train:
   epochs: 10 # used in pipeline.trainer.Trainer.fit.
-  batch_size: 128 # used in train dataloader.
-  eval_batch_size: 128 # used in eval/test dataloaders.
+  batch_size: 32 # used in train dataloader.
+  eval_batch_size: 32 # used in eval/test dataloaders.
   num_workers: 2 # used in dataloader worker setup.
   lr: 0.0003 # used in optimizer construction.
   weight_decay: 0.0001 # used in optimizer construction.
-  grad_clip: 1.0 # used in trainer backward step.
+  grad_clip: 1.0 # canonical gradient clipping key used in pipeline.trainer.
   grad_accum_steps: 2 # used in trainer gradient accumulation.
-  amp: true # used in trainer mixed precision switch.
+  amp: true # canonical mixed precision key used in pipeline.trainer.
   ema_decay: 0.999 # used in trainer ema update.
   max_train_steps_per_epoch: 0 # used in trainer to optionally cap train steps.
   max_eval_steps: 0 # used in trainer to optionally cap eval steps.
+  memory:
+    channels_last: false # NHWC memory format on CUDA, often reduces memory pressure.
+    oom_skip_batch: false # when CUDA OOM occurs, skip current batch instead of hard crash.
+    empty_cache_steps: 0 # if >0, call torch.cuda.empty_cache() every N optimizer steps.
+  scheduler:
+    name: "warmup_cosine"
+    warmup_epochs: 1.0
+    min_lr_ratio: 0.05
+  early_stop:
+    enabled: true
+    metric: "eval_dice"
+    mode: "max"
+    patience: 8
+    min_delta: 1.0e-4
+  staged:
+    enabled: true
+    stages:
+      # spectral_pretrain stage
+      - name: "spectral_pretrain"
+        freeze:
+          backbone: true
+          decoder: true
+          spectral_encoder: false
+        loss_weights:
+          stage1: 1.0
+          composite: 0.0
+        transition:
+          metric: "train_stage1_total"
+          mode: "min"
+          patience: 3
+          min_delta: 1.0e-4
+        scheduler:
+          name: "warmup_cosine"
+          warmup_epochs: 0.5
+          min_lr_ratio: 0.10
+        max_epochs_guard: 8
+
+      # segmentation_train stage
+      - name: "segmentation_train"
+        freeze:
+          backbone: false
+          decoder: false
+          spectral_encoder: true
+        loss_weights:
+          stage1: 0.0
+          composite: 1.0
+        transition:
+          metric: "eval_dice"
+          mode: "max"
+          patience: 5
+          min_delta: 1.0e-4
+        scheduler:
+          name: "warmup_cosine"
+          warmup_epochs: 1.0
+          min_lr_ratio: 0.05
+        max_epochs_guard: 8
+
+      # finetune stage
+      - name: "joint_finetune"
+        freeze:
+          backbone: false
+          decoder: false
+          spectral_encoder: false
+        loss_weights:
+          stage1: 0.2
+          composite: 1.0
+        transition:
+          metric: "eval_dice"
+          mode: "max"
+          patience: 4
+          min_delta: 1.0e-4
+        scheduler:
+          name: "warmup_cosine"
+          warmup_epochs: 0.5
+          min_lr_ratio: 0.20
+        max_epochs_guard: 8
 
 loss:
   dice_weight: 0.40 # used in composite segmentation loss.
@@ -94,12 +201,19 @@ loss:
   tversky_alpha: 0.85 # used in tversky loss.
   tversky_beta: 0.15 # used in tversky loss.
   class_weights: [1.00, 3.00, 1.50, 1.50] # used in focal/cross-entropy weighting.
+  stage1:
+    lambda_intra: 1.0
+    lambda_inter: 0.5
+    lambda_focal: 1.0
+    focal_gamma: 2.0
+    center_beta: 0.999
+    margin: 1.0
+    max_pixels: 8192
 
 runtime:
   seed: 350234 # used in pipeline.core._seed_everything.
   device: "cuda" # used in pipeline.trainer device selection.
   progress_bar: true # used in pipeline.dataset and pipeline.trainer to toggle tqdm progress bars.
-  save_top_k: 1 # used in trainer checkpoint policy.
 
 visualization:
   tsne_enabled: true

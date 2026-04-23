@@ -185,7 +185,6 @@ def _run(run_log_path, output_root, args, config):
             f"[{idx}/{len(models)}] profile:\n"
             f"\tfamily={run_cfg.model.family}\n"
             f"\tpreprocess={run_cfg.data.preprocess.mode}\n"
-            f"\tuse_pretrained={bool(run_cfg.model.get('use_pretrained', False))}\n"
             f"\tpretrained_weights={bool(run_cfg.model.get('pretrained_weights', True))}\n"
         )
         pipeline = Pipeline(run_cfg, model_key=model_key)

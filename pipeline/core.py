@@ -89,7 +89,7 @@ class Pipeline:
         stage_t0 = time.perf_counter()
         tprint("stage[trainer]: init trainer")
         trainer = Trainer(model=model, config=self.config, output_dir=str(self.output_dir))
-        tprint(f"stage[trainer] done in {time.perf_counter() - stage_t0:.2f}s\n")
+        tprint(f"stage[trainer] \033[92m{trainer.device}\033[0m trainer done in {time.perf_counter() - stage_t0:.2f}s\n")
 
         # plot t-SNE of initial features
         if self.config.visualization.tsne_enabled:
@@ -104,8 +104,8 @@ class Pipeline:
         tprint("stage[train]: fit train/eval")
         trainer_result = trainer.fit(
             train_loader=loaders["train"],
-            eval_loader=loaders["eval"],
-            epochs=int(self.config.train.epochs),
+            val_loader=loaders["eval"],
+            num_epochs=int(self.config.train.epochs),
         )
         tprint(
             f"stage[train] done in {time.perf_counter() - stage_t0:.2f}s\n"
@@ -116,7 +116,7 @@ class Pipeline:
         stage_t0 = time.perf_counter()
         tprint("stage[test]: predict on test loader")
         pred_pack = trainer.predict(
-            dataloader=loaders["test"],
+            data_loader=loaders["test"],
             keep_images=int(self.config.visualization.num_seg_examples),
             keep_features=int(self.config.visualization.tsne_max_points),
         )
@@ -149,6 +149,7 @@ class Pipeline:
         tprint("stage[export]: export onnx")
         onnx_path = self._export_onnx(trainer, in_channels=in_channels)
         tprint(f"stage[export] done in {time.perf_counter() - stage_t0:.2f}s\n")
+        trainer.cleanup_checkpoints()
         onnx_note_path = str(Path(onnx_path).with_name("best_model_info.txt")) if onnx_path else None
 
         tprint(f"pipeline done: model_key={self.model_key}, output_dir={self.output_dir}\n")
@@ -174,7 +175,7 @@ class Pipeline:
             f"\tembed_dim={int(self.config.model.embed_dim)}, depth={int(self.config.model.depth)}\n"
             f"\theads={int(self.config.model.num_heads)}\n"
             f"\tfreeze_backbone={bool(self.config.model.freeze_backbone)}\n"
-            f"\tuse_pretrained={self.config.model.use_pretrained}, pretrained_weights={self.config.model.pretrained_weights}\n"
+            f"\tpretrained_weights={bool(getattr(self.config.model, 'pretrained_weights', True))}\n"
         )
 
         if self.model_key.startswith("hsi"):
@@ -281,6 +282,12 @@ class Pipeline:
         """generate dataset-only plots that do not depend on trained predictions."""
         tprint("visualization: dataset class distribution")
         self.visualizer.plot_distribution(prepared.stats)
+        tprint("visualization: train sampling distribution")
+        self.visualizer.plot_sampling_stats(prepared.stats)
+        data_dir = self.output_dir / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        with (data_dir / "sampling_stats.json").open("w", encoding="utf-8") as f:
+            json.dump(prepared.stats, f, indent=2, ensure_ascii=False)
 
         if prepared.modality == "hsi":
             tprint("visualization: spectral reducer comparison")
@@ -360,7 +367,9 @@ class Pipeline:
         images = pred_pack.get("image_samples", [])
         gts = pred_pack.get("gt_masks", [])
 
-        if not images or not gts:
+        if images is None or gts is None:
+            return {}
+        if len(images) == 0 or len(gts) == 0:
             return {}
 
         num_classes = int(self.config.data.num_classes)
@@ -402,7 +411,7 @@ class Pipeline:
             tprint("onnx export skipped: export.export_onnx=false")
             return None
 
-        model = trainer.ema.ema_model if trainer.ema is not None else trainer.model
+        model = trainer.ema.ema if trainer.ema is not None else trainer.model
         model.eval()
 
         onnx_dir = self.output_dir / "models"
