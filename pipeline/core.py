@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import random
 import time
+import copy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,9 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 from munch import Munch
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score
 
 from config import _to_munch
 from pipeline.monitor import tprint
@@ -286,8 +290,7 @@ class Pipeline:
         self.visualizer.plot_sampling_stats(prepared.stats)
         data_dir = self.output_dir / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
-        with (data_dir / "sampling_stats.json").open("w", encoding="utf-8") as f:
-            json.dump(prepared.stats, f, indent=2, ensure_ascii=False)
+        stats_for_json = copy.deepcopy(prepared.stats)
 
         if prepared.modality == "hsi":
             tprint("visualization: spectral reducer comparison")
@@ -308,6 +311,92 @@ class Pipeline:
                     pca_label=getattr(prepared.reducer, "reference_projection_name", "PCA"),
                     lda_label=getattr(prepared.reducer, "reduced_projection_name", "Reducer"),
                 )
+            tprint("visualization: patient domain shift")
+            patient_shift_payload = self._collect_patient_shift_points(prepared=prepared)
+            if patient_shift_payload is not None:
+                (
+                    raw_points_2d,
+                    norm_points_2d,
+                    point_labels,
+                    point_patient_ids,
+                    selected_patients,
+                    raw_features_hd,
+                    norm_features_hd,
+                ) = patient_shift_payload
+                self.visualizer.plot_patient_shift(
+                    raw_points_2d=raw_points_2d,
+                    norm_points_2d=norm_points_2d,
+                    labels=point_labels,
+                    patient_ids=point_patient_ids,
+                    selected_patients=selected_patients,
+                    title=f"{self.model_key} patient spectral shift",
+                )
+                self.visualizer.plot_patient_distance_distribution(
+                    features_hd=norm_features_hd,
+                    labels=point_labels,
+                    patient_ids=point_patient_ids,
+                    selected_patients=selected_patients,
+                    title=f"{self.model_key} intra/inter patient distance",
+                )
+                self.visualizer.plot_patient_divergence_heatmaps(
+                    features_hd=norm_features_hd,
+                    labels=point_labels,
+                    patient_ids=point_patient_ids,
+                    selected_patients=selected_patients,
+                    title=f"{self.model_key} patient MMD/Bhattacharyya",
+                )
+                shift_stats = self._compute_patient_shift_stats(
+                    raw_features_hd=raw_features_hd,
+                    norm_features_hd=norm_features_hd,
+                    labels=point_labels,
+                    patient_ids=point_patient_ids,
+                    selected_patients=selected_patients,
+                )
+                self.visualizer.plot_patient_feature_shift(
+                    feature_shift_by_class=shift_stats.get("feature_shift_top_dims", {}),
+                    title=f"{self.model_key} patient feature-wise shift (top dims)",
+                )
+                band_shift_payload = self._collect_patient_band_shift(prepared=prepared)
+                if band_shift_payload is not None:
+                    (
+                        band_stats_all,
+                        all_patient_ids,
+                        band_stats_viz,
+                        viz_patient_ids,
+                    ) = band_shift_payload
+                    self.visualizer.plot_patient_wise_band_shift(
+                        band_stats_by_class=band_stats_viz,
+                        patient_order=viz_patient_ids,
+                        title=f"{self.model_key} patient-wise band shift",
+                    )
+                    band_data_path = data_dir / "patient_wise_band_shift_data.npz"
+                    self._save_patient_band_shift_npz(
+                        path=band_data_path,
+                        band_stats_all=band_stats_all,
+                        all_patient_ids=all_patient_ids,
+                    )
+                    loaded_band_data = self._load_patient_band_shift_npz(band_data_path)
+                    cluster_payload = self._cluster_patients_from_band_shift_data(loaded_band_data)
+                    if cluster_payload is not None:
+                        sampling_payload = {
+                            "patient_clusters": cluster_payload["clusters"],
+                            "cluster_metrics": cluster_payload["metrics"],
+                            "model_key": self.model_key,
+                        }
+                        with (data_dir / "sampling.json").open("w", encoding="utf-8") as f:
+                            json.dump(sampling_payload, f, indent=2, ensure_ascii=False)
+                        self.visualizer.plot_patient_clustering(
+                            embedding_2d=cluster_payload["embedding_2d"],
+                            patient_ids=cluster_payload["patient_ids"],
+                            cluster_ids=cluster_payload["cluster_ids"],
+                            title=f"{self.model_key} patient clustering",
+                        )
+                stats_for_json["patient_shift_analysis"] = shift_stats
+
+        # keep runtime JSON compact and remove huge cache path mapping
+        stats_for_json.pop("cached_hsi_paths", None)
+        with (data_dir / "sampling_stats.json").open("w", encoding="utf-8") as f:
+            json.dump(stats_for_json, f, indent=2, ensure_ascii=False)
 
     def _collect_reducer_points(self, prepared: Any, max_points: int) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """collect balanced pixels for spectral reducer comparison plots."""
@@ -337,7 +426,8 @@ class Pipeline:
             flat = cube.reshape(-1, c)
             labels = mask.reshape(-1)
 
-            for cls_idx in range(num_classes):
+            # spectral projection excludes background class (0)
+            for cls_idx in range(1, num_classes):
                 idx = np.where(labels == cls_idx)[0]
                 if idx.size == 0:
                     continue
@@ -404,6 +494,548 @@ class Pipeline:
             out[class_names[cls_idx]] = (mean, std)
 
         return out
+
+    def _collect_patient_shift_points(
+        self,
+        prepared: Any,
+        target_patients: int = 10,
+        max_pixels_per_patient_class: int = 2000,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, List[str], List[str], np.ndarray, np.ndarray]]:
+        """
+        Collect per-pixel projected features for cross-patient shift visualization.
+        Uses reducer projection + discriminative 2D selection (same family as spectral projection).
+        """
+        all_samples: List[Any] = []
+        for split_name in ("train", "eval", "test"):
+            all_samples.extend(list(prepared.samples_by_split.get(split_name, [])))
+        if not all_samples:
+            return None
+
+        rng = np.random.default_rng(int(self.config.runtime.seed))
+        target_patients = int(np.clip(target_patients, 5, 10))
+
+        by_patient: Dict[str, List[Any]] = {}
+        for sample in all_samples:
+            by_patient.setdefault(str(sample.patient_id), []).append(sample)
+
+        patient_pool = sorted(by_patient.keys())
+        if not patient_pool:
+            return None
+        if len(patient_pool) > target_patients:
+            chosen_idx = rng.choice(len(patient_pool), size=target_patients, replace=False)
+            selected_patients = [patient_pool[int(i)] for i in sorted(chosen_idx)]
+        else:
+            selected_patients = patient_pool
+
+        reducer = getattr(prepared, "reducer", None)
+        if reducer is None or not hasattr(reducer, "project_pixels"):
+            return None
+
+        raw_chunks: List[np.ndarray] = []
+        norm_chunks: List[np.ndarray] = []
+        label_chunks: List[np.ndarray] = []
+        patient_chunks: List[np.ndarray] = []
+        num_classes = int(self.config.data.num_classes)
+
+        for pid in selected_patients:
+            patient_samples = by_patient.get(pid, [])
+            for sample in patient_samples:
+                cube = np.load(sample.hsi_path).astype(np.float32)
+                mask = np.load(sample.mask_path).astype(np.int64)
+                if cube.ndim != 3 or mask.ndim != 2:
+                    continue
+                flat = cube.reshape(-1, cube.shape[-1])
+                labels = mask.reshape(-1)
+                for cls_idx in range(1, num_classes):
+                    idx = np.where(labels == cls_idx)[0]
+                    if idx.size == 0:
+                        continue
+                    take = min(int(max_pixels_per_patient_class), int(idx.size))
+                    chosen = rng.choice(idx, size=take, replace=False)
+                    raw_sel = flat[chosen]
+                    norm_sel = reducer._prepare_features(raw_sel, fit=False) if hasattr(reducer, "_prepare_features") else raw_sel
+                    raw_chunks.append(raw_sel)
+                    norm_chunks.append(norm_sel)
+                    label_chunks.append(np.full(take, cls_idx, dtype=np.int64))
+                    patient_chunks.append(np.full(take, pid, dtype=object))
+
+        if not raw_chunks:
+            return None
+
+        x_raw = np.concatenate(raw_chunks, axis=0).astype(np.float32)
+        x_norm = np.concatenate(norm_chunks, axis=0).astype(np.float32)
+        y = np.concatenate(label_chunks, axis=0).astype(np.int64)
+        p = np.concatenate(patient_chunks, axis=0).astype(object)
+
+        if x_raw.shape[0] < 20 or x_norm.shape[0] < 20:
+            return None
+
+        # Keep same projection style: discriminative 2D selected from feature space.
+        def _best2d(points: np.ndarray) -> np.ndarray:
+            if points.shape[1] == 1:
+                return np.concatenate([points, np.zeros((points.shape[0], 1), dtype=np.float32)], axis=1)
+            if points.shape[1] == 2:
+                return points.astype(np.float32)
+            global_mean = points.mean(axis=0)
+            scores = np.zeros(points.shape[1], dtype=np.float64)
+            for cls_idx in range(1, num_classes):
+                m = y == cls_idx
+                if not np.any(m):
+                    continue
+                cls = points[m]
+                cls_mean = cls.mean(axis=0)
+                cls_var = cls.var(axis=0)
+                scores += cls.shape[0] * (cls_mean - global_mean) ** 2 / np.maximum(cls_var, 1e-8)
+            best = np.argsort(-scores)[:2]
+            best = np.sort(best)
+            return points[:, best].astype(np.float32)
+
+        raw_points_2d = _best2d(x_raw)
+        norm_points_2d = _best2d(x_norm)
+        return raw_points_2d, norm_points_2d, y, [str(v) for v in p.tolist()], selected_patients, x_raw, x_norm
+
+    def _compute_patient_shift_stats(
+        self,
+        raw_features_hd: np.ndarray,
+        norm_features_hd: np.ndarray,
+        labels: np.ndarray,
+        patient_ids: List[str],
+        selected_patients: List[str],
+    ) -> Dict[str, Any]:
+        """Compute quantitative patient shift statistics for JSON/reporting."""
+        x_raw = np.asarray(raw_features_hd, dtype=np.float64)
+        x_norm = np.asarray(norm_features_hd, dtype=np.float64)
+        y = np.asarray(labels, dtype=np.int64)
+        p = np.asarray([str(v) for v in patient_ids], dtype=object)
+        fg_labels = [idx for idx in range(1, int(self.config.data.num_classes))]
+        rng = np.random.default_rng(int(self.config.runtime.seed) + 73)
+
+        def _sample_pair_dist(a: np.ndarray, b: np.ndarray, n_pairs: int = 1200) -> np.ndarray:
+            if a.shape[0] == 0 or b.shape[0] == 0:
+                return np.empty((0,), dtype=np.float64)
+            ia = rng.integers(0, a.shape[0], size=n_pairs)
+            ib = rng.integers(0, b.shape[0], size=n_pairs)
+            return np.linalg.norm(a[ia] - b[ib], axis=1)
+
+        def _rbf_mmd2(a: np.ndarray, b: np.ndarray) -> float:
+            na = min(256, a.shape[0]); nb = min(256, b.shape[0])
+            if na < 4 or nb < 4:
+                return float("nan")
+            a = a[rng.choice(a.shape[0], size=na, replace=False)]
+            b = b[rng.choice(b.shape[0], size=nb, replace=False)]
+            z = np.concatenate([a, b], axis=0)
+            d2 = np.sum((z[:, None, :] - z[None, :, :]) ** 2, axis=-1)
+            sigma2 = float(np.median(d2[np.triu_indices_from(d2, k=1)]))
+            sigma2 = max(sigma2, 1e-6)
+            kaa = np.exp(-np.sum((a[:, None, :] - a[None, :, :]) ** 2, axis=-1) / (2.0 * sigma2))
+            kbb = np.exp(-np.sum((b[:, None, :] - b[None, :, :]) ** 2, axis=-1) / (2.0 * sigma2))
+            kab = np.exp(-np.sum((a[:, None, :] - b[None, :, :]) ** 2, axis=-1) / (2.0 * sigma2))
+            return float(kaa.mean() + kbb.mean() - 2.0 * kab.mean())
+
+        def _bhattacharyya(a: np.ndarray, b: np.ndarray) -> float:
+            if a.shape[0] < 4 or b.shape[0] < 4:
+                return float("nan")
+            mu1 = a.mean(axis=0); mu2 = b.mean(axis=0)
+            c1 = np.cov(a, rowvar=False); c2 = np.cov(b, rowvar=False)
+            dim = c1.shape[0]
+            reg = 1e-4 * np.eye(dim)
+            c1 = c1 + reg; c2 = c2 + reg
+            c = 0.5 * (c1 + c2)
+            invc = np.linalg.pinv(c)
+            diff = (mu1 - mu2).reshape(-1, 1)
+            t1 = 0.125 * float(diff.T @ invc @ diff)
+            det_c = max(np.linalg.det(c), 1e-12)
+            det_c1 = max(np.linalg.det(c1), 1e-12)
+            det_c2 = max(np.linalg.det(c2), 1e-12)
+            t2 = 0.5 * np.log(det_c / np.sqrt(det_c1 * det_c2))
+            return float(t1 + t2)
+
+        summary: Dict[str, Any] = {
+            "selected_patients": list(selected_patients),
+            "num_selected_patients": len(selected_patients),
+            "samples": {
+                "num_points": int(x_norm.shape[0]),
+                "num_features_raw": int(x_raw.shape[1]) if x_raw.ndim == 2 else 0,
+                "num_features_norm": int(x_norm.shape[1]) if x_norm.ndim == 2 else 0,
+            },
+            "by_class": {},
+            "feature_shift_top_dims": {},
+        }
+
+        for cls_idx in fg_labels:
+            cls_name = self.config.data.class_names[cls_idx] if cls_idx < len(self.config.data.class_names) else str(cls_idx)
+            intra_list: List[np.ndarray] = []
+            inter_list: List[np.ndarray] = []
+            mmd_vals: List[float] = []
+            bha_vals: List[float] = []
+            patient_means: List[np.ndarray] = []
+
+            for pid in selected_patients:
+                cur = x_norm[(y == cls_idx) & (p == pid)]
+                if cur.shape[0] < 5:
+                    continue
+                intra_list.append(_sample_pair_dist(cur, cur))
+                patient_means.append(cur.mean(axis=0))
+
+            for i in range(len(selected_patients)):
+                for j in range(i + 1, len(selected_patients)):
+                    ai = x_norm[(y == cls_idx) & (p == selected_patients[i])]
+                    bj = x_norm[(y == cls_idx) & (p == selected_patients[j])]
+                    if ai.shape[0] < 5 or bj.shape[0] < 5:
+                        continue
+                    inter_list.append(_sample_pair_dist(ai, bj))
+                    mmd_vals.append(_rbf_mmd2(ai, bj))
+                    bha_vals.append(_bhattacharyya(ai, bj))
+
+            intra = np.concatenate(intra_list, axis=0) if intra_list else np.empty((0,), dtype=np.float64)
+            inter = np.concatenate(inter_list, axis=0) if inter_list else np.empty((0,), dtype=np.float64)
+            class_stat = {
+                "intra_mean": float(np.mean(intra)) if intra.size > 0 else None,
+                "inter_mean": float(np.mean(inter)) if inter.size > 0 else None,
+                "intra_median": float(np.median(intra)) if intra.size > 0 else None,
+                "inter_median": float(np.median(inter)) if inter.size > 0 else None,
+                "inter_over_intra_ratio": float(np.mean(inter) / max(np.mean(intra), 1e-8)) if intra.size > 0 and inter.size > 0 else None,
+                "mmd_mean": float(np.nanmean(mmd_vals)) if mmd_vals else None,
+                "mmd_std": float(np.nanstd(mmd_vals)) if mmd_vals else None,
+                "bhattacharyya_mean": float(np.nanmean(bha_vals)) if bha_vals else None,
+                "bhattacharyya_std": float(np.nanstd(bha_vals)) if bha_vals else None,
+                "num_valid_patient_pairs": int(len(mmd_vals)),
+            }
+            summary["by_class"][cls_name] = class_stat
+
+            if patient_means:
+                means = np.stack(patient_means, axis=0)
+                # feature-wise shift strength: std across patient means
+                shift_strength = means.std(axis=0)
+                top_k = min(12, shift_strength.shape[0])
+                top_idx = np.argsort(-shift_strength)[:top_k]
+                summary["feature_shift_top_dims"][cls_name] = [
+                    {"feature_idx": int(i), "shift_strength": float(shift_strength[i])}
+                    for i in top_idx
+                ]
+            else:
+                summary["feature_shift_top_dims"][cls_name] = []
+
+        return summary
+
+    def _save_patient_band_shift_npz(
+        self,
+        path: Path,
+        band_stats_all: Mapping[str, Any],
+        all_patient_ids: Sequence[str],
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            str(path),
+            class_names=np.asarray(band_stats_all["class_names"], dtype="U32"),
+            patient_ids=np.asarray(list(all_patient_ids), dtype="U64"),
+            mean=np.asarray(band_stats_all["mean"], dtype=np.float32),
+            median=np.asarray(band_stats_all["median"], dtype=np.float32),
+            std=np.asarray(band_stats_all["std"], dtype=np.float32),
+            count=np.asarray(band_stats_all["count"], dtype=np.int32),
+        )
+
+    def _load_patient_band_shift_npz(self, path: Path) -> Dict[str, Any]:
+        with np.load(str(path), allow_pickle=False) as f:
+            return {
+                "class_names": [str(v) for v in f["class_names"].tolist()],
+                "patient_ids": [str(v) for v in f["patient_ids"].tolist()],
+                "mean": np.asarray(f["mean"], dtype=np.float64),
+                "median": np.asarray(f["median"], dtype=np.float64),
+                "std": np.asarray(f["std"], dtype=np.float64),
+                "count": np.asarray(f["count"], dtype=np.int64),
+            }
+
+    def _cluster_patients_from_band_shift_data(self, band_data: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        class_names = list(band_data.get("class_names", []))
+        patient_ids = list(band_data.get("patient_ids", []))
+        mean_arr = np.asarray(band_data.get("mean", []), dtype=np.float64)      # [C, P, B]
+        std_arr = np.asarray(band_data.get("std", []), dtype=np.float64)        # [C, P, B]
+        count_arr = np.asarray(band_data.get("count", []), dtype=np.int64)      # [C, P]
+        if mean_arr.ndim != 3 or std_arr.ndim != 3 or count_arr.ndim != 2 or len(patient_ids) < 2:
+            return None
+        c, p, b = mean_arr.shape
+        if p != len(patient_ids):
+            return None
+        # Build patient feature using all patients; missing class stats are imputed later.
+        x = np.concatenate([mean_arr, std_arr], axis=2)  # [C, P, 2B]
+        x = np.transpose(x, (1, 0, 2)).reshape(p, c * 2 * b)  # [P, C*2B]
+        # mark missing class stats as NaN using count==0
+        missing_mask = (count_arr <= 0)  # [C, P]
+        if np.any(missing_mask):
+            for cls_idx in range(c):
+                miss_p = np.where(missing_mask[cls_idx])[0]
+                if miss_p.size == 0:
+                    continue
+                start = cls_idx * (2 * b)
+                end = start + (2 * b)
+                x[miss_p, start:end] = np.nan
+        # impute NaN with feature-wise mean
+        feat_mean = np.nanmean(x, axis=0)
+        feat_mean = np.where(np.isfinite(feat_mean), feat_mean, 0.0)
+        nan_idx = np.where(~np.isfinite(x))
+        if nan_idx[0].size > 0:
+            x[nan_idx] = feat_mean[nan_idx[1]]
+
+        mu = x.mean(axis=0, keepdims=True)
+        sd = x.std(axis=0, keepdims=True)
+        xz = (x - mu) / np.maximum(sd, 1e-8)
+
+        n = xz.shape[0]
+        if n == 2:
+            labels = np.array([0, 1], dtype=np.int32)
+        else:
+            k_min = 2
+            k_max = min(6, n - 1)
+            best_k = 2
+            best_score = -1.0
+            best_labels = None
+            for k in range(k_min, k_max + 1):
+                model = AgglomerativeClustering(n_clusters=k, linkage="ward")
+                cur = model.fit_predict(xz)
+                if len(np.unique(cur)) < 2:
+                    continue
+                score = float(silhouette_score(xz, cur))
+                if score > best_score:
+                    best_score = score
+                    best_k = k
+                    best_labels = cur
+            labels = best_labels if best_labels is not None else AgglomerativeClustering(n_clusters=best_k, linkage="ward").fit_predict(xz)
+
+        clusters: Dict[str, Any] = {}
+        dist_mat = np.linalg.norm(xz[:, None, :] - xz[None, :, :], axis=-1)
+        for cid in sorted(np.unique(labels).tolist()):
+            member_indices = [i for i in range(len(patient_ids)) if int(labels[i]) == int(cid)]
+            members = [patient_ids[i] for i in member_indices]
+            cluster_entry: Dict[str, Any] = {"patients": members, "size": len(members)}
+
+            if len(member_indices) >= 1:
+                # Medoid: patient with minimum sum distance to others in the cluster.
+                sub = dist_mat[np.ix_(member_indices, member_indices)]
+                sums = sub.sum(axis=1)
+                medoid_local_idx = int(np.argmin(sums))
+                medoid_global_idx = member_indices[medoid_local_idx]
+                cluster_entry["medoid_patient_id"] = patient_ids[medoid_global_idx]
+            else:
+                cluster_entry["medoid_patient_id"] = None
+
+            if len(member_indices) >= 2:
+                nearest_pair = None
+                farthest_pair = None
+                nearest_dist = float("inf")
+                farthest_dist = -float("inf")
+                for i_pos in range(len(member_indices)):
+                    for j_pos in range(i_pos + 1, len(member_indices)):
+                        gi = member_indices[i_pos]
+                        gj = member_indices[j_pos]
+                        d = float(dist_mat[gi, gj])
+                        if d < nearest_dist:
+                            nearest_dist = d
+                            nearest_pair = (patient_ids[gi], patient_ids[gj])
+                        if d > farthest_dist:
+                            farthest_dist = d
+                            farthest_pair = (patient_ids[gi], patient_ids[gj])
+                cluster_entry["nearest_patient_pair"] = {
+                    "patients": list(nearest_pair) if nearest_pair is not None else [],
+                    "distance": float(nearest_dist) if nearest_pair is not None else None,
+                }
+                cluster_entry["farthest_patient_pair"] = {
+                    "patients": list(farthest_pair) if farthest_pair is not None else [],
+                    "distance": float(farthest_dist) if farthest_pair is not None else None,
+                }
+            else:
+                cluster_entry["nearest_patient_pair"] = {"patients": [], "distance": None}
+                cluster_entry["farthest_patient_pair"] = {"patients": [], "distance": None}
+
+            clusters[f"cluster_{int(cid)}"] = cluster_entry
+
+        # Compute class-wise intra/inter distance metrics.
+        metrics: Dict[str, Any] = {"global": {}, "by_class": {}}
+        for cls_idx, cls in enumerate(class_names):
+            class_vecs = []
+            valid_patient_indices = []
+            for pid_idx in range(len(patient_ids)):
+                if count_arr[cls_idx, pid_idx] <= 0:
+                    continue
+                class_vecs.append(mean_arr[cls_idx, pid_idx])
+                valid_patient_indices.append(pid_idx)
+            if len(class_vecs) < 2:
+                metrics["by_class"][cls] = {
+                    "intra_mean_distance": None,
+                    "intra_std_distance": None,
+                    "inter_mean_distance": None,
+                    "inter_std_distance": None,
+                    "inter_over_intra_ratio": None,
+                }
+                continue
+            arr = np.stack(class_vecs, axis=0)
+            intra_dists: List[float] = []
+            inter_dists: List[float] = []
+            for i in range(arr.shape[0]):
+                for j in range(i + 1, arr.shape[0]):
+                    d = float(np.linalg.norm(arr[i] - arr[j]))
+                    if labels[valid_patient_indices[i]] == labels[valid_patient_indices[j]]:
+                        intra_dists.append(d)
+                    else:
+                        inter_dists.append(d)
+            metrics["by_class"][cls] = {
+                "intra_mean_distance": float(np.mean(intra_dists)) if intra_dists else None,
+                "intra_std_distance": float(np.std(intra_dists)) if intra_dists else None,
+                "inter_mean_distance": float(np.mean(inter_dists)) if inter_dists else None,
+                "inter_std_distance": float(np.std(inter_dists)) if inter_dists else None,
+                "inter_over_intra_ratio": (
+                    float(np.mean(inter_dists) / max(np.mean(intra_dists), 1e-8))
+                    if intra_dists and inter_dists
+                    else None
+                ),
+            }
+
+        # global metrics over concatenated patient vectors
+        global_intra: List[float] = []
+        global_inter: List[float] = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = float(np.linalg.norm(xz[i] - xz[j]))
+                if labels[i] == labels[j]:
+                    global_intra.append(d)
+                else:
+                    global_inter.append(d)
+        metrics["global"] = {
+            "num_patients": int(n),
+            "num_clusters": int(len(np.unique(labels))),
+            "intra_mean_distance": float(np.mean(global_intra)) if global_intra else None,
+            "intra_std_distance": float(np.std(global_intra)) if global_intra else None,
+            "inter_mean_distance": float(np.mean(global_inter)) if global_inter else None,
+            "inter_std_distance": float(np.std(global_inter)) if global_inter else None,
+            "inter_over_intra_ratio": (
+                float(np.mean(global_inter) / max(np.mean(global_intra), 1e-8))
+                if global_intra and global_inter
+                else None
+            ),
+        }
+
+        pca = PCA(n_components=2, random_state=int(self.config.runtime.seed))
+        emb = pca.fit_transform(xz).astype(np.float32)
+        return {
+            "clusters": clusters,
+            "metrics": metrics,
+            "patient_ids": patient_ids,
+            "cluster_ids": [int(v) for v in labels.tolist()],
+            "embedding_2d": emb,
+        }
+
+    def _collect_patient_band_shift(
+        self,
+        prepared: Any,
+        target_patients: int = 16,
+    ) -> Optional[Tuple[Dict[str, Any], List[str], Dict[str, Dict[str, Dict[str, np.ndarray]]], List[str]]]:
+        """
+        Build per-band patient statistics (mean/median/std) on raw reflectance
+        for each foreground class before training.
+        """
+        all_samples: List[Any] = []
+        for split_name in ("train", "eval", "test"):
+            all_samples.extend(list(prepared.samples_by_split.get(split_name, [])))
+        if not all_samples:
+            return None
+
+        by_patient: Dict[str, List[Any]] = {}
+        for sample in all_samples:
+            by_patient.setdefault(str(sample.patient_id), []).append(sample)
+        patient_pool = sorted(by_patient.keys())
+        if not patient_pool:
+            return None
+
+        rng = np.random.default_rng(int(self.config.runtime.seed) + 137)
+        target_patients = int(np.clip(target_patients, 7, 16))
+        if len(patient_pool) > target_patients:
+            chosen_idx = rng.choice(len(patient_pool), size=target_patients, replace=False)
+            selected_patients_viz = [patient_pool[int(i)] for i in sorted(chosen_idx)]
+        else:
+            selected_patients_viz = patient_pool
+
+        num_classes = int(self.config.data.num_classes)
+        class_names = [self.config.data.class_names[i] if i < len(self.config.data.class_names) else str(i) for i in range(num_classes)]
+        fg_class_names = [class_names[i] for i in range(1, num_classes)]
+        n_cls = len(fg_class_names)
+        n_pat = len(patient_pool)
+        mean_arr: List[np.ndarray] = []
+        median_arr: List[np.ndarray] = []
+        std_arr: List[np.ndarray] = []
+        count_arr = np.zeros((n_cls, n_pat), dtype=np.int32)
+        band_stats_by_class_viz: Dict[str, Dict[str, Dict[str, np.ndarray]]] = {}
+        n_bands = None
+        for cls_idx in range(1, num_classes):
+            cls_name = class_names[cls_idx]
+            by_patient_stats: Dict[str, Dict[str, np.ndarray]] = {}
+            cls_means: List[np.ndarray] = []
+            cls_medians: List[np.ndarray] = []
+            cls_stds: List[np.ndarray] = []
+            for pid_idx, pid in enumerate(patient_pool):
+                rows: List[np.ndarray] = []
+                for sample in by_patient.get(pid, []):
+                    cube = np.load(sample.hsi_path).astype(np.float32)
+                    mask = np.load(sample.mask_path).astype(np.int64)
+                    if cube.ndim != 3 or mask.ndim != 2:
+                        continue
+                    # Support both HWC and CHW cube layouts.
+                    if cube.shape[:2] == mask.shape:
+                        cube_hwc = cube
+                    elif cube.shape[1:] == mask.shape:
+                        cube_hwc = np.moveaxis(cube, 0, -1)
+                    else:
+                        continue
+                    m = mask == cls_idx
+                    if not np.any(m):
+                        continue
+                    rows.append(cube_hwc[m])  # [N, bands]
+                if not rows:
+                    if n_bands is None:
+                        # infer n_bands from first valid sample across all patients/classes later
+                        cls_means.append(np.array([], dtype=np.float32))
+                        cls_medians.append(np.array([], dtype=np.float32))
+                        cls_stds.append(np.array([], dtype=np.float32))
+                    else:
+                        cls_means.append(np.full((n_bands,), np.nan, dtype=np.float32))
+                        cls_medians.append(np.full((n_bands,), np.nan, dtype=np.float32))
+                        cls_stds.append(np.full((n_bands,), np.nan, dtype=np.float32))
+                    continue
+                arr = np.concatenate(rows, axis=0).astype(np.float32)
+                if n_bands is None:
+                    n_bands = int(arr.shape[1])
+                mean_v = arr.mean(axis=0)
+                med_v = np.median(arr, axis=0)
+                std_v = arr.std(axis=0)
+                count_arr[cls_idx - 1, pid_idx] = int(arr.shape[0])
+                cls_means.append(mean_v)
+                cls_medians.append(med_v)
+                cls_stds.append(std_v)
+                by_patient_stats[pid] = {"mean": mean_v, "median": med_v, "std": std_v}
+            if n_bands is None:
+                return None
+            # backfill any empty placeholders created before n_bands was known
+            for i in range(len(cls_means)):
+                if cls_means[i].size == 0:
+                    cls_means[i] = np.full((n_bands,), np.nan, dtype=np.float32)
+                    cls_medians[i] = np.full((n_bands,), np.nan, dtype=np.float32)
+                    cls_stds[i] = np.full((n_bands,), np.nan, dtype=np.float32)
+            mean_arr.append(np.stack(cls_means, axis=0))
+            median_arr.append(np.stack(cls_medians, axis=0))
+            std_arr.append(np.stack(cls_stds, axis=0))
+
+            # viz-only subset keeps a manageable number of patients
+            band_stats_by_class_viz[cls_name] = {pid: by_patient_stats[pid] for pid in selected_patients_viz if pid in by_patient_stats}
+
+        if not mean_arr:
+            return None
+        band_stats_all = {
+            "class_names": fg_class_names,
+            "mean": np.stack(mean_arr, axis=0),      # [C, P, B]
+            "median": np.stack(median_arr, axis=0),  # [C, P, B]
+            "std": np.stack(std_arr, axis=0),        # [C, P, B]
+            "count": count_arr,                      # [C, P]
+        }
+        return band_stats_all, patient_pool, band_stats_by_class_viz, selected_patients_viz
 
     def _export_onnx(self, trainer: Trainer, in_channels: int) -> Optional[str]:
         """export best model to onnx."""

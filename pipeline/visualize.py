@@ -7,7 +7,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import Patch
+from matplotlib.patches import Ellipse, Patch
+from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
 from pipeline.analyzer import MetricsBundle
@@ -316,40 +317,76 @@ class Visualizer:
         pca_features = np.asarray(pca_features[:n], dtype=np.float32)
         lda_features = np.asarray(lda_features[:n], dtype=np.float32)
         labels = np.asarray(labels[:n], dtype=np.int64)
+        # Exclude background label from spectral projection visualization.
+        non_bg = labels > 0
+        if np.count_nonzero(non_bg) < 10:
+            return
+        pca_features = pca_features[non_bg]
+        lda_features = lda_features[non_bg]
+        labels = labels[non_bg]
+        active_classes = sorted(np.unique(labels).tolist())
+        class_names = [self.class_names[idx] if idx < len(self.class_names) else f"class_{idx}" for idx in active_classes]
+        cls_to_local = {cls_idx: i for i, cls_idx in enumerate(active_classes)}
 
-        def _to_2d(points: np.ndarray) -> np.ndarray:
+        def _select_best_2d(points: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int]]:
             if points.ndim != 2 or points.shape[0] == 0:
-                return np.empty((0, 2), dtype=np.float32)
-            if points.shape[1] >= 2:
-                return points[:, :2].astype(np.float32)
-            pad = np.zeros((points.shape[0], 2 - points.shape[1]), dtype=np.float32)
-            return np.concatenate([points.astype(np.float32), pad], axis=1)
+                return np.empty((0, 2), dtype=np.float32), (0, 1)
+            dim = points.shape[1]
+            if dim == 1:
+                pad = np.zeros((points.shape[0], 1), dtype=np.float32)
+                return np.concatenate([points.astype(np.float32), pad], axis=1), (0, 0)
+            if dim == 2:
+                return points.astype(np.float32), (0, 1)
+
+            # Fisher score per dimension: maximize between-class / within-class.
+            global_mean = points.mean(axis=0)
+            scores = np.zeros(dim, dtype=np.float64)
+            present = 0
+            for cls_idx in range(len(self.class_names)):
+                idx = labels == cls_idx
+                if not np.any(idx):
+                    continue
+                present += 1
+                cls_points = points[idx]
+                cls_mean = cls_points.mean(axis=0)
+                cls_var = cls_points.var(axis=0)
+                n = float(cls_points.shape[0])
+                scores += n * (cls_mean - global_mean) ** 2 / np.maximum(cls_var, 1e-8)
+            if present == 0:
+                # fallback to first two dims if labels are empty/invalid
+                return points[:, :2].astype(np.float32), (0, 1)
+            best = np.argsort(-scores)[:2]
+            best = np.sort(best)
+            return points[:, best].astype(np.float32), (int(best[0]), int(best[1]))
 
         def _centroids(points: np.ndarray) -> Dict[int, np.ndarray]:
             out: Dict[int, np.ndarray] = {}
-            for cls_idx in range(len(self.class_names)):
+            for cls_idx in active_classes:
                 idx = labels == cls_idx
                 if np.any(idx):
                     out[cls_idx] = points[idx].mean(axis=0)
             return out
 
         def _distance_matrix(centroids: Dict[int, np.ndarray]) -> np.ndarray:
-            mat = np.full((len(self.class_names), len(self.class_names)), np.nan, dtype=np.float32)
-            for i in range(len(self.class_names)):
+            n_cls = len(active_classes)
+            mat = np.full((n_cls, n_cls), np.nan, dtype=np.float32)
+            for i in active_classes:
                 if i not in centroids:
                     continue
-                for j in range(len(self.class_names)):
+                for j in active_classes:
                     if j not in centroids:
                         continue
-                    mat[i, j] = float(np.linalg.norm(centroids[i] - centroids[j]))
+                    mat[cls_to_local[i], cls_to_local[j]] = float(np.linalg.norm(centroids[i] - centroids[j]))
             return mat
 
-        pca_xy = _to_2d(pca_features)
-        lda_xy = _to_2d(lda_features)
+        pca_xy, pca_dims = _select_best_2d(pca_features)
+        lda_xy, lda_dims = _select_best_2d(lda_features)
         pca_centroids = _centroids(pca_xy)
         lda_centroids = _centroids(lda_xy)
-        pca_dist = _distance_matrix(pca_centroids)
-        lda_dist = _distance_matrix(lda_centroids)
+        # Distances are computed in full feature space to avoid hiding separability
+        # that may lie outside 2D display coordinates.
+        pca_dist = _distance_matrix(_centroids(pca_features))
+        lda_dist = _distance_matrix(_centroids(lda_features))
 
         if explained_variance_ratio is not None:
             explained_variance_ratio = np.asarray(explained_variance_ratio, dtype=np.float64)
@@ -357,10 +394,10 @@ class Visualizer:
             explained_variance_ratio = explained_variance_ratio[explained_variance_ratio > 0]
 
         cmap = plt.get_cmap("tab10")
-        colors = [cmap(i % 10) for i in range(len(self.class_names))]
+        colors = [cmap(i % 10) for i in range(len(active_classes))]
         legend_handles = [
-            Patch(facecolor=colors[i], edgecolor="none", label=f"{i}: {name}")
-            for i, name in enumerate(self.class_names)
+            Patch(facecolor=colors[i], edgecolor="none", label=f"{active_classes[i]}: {name}")
+            for i, name in enumerate(class_names)
         ]
 
         fig, axes = plt.subplots(2, 2, figsize=(16.2, 9.2), gridspec_kw={"height_ratios": [1.0, 1.0], "width_ratios": [1.0, 1.0]})
@@ -401,9 +438,18 @@ class Visualizer:
         ax.grid(alpha=0.25)
         ax.text(0.02, 0.97, "(a)", transform=ax.transAxes, ha="left", va="top", fontsize=11, fontweight="semibold")
 
-        def _scatter_panel(ax, points: np.ndarray, centroids: Dict[int, np.ndarray], panel_label: str, panel_title: str, dim_label: str) -> None:
+        def _scatter_panel(
+            ax,
+            points: np.ndarray,
+            centroids: Dict[int, np.ndarray],
+            panel_label: str,
+            panel_title: str,
+            dim_label: str,
+            dims_used: Tuple[int, int],
+        ) -> None:
             ax.set_facecolor("#fbfbfd")
-            for cls_idx, class_name in enumerate(self.class_names):
+            for local_idx, cls_idx in enumerate(active_classes):
+                class_name = class_names[local_idx]
                 idx = labels == cls_idx
                 if not np.any(idx):
                     continue
@@ -412,7 +458,7 @@ class Visualizer:
                     points[idx, 1],
                     s=11,
                     alpha=0.72,
-                    color=colors[cls_idx],
+                    color=colors[local_idx],
                     edgecolors="white",
                     linewidths=0.25,
                 )
@@ -423,7 +469,7 @@ class Visualizer:
                         [cy],
                         s=120,
                         marker="X",
-                        color=colors[cls_idx],
+                        color=colors[local_idx],
                         edgecolors="black",
                         linewidths=0.7,
                         zorder=4,
@@ -439,14 +485,14 @@ class Visualizer:
                     )
 
             ax.set_title(panel_title)
-            ax.set_xlabel(f"{dim_label}-1")
-            ax.set_ylabel(f"{dim_label}-2")
+            ax.set_xlabel(f"{dim_label}[{dims_used[0]}]")
+            ax.set_ylabel(f"{dim_label}[{dims_used[1]}]")
             ax.grid(alpha=0.25)
             ax.set_aspect("equal", adjustable="datalim")
             ax.text(0.02, 0.97, panel_label, transform=ax.transAxes, ha="left", va="top", fontsize=11, fontweight="semibold")
 
-        _scatter_panel(flat_axes[1], pca_xy, pca_centroids, "(b)", f"{pca_label} projection", pca_label[:2].upper())
-        _scatter_panel(flat_axes[2], lda_xy, lda_centroids, "(c)", f"{lda_label} projection", lda_label[:2].upper())
+        _scatter_panel(flat_axes[1], pca_xy, pca_centroids, "(b)", f"{pca_label} projection (best 2D)", pca_label[:2].upper(), pca_dims)
+        _scatter_panel(flat_axes[2], lda_xy, lda_centroids, "(c)", f"{lda_label} projection (best 2D)", lda_label[:2].upper(), lda_dims)
 
         heat_ax = flat_axes[3]
         heat_ax.axis("off")
@@ -467,10 +513,10 @@ class Visualizer:
             vmax = float(np.nanmax(valid))
             im = hax.imshow(mat, cmap="magma", vmin=0.0, vmax=max(vmax, 1e-6))
             hax.set_title(htitle)
-            hax.set_xticks(np.arange(len(self.class_names)))
-            hax.set_yticks(np.arange(len(self.class_names)))
-            hax.set_xticklabels(self.class_names, rotation=45, ha="right")
-            hax.set_yticklabels(self.class_names)
+            hax.set_xticks(np.arange(len(class_names)))
+            hax.set_yticks(np.arange(len(class_names)))
+            hax.set_xticklabels(class_names, rotation=45, ha="right")
+            hax.set_yticklabels(class_names)
             hax.tick_params(axis="both", labelsize=8)
             for i in range(mat.shape[0]):
                 for j in range(mat.shape[1]):
@@ -496,6 +542,439 @@ class Visualizer:
         )
         fig.tight_layout(rect=(0.0, 0.04, 1.0, 0.96))
         self._save_fig(fig, f"features/{title.lower().replace(' ', '_')}.png")
+
+    def _select_best_2d_by_fisher(self, points: np.ndarray, labels: np.ndarray) -> np.ndarray:
+        points = np.asarray(points, dtype=np.float32)
+        labels = np.asarray(labels, dtype=np.int64)
+        if points.ndim != 2 or points.shape[0] == 0:
+            return np.empty((0, 2), dtype=np.float32)
+        if points.shape[1] == 1:
+            return np.concatenate([points, np.zeros((points.shape[0], 1), dtype=np.float32)], axis=1)
+        if points.shape[1] == 2:
+            return points
+
+        global_mean = points.mean(axis=0)
+        scores = np.zeros(points.shape[1], dtype=np.float64)
+        for cls_idx in np.unique(labels):
+            if cls_idx <= 0:
+                continue
+            m = labels == cls_idx
+            if not np.any(m):
+                continue
+            cls = points[m]
+            cls_mean = cls.mean(axis=0)
+            cls_var = cls.var(axis=0)
+            scores += cls.shape[0] * (cls_mean - global_mean) ** 2 / np.maximum(cls_var, 1e-8)
+        best = np.argsort(-scores)[:2]
+        best = np.sort(best)
+        return points[:, best].astype(np.float32)
+
+    def plot_patient_shift(
+        self,
+        raw_points_2d: np.ndarray,
+        norm_points_2d: np.ndarray,
+        labels: np.ndarray,
+        patient_ids: Sequence[str],
+        selected_patients: Sequence[str],
+        title: str = "patient spectral domain shift",
+    ) -> None:
+        """Plot per-class cross-patient shift with 90% clouds, raw vs norm (3x2)."""
+        raw_pts = np.asarray(raw_points_2d, dtype=np.float32)
+        norm_pts = np.asarray(norm_points_2d, dtype=np.float32)
+        y = np.asarray(labels, dtype=np.int64)
+        pids = np.asarray([str(v) for v in patient_ids], dtype=object)
+        if raw_pts.ndim != 2 or raw_pts.shape[1] != 2 or raw_pts.shape[0] < 20:
+            return
+        if norm_pts.ndim != 2 or norm_pts.shape[1] != 2 or norm_pts.shape[0] != raw_pts.shape[0]:
+            return
+        if y.shape[0] != raw_pts.shape[0] or pids.shape[0] != raw_pts.shape[0]:
+            return
+
+        fg_labels = [idx for idx in range(1, len(self.class_names))]
+        if not fg_labels:
+            return
+
+        fig, axes = plt.subplots(len(fg_labels), 2, figsize=(12.5, 4.3 * len(fg_labels)))
+        if len(fg_labels) == 1:
+            axes = np.expand_dims(axes, axis=0)
+
+        cmap = plt.get_cmap("tab10")
+        color_map = {pid: cmap(i % 10) for i, pid in enumerate(selected_patients)}
+
+        # chi-square quantile for 2 DoF at 90%
+        chi2_q90 = 4.605170186
+
+        for row, cls_idx in enumerate(fg_labels):
+            cls_name = self.class_names[cls_idx] if cls_idx < len(self.class_names) else f"class_{cls_idx}"
+            for col, pts in enumerate([raw_pts, norm_pts]):
+                ax = axes[row, col]
+                col_name = "raw" if col == 0 else "norm"
+                ax.set_title(f"{cls_name} ({col_name})")
+                ax.set_xlabel("proj-dim1")
+                ax.set_ylabel("proj-dim2")
+                ax.grid(alpha=0.25)
+
+                has_data = False
+                for pid in selected_patients:
+                    m = (y == cls_idx) & (pids == pid)
+                    if np.count_nonzero(m) < 8:
+                        continue
+                    has_data = True
+                    cur = pts[m]
+                    color = color_map[pid]
+                    ax.scatter(cur[:, 0], cur[:, 1], s=6, alpha=0.10, color=color, edgecolors="none")
+
+                    center = cur.mean(axis=0)
+                    cov = np.cov(cur.T)
+                    if cov.shape != (2, 2) or not np.all(np.isfinite(cov)):
+                        continue
+                    evals, evecs = np.linalg.eigh(cov)
+                    evals = np.clip(evals, 1e-8, None)
+                    order = np.argsort(evals)[::-1]
+                    evals = evals[order]
+                    evecs = evecs[:, order]
+                    angle = float(np.degrees(np.arctan2(evecs[1, 0], evecs[0, 0])))
+                    width = 2.0 * np.sqrt(chi2_q90 * evals[0])
+                    height = 2.0 * np.sqrt(chi2_q90 * evals[1])
+                    cloud = Ellipse(
+                        xy=(float(center[0]), float(center[1])),
+                        width=float(width),
+                        height=float(height),
+                        angle=angle,
+                        facecolor=color,
+                        edgecolor=color,
+                        alpha=0.18,
+                        linewidth=1.1,
+                    )
+                    ax.add_patch(cloud)
+                if not has_data:
+                    ax.text(0.5, 0.5, "insufficient points", transform=ax.transAxes, ha="center", va="center")
+
+        legend_handles = [
+            Patch(facecolor=color_map[pid], edgecolor="none", label=str(pid))
+            for pid in selected_patients
+            if pid in color_map
+        ]
+        if legend_handles:
+            fig.legend(
+                handles=legend_handles,
+                loc="lower center",
+                bbox_to_anchor=(0.5, -0.02),
+                ncol=min(5, len(legend_handles)),
+                frameon=False,
+                fontsize=8.5,
+                title="patient",
+                title_fontsize=9,
+            )
+
+        fig.suptitle(title, fontsize=12, y=0.995)
+        fig.tight_layout(rect=(0.0, 0.07, 1.0, 0.97))
+        self._save_fig(fig, "data/patient_shift.png")
+
+    def plot_patient_distance_distribution(
+        self,
+        features_hd: np.ndarray,
+        labels: np.ndarray,
+        patient_ids: Sequence[str],
+        selected_patients: Sequence[str],
+        title: str = " ", # leave none otherwise conflicts with legend
+    ) -> None:
+        x = np.asarray(features_hd, dtype=np.float32)
+        y = np.asarray(labels, dtype=np.int64)
+        p = np.asarray([str(v) for v in patient_ids], dtype=object)
+        if x.ndim != 2 or x.shape[0] < 20 or y.shape[0] != x.shape[0] or p.shape[0] != x.shape[0]:
+            return
+
+        fg_labels = [idx for idx in range(1, len(self.class_names))]
+        fig, axes = plt.subplots(1, len(fg_labels), figsize=(5.4 * len(fg_labels), 4.2))
+        if len(fg_labels) == 1:
+            axes = [axes]
+        rng = np.random.default_rng(3407)
+
+        def _sample_pair_dist(a: np.ndarray, b: np.ndarray, n_pairs: int) -> np.ndarray:
+            if a.shape[0] == 0 or b.shape[0] == 0:
+                return np.empty((0,), dtype=np.float32)
+            ia = rng.integers(0, a.shape[0], size=n_pairs)
+            ib = rng.integers(0, b.shape[0], size=n_pairs)
+            return np.linalg.norm(a[ia] - b[ib], axis=1).astype(np.float32)
+
+        for ax, cls_idx in zip(axes, fg_labels):
+            intra_vals: List[np.ndarray] = []
+            inter_vals: List[np.ndarray] = []
+            for pid in selected_patients:
+                m = (y == cls_idx) & (p == pid)
+                cur = x[m]
+                if cur.shape[0] < 5:
+                    continue
+                intra_vals.append(_sample_pair_dist(cur, cur, n_pairs=800))
+            for i in range(len(selected_patients)):
+                for j in range(i + 1, len(selected_patients)):
+                    mi = (y == cls_idx) & (p == selected_patients[i])
+                    mj = (y == cls_idx) & (p == selected_patients[j])
+                    ai = x[mi]
+                    bj = x[mj]
+                    if ai.shape[0] < 5 or bj.shape[0] < 5:
+                        continue
+                    inter_vals.append(_sample_pair_dist(ai, bj, n_pairs=800))
+
+            intra = np.concatenate(intra_vals, axis=0) if intra_vals else np.empty((0,), dtype=np.float32)
+            inter = np.concatenate(inter_vals, axis=0) if inter_vals else np.empty((0,), dtype=np.float32)
+            cls_name = self.class_names[cls_idx] if cls_idx < len(self.class_names) else str(cls_idx)
+            if intra.size > 0:
+                ax.hist(intra, bins=40, density=True, alpha=0.40, color="#4e79a7", label="intra-patient")
+            if inter.size > 0:
+                ax.hist(inter, bins=40, density=True, alpha=0.40, color="#e15759", label="inter-patient")
+            ax.set_title(f"{cls_name}")
+            ax.set_xlabel("L2 distance (high-dim)")
+            ax.set_ylabel("density")
+            ax.grid(alpha=0.25)
+            if intra.size == 0 and inter.size == 0:
+                ax.text(0.5, 0.5, "insufficient points", transform=ax.transAxes, ha="center", va="center")
+        fig.legend(
+            loc="upper center",
+            ncol=2,
+            frameon=False,
+            bbox_to_anchor=(0.5, 1.02),
+            fontsize=9,
+        )
+        fig.suptitle(title, fontsize=12, y=0.995)
+        fig.tight_layout(rect=(0.0, 0.02, 1.0, 0.92))
+        self._save_fig(fig, "data/patient_distance_distribution.png")
+
+    def plot_patient_divergence_heatmaps(
+        self,
+        features_hd: np.ndarray,
+        labels: np.ndarray,
+        patient_ids: Sequence[str],
+        selected_patients: Sequence[str],
+        title: str = "cross-patient divergence heatmaps",
+    ) -> None:
+        x = np.asarray(features_hd, dtype=np.float64)
+        y = np.asarray(labels, dtype=np.int64)
+        p = np.asarray([str(v) for v in patient_ids], dtype=object)
+        if x.ndim != 2 or x.shape[0] < 20:
+            return
+        fg_labels = [idx for idx in range(1, len(self.class_names))]
+        n_pat = len(selected_patients)
+        if n_pat < 2:
+            return
+        fig, axes = plt.subplots(len(fg_labels), 2, figsize=(10.8, 3.7 * len(fg_labels)))
+        if len(fg_labels) == 1:
+            axes = np.expand_dims(axes, axis=0)
+        rng = np.random.default_rng(3407)
+
+        def _rbf_mmd2(a: np.ndarray, b: np.ndarray) -> float:
+            na = min(256, a.shape[0]); nb = min(256, b.shape[0])
+            a = a[rng.choice(a.shape[0], size=na, replace=False)]
+            b = b[rng.choice(b.shape[0], size=nb, replace=False)]
+            z = np.concatenate([a, b], axis=0)
+            if z.shape[0] < 4:
+                return float("nan")
+            d2 = np.sum((z[:, None, :] - z[None, :, :]) ** 2, axis=-1)
+            sigma2 = float(np.median(d2[np.triu_indices_from(d2, k=1)]))
+            sigma2 = max(sigma2, 1e-6)
+            kaa = np.exp(-np.sum((a[:, None, :] - a[None, :, :]) ** 2, axis=-1) / (2.0 * sigma2))
+            kbb = np.exp(-np.sum((b[:, None, :] - b[None, :, :]) ** 2, axis=-1) / (2.0 * sigma2))
+            kab = np.exp(-np.sum((a[:, None, :] - b[None, :, :]) ** 2, axis=-1) / (2.0 * sigma2))
+            return float(kaa.mean() + kbb.mean() - 2.0 * kab.mean())
+
+        def _bhattacharyya(a: np.ndarray, b: np.ndarray) -> float:
+            mu1 = a.mean(axis=0); mu2 = b.mean(axis=0)
+            c1 = np.cov(a, rowvar=False); c2 = np.cov(b, rowvar=False)
+            dim = c1.shape[0]
+            reg = 1e-4 * np.eye(dim)
+            c1 = c1 + reg; c2 = c2 + reg
+            c = 0.5 * (c1 + c2)
+            invc = np.linalg.pinv(c)
+            diff = (mu1 - mu2).reshape(-1, 1)
+            t1 = 0.125 * float(diff.T @ invc @ diff)
+            det_c = max(np.linalg.det(c), 1e-12)
+            det_c1 = max(np.linalg.det(c1), 1e-12)
+            det_c2 = max(np.linalg.det(c2), 1e-12)
+            t2 = 0.5 * np.log(det_c / np.sqrt(det_c1 * det_c2))
+            return float(t1 + t2)
+
+        for row, cls_idx in enumerate(fg_labels):
+            mmd_mat = np.full((n_pat, n_pat), np.nan, dtype=np.float64)
+            bha_mat = np.full((n_pat, n_pat), np.nan, dtype=np.float64)
+            for i, pi in enumerate(selected_patients):
+                ai = x[(y == cls_idx) & (p == pi)]
+                if ai.shape[0] < 8:
+                    continue
+                for j, pj in enumerate(selected_patients):
+                    bj = x[(y == cls_idx) & (p == pj)]
+                    if bj.shape[0] < 8:
+                        continue
+                    if i == j:
+                        mmd_mat[i, j] = 0.0
+                        bha_mat[i, j] = 0.0
+                    else:
+                        mmd_mat[i, j] = _rbf_mmd2(ai, bj)
+                        bha_mat[i, j] = _bhattacharyya(ai, bj)
+
+            cls_name = self.class_names[cls_idx] if cls_idx < len(self.class_names) else str(cls_idx)
+            for col, (mat, name, cmap) in enumerate([(mmd_mat, "MMD", "viridis"), (bha_mat, "Bhattacharyya", "magma")]):
+                ax = axes[row, col]
+                valid = mat[np.isfinite(mat)]
+                if valid.size == 0:
+                    ax.text(0.5, 0.5, "insufficient points", transform=ax.transAxes, ha="center", va="center")
+                    ax.axis("off")
+                    continue
+                vmax = float(np.nanmax(valid))
+                im = ax.imshow(mat, cmap=cmap, vmin=0.0, vmax=max(vmax, 1e-8))
+                ax.set_title(f"{cls_name} - {name}")
+                ax.set_xticks(np.arange(n_pat)); ax.set_yticks(np.arange(n_pat))
+                ax.set_xticklabels(selected_patients, rotation=45, ha="right", fontsize=7)
+                ax.set_yticklabels(selected_patients, fontsize=7)
+                fig.colorbar(im, ax=ax, shrink=0.8, pad=0.02)
+        fig.suptitle(title, fontsize=12, y=0.995)
+        fig.tight_layout(rect=(0.0, 0.03, 1.0, 0.98))
+        self._save_fig(fig, "data/patient_divergence_heatmaps.png")
+
+    def plot_patient_feature_shift(
+        self,
+        feature_shift_by_class: Mapping[str, Sequence[Mapping[str, Any]]],
+        title: str = "patient feature-wise shift (top dims)",
+    ) -> None:
+        """Visualize top shifted feature dimensions across patients for each class."""
+        if not feature_shift_by_class:
+            return
+        class_keys = [name for name in self.class_names[1:] if name in feature_shift_by_class]
+        if not class_keys:
+            class_keys = list(feature_shift_by_class.keys())
+        if not class_keys:
+            return
+
+        fig, axes = plt.subplots(1, len(class_keys), figsize=(5.2 * len(class_keys), 4.2))
+        if len(class_keys) == 1:
+            axes = [axes]
+        cmap = plt.get_cmap("tab20")
+        for ax, cls_name in zip(axes, class_keys):
+            rows = list(feature_shift_by_class.get(cls_name, []))
+            if not rows:
+                ax.text(0.5, 0.5, "insufficient points", transform=ax.transAxes, ha="center", va="center")
+                ax.axis("off")
+                continue
+            idxs = [int(r.get("feature_idx", 0)) for r in rows]
+            vals = [float(r.get("shift_strength", 0.0)) for r in rows]
+            x = np.arange(len(idxs))
+            colors = [cmap(i % 20) for i in range(len(idxs))]
+            ax.bar(x, vals, color=colors, alpha=0.85)
+            ax.set_xticks(x)
+            ax.set_xticklabels([str(i) for i in idxs], rotation=45, ha="right", fontsize=8)
+            ax.set_title(cls_name)
+            ax.set_xlabel("feature index (top shifted)")
+            ax.set_ylabel("std of patient means")
+            ax.grid(axis="y", alpha=0.25)
+        fig.suptitle(title, fontsize=12, y=0.995)
+        fig.tight_layout(rect=(0.0, 0.03, 1.0, 0.97))
+        self._save_fig(fig, "data/patient_feature_shift_topdims.png")
+
+    def plot_patient_wise_band_shift(
+        self,
+        band_stats_by_class: Mapping[str, Mapping[str, Mapping[str, np.ndarray]]],
+        patient_order: Sequence[str],
+        title: str = "patient-wise band shift",
+    ) -> None:
+        """
+        For each foreground class, plot per-patient (band, mean) scatter+line with +/-2sigma range.
+        """
+        if not band_stats_by_class:
+            return
+        class_keys = [name for name in self.class_names[1:] if name in band_stats_by_class]
+        if not class_keys:
+            class_keys = list(band_stats_by_class.keys())
+        if not class_keys:
+            return
+
+        fig, axes = plt.subplots(1, len(class_keys), figsize=(6.0 * len(class_keys), 4.7))
+        if len(class_keys) == 1:
+            axes = [axes]
+        cmap = plt.get_cmap("tab10")
+        colors = {pid: cmap(i % 10) for i, pid in enumerate(patient_order)}
+
+        for ax, cls_name in zip(axes, class_keys):
+            cls_stats = band_stats_by_class.get(cls_name, {})
+            if not cls_stats:
+                ax.text(0.5, 0.5, "insufficient data", transform=ax.transAxes, ha="center", va="center")
+                ax.axis("off")
+                continue
+            for pid in patient_order:
+                rows = cls_stats.get(pid, None)
+                if rows is None:
+                    continue
+                mean = np.asarray(rows.get("mean", []), dtype=np.float32)
+                std = np.asarray(rows.get("std", []), dtype=np.float32)
+                if mean.size == 0 or std.size != mean.size:
+                    continue
+                x = np.arange(mean.size, dtype=np.int32)
+                c = colors[pid]
+                # scatter + dashed line for mean reflectance
+                ax.scatter(x, mean, s=9, color=c, alpha=0.75)
+                ax.plot(x, mean, linestyle="--", linewidth=1.1, color=c, alpha=0.9)
+                # 2 sigma envelope
+                low = mean - 2.0 * std
+                high = mean + 2.0 * std
+                ax.fill_between(x, low, high, color=c, alpha=0.10)
+            ax.set_title(cls_name)
+            ax.set_xlabel("band index")
+            ax.set_ylabel("reflectance mean")
+            ax.grid(alpha=0.25)
+
+        legend_handles = [
+            Patch(facecolor=colors[pid], edgecolor="none", label=str(pid))
+            for pid in patient_order
+            if pid in colors
+        ]
+        if legend_handles:
+            fig.legend(
+                handles=legend_handles,
+                loc="lower center",
+                bbox_to_anchor=(0.5, -0.02),
+                ncol=min(8, len(legend_handles)),
+                frameon=False,
+                fontsize=8.5,
+                title="patient",
+                title_fontsize=9,
+            )
+        fig.suptitle(title, fontsize=12, y=0.995)
+        fig.tight_layout(rect=(0.0, 0.07, 1.0, 0.97))
+        self._save_fig(fig, "data/patient_wise_band_shift.png")
+
+    def plot_patient_clustering(
+        self,
+        embedding_2d: np.ndarray,
+        patient_ids: Sequence[str],
+        cluster_ids: Sequence[int],
+        title: str = "patient clustering",
+    ) -> None:
+        """Plot patient-level clustering scatter."""
+        z = np.asarray(embedding_2d, dtype=np.float32)
+        if z.ndim != 2 or z.shape[1] != 2 or z.shape[0] == 0:
+            return
+        pids = [str(v) for v in patient_ids]
+        cids = [int(v) for v in cluster_ids]
+        if len(pids) != z.shape[0] or len(cids) != z.shape[0]:
+            return
+
+        fig, ax = plt.subplots(figsize=(7.6, 5.8))
+        cmap = plt.get_cmap("tab10")
+        unique_clusters = sorted(set(cids))
+        for cid in unique_clusters:
+            idx = np.array([i for i, v in enumerate(cids) if v == cid], dtype=np.int64)
+            if idx.size == 0:
+                continue
+            color = cmap(cid % 10)
+            ax.scatter(z[idx, 0], z[idx, 1], s=64, color=color, alpha=0.85, label=f"cluster {cid}", edgecolors="black", linewidths=0.4)
+            for i in idx.tolist():
+                ax.annotate(pids[i], (z[i, 0], z[i, 1]), xytext=(4, 4), textcoords="offset points", fontsize=8)
+        ax.set_title(title)
+        ax.set_xlabel("PC1")
+        ax.set_ylabel("PC2")
+        ax.grid(alpha=0.25)
+        ax.legend(frameon=False, loc="best")
+        fig.tight_layout()
+        self._save_fig(fig, "data/patient_clustering.png")
 
     def show_segmentation(
         self,

@@ -1,4 +1,5 @@
 # trainer.py
+from tqdm import tqdm
 from munch import Munch
 from pathlib import Path
 from dataclasses import dataclass
@@ -7,6 +8,9 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 import numpy as np
 import copy, json, math, time
 import torch, torch.nn as nn, torch.nn.functional as F
+
+from pipeline.monitor import tprint
+
 
 def _cfg_get(config, path, default=None):
     current = config
@@ -427,6 +431,7 @@ class Trainer:
         self.best_val_dice = -float("inf")
 
     def _build_optimizer(self):
+        tprint(f"building optimizer...")
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         optimizer_cfg = _cfg_get(self.config, "train.optimizer", "adamw")
         if isinstance(optimizer_cfg, str):
@@ -450,6 +455,7 @@ class Trainer:
 
         betas = tuple(_cfg_get(self.config, "train.optimizer.betas", [0.9, 0.999]))
         eps = float(_cfg_get(self.config, "train.optimizer.eps", 1e-8))
+        tprint(f"optimizer built.")
         return torch.optim.AdamW(
             trainable_params,
             lr=lr,
@@ -472,6 +478,7 @@ class Trainer:
         return _cfg_get(self.config, "train.scheduler", "none")
 
     def _set_stage_trainability(self, stage_cfg: Mapping[str, Any]) -> None:
+        tprint(f"setting params grad...")
         freeze_cfg = stage_cfg.get("freeze", {}) if isinstance(stage_cfg, Mapping) else {}
         freeze_backbone = bool(freeze_cfg.get("backbone", False))
         freeze_decoder = bool(freeze_cfg.get("decoder", False))
@@ -486,9 +493,11 @@ class Trainer:
             if freeze_spectral and ("spectral_encoder" in lower or "spectral_aux_head" in lower):
                 req_grad = False
             param.requires_grad_(req_grad)
+        tprint(f"params grad initialized.")
         self.optimizer = self._build_optimizer()
 
     def _build_scheduler(self, train_loader, num_epochs, scheduler_cfg_override=None):
+        tprint(f"building scheduler...")
         scheduler_cfg = scheduler_cfg_override if scheduler_cfg_override is not None else _cfg_get(self.config, "train.scheduler", "none")
         if isinstance(scheduler_cfg, Mapping):
             scheduler_name = str(scheduler_cfg.get("name", "none")).lower()
@@ -504,8 +513,9 @@ class Trainer:
         self.scheduler_step_on = "epoch"
         if scheduler_name in {"none", "", "null"}:
             self.scheduler = None
+            tprint(f"scheduler None built.")
             return
-
+        
         steps_per_epoch = max(1, math.ceil(len(train_loader) / self.grad_accum_steps))
         total_steps = max(1, steps_per_epoch * int(max(1, num_epochs)))
         warmup_epochs = float(scheduler_ns.get("warmup_epochs", _cfg_get(self.config, "train.scheduler.warmup_epochs", 0.0)))
@@ -525,9 +535,11 @@ class Trainer:
                 return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
             self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_lambda)
+            tprint(f"scheduler built.")
             return
 
         if scheduler_name == "poly":
+            tprint(f"scheduler built.")
             self.scheduler_step_on = "step"
 
             def lr_lambda(step):
@@ -545,6 +557,7 @@ class Trainer:
             gamma = float(scheduler_ns.get("gamma", _cfg_get(self.config, "train.scheduler.gamma", 0.1)))
             self.scheduler_step_on = "epoch"
             self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=step_size, gamma=gamma)
+            tprint(f"scheduler built.")
             return
 
         self.scheduler = None
@@ -734,18 +747,26 @@ class Trainer:
         w_stage1 = float(loss_weights.get("stage1", 0.0))
         w_comp = float(loss_weights.get("composite", 1.0))
 
-        for step, batch in enumerate(train_loader):
+        an_epoch = tqdm(train_loader, desc=f"Training", total=len(train_loader))
+        
+        for step, batch in enumerate(an_epoch):
             if self.max_train_steps_per_epoch > 0 and step >= self.max_train_steps_per_epoch:
+                an_epoch.close()
                 break
+
             images, targets, _ = self._unpack_batch(batch)
             images = images.to(self.device, non_blocking=True)
+
             if self.channels_last and images.ndim == 4 and self.device.type == "cuda":
                 images = images.contiguous(memory_format=torch.channels_last)
+            
             targets = targets.to(self.device, non_blocking=True).long()
 
             try:
                 with self._autocast_context():
+                    # ⭐ forward pass
                     logits, aux_outputs = self._forward_with_aux(images)
+                    # ⭐ compute losses
                     main_loss, loss_dict = self.criterion.compute(logits, targets)
                     aux_loss, aux_loss_dict = self._compute_aux_loss(aux_outputs, targets)
                     composite_total = main_loss + self.aux_loss_weight * aux_loss
@@ -755,13 +776,15 @@ class Trainer:
                     total_batch_loss = w_comp * composite_total + w_stage1 * stage1_total
             except RuntimeError as exc:
                 if self.device.type == "cuda" and self.oom_skip_batch and "out of memory" in str(exc).lower():
-                    print(f"[warn] OOM at train step {step}, skip batch")
+                    tprint(f"[warn] OOM at train step {step}, skip batch")
                     self.optimizer.zero_grad(set_to_none=True)
                     torch.cuda.empty_cache()
                     continue
                 raise
 
+            # ⭐ scale loss
             scaled_loss = total_batch_loss / self.grad_accum_steps
+            # ⭐ backward pass
             self.scaler.scale(scaled_loss).backward()
 
             should_step = ((step + 1) % self.grad_accum_steps == 0) or ((step + 1) == len(train_loader))
@@ -769,17 +792,21 @@ class Trainer:
                 if self.max_grad_norm > 0:
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                prev_scale = float(self.scaler.get_scale()) if (self.use_amp and self.device.type == "cuda") else 1.0
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+                new_scale = float(self.scaler.get_scale()) if (self.use_amp and self.device.type == "cuda") else 1.0
+                optimizer_stepped = not (self.use_amp and self.device.type == "cuda" and new_scale < prev_scale)
                 self.optimizer.zero_grad(set_to_none=True)
-                optimizer_steps += 1
+                if optimizer_stepped:
+                    optimizer_steps += 1
 
-                if self.scheduler is not None and self.scheduler_step_on == "step":
-                    self.scheduler.step()
-                if self.ema is not None:
-                    self.ema.update(self.model)
-                if self.device.type == "cuda" and self.empty_cache_steps > 0 and (optimizer_steps % self.empty_cache_steps == 0):
-                    torch.cuda.empty_cache()
+                    if self.scheduler is not None and self.scheduler_step_on == "step":
+                        self.scheduler.step()
+                    if self.ema is not None:
+                        self.ema.update(self.model)
+                    if self.device.type == "cuda" and self.empty_cache_steps > 0 and (optimizer_steps % self.empty_cache_steps == 0):
+                        torch.cuda.empty_cache()
 
             preds = torch.argmax(logits.detach(), dim=1)
             epoch_confusion += self._confusion_matrix(preds.cpu(), targets.detach().cpu())
@@ -795,7 +822,7 @@ class Trainer:
             for key, value in merged_loss_dict.items():
                 running_loss_components[key] = running_loss_components.get(key, 0.0) + float(value)
 
-        if self.scheduler is not None and self.scheduler_step_on == "epoch":
+        if self.scheduler is not None and self.scheduler_step_on == "epoch" and optimizer_steps > 0:
             self.scheduler.step()
 
         avg_loss = total_loss / max(1, num_batches)
@@ -944,6 +971,9 @@ class Trainer:
                 break
             stage_name = str(stage_cfg.get("name", f"stage_{stage_idx + 1}"))
             self._set_stage_trainability(stage_cfg)
+
+            tprint(f"stage[{stage_name}]: train/eval loop")
+
             self._build_scheduler(
                 train_loader,
                 int(stage_cfg.get("max_epochs_guard", num_epochs)),
@@ -963,7 +993,7 @@ class Trainer:
             stage_epoch_budget = min(max(1, guard_epochs), max(0, int(num_epochs) - global_epoch))
             if stage_epoch_budget <= 0:
                 break
-
+            
             for _ in range(stage_epoch_budget):
                 epoch_start = time.time()
                 global_epoch += 1
@@ -1045,14 +1075,14 @@ class Trainer:
 
                 epoch_time = time.time() - epoch_start
                 print(
-                    f"Epoch {global_epoch} "
-                    f"- stage: {stage_name} "
-                    f"- lr: {self._current_lr():.6e} "
-                    f"- train_loss: {train_metrics['loss']:.4f} "
-                    f"- val_loss: {val_metrics['loss']:.4f} "
-                    f"- train_dice: {train_summary['dice']:.4f} "
-                    f"- val_dice: {val_summary['dice']:.4f} "
-                    f"- time: {epoch_time:.1f}s"
+                    f"Epoch {global_epoch}\n"
+                    f"\t- stage: {stage_name}\n"
+                    f"\t- lr: {self._current_lr():.6e}\n"
+                    f"\t- train_loss: {train_metrics['loss']:.4f}\n"
+                    f"\t- val_loss: {val_metrics['loss']:.4f}\n"
+                    f"\t- train_dice: {train_summary['dice']:.4f}\n"
+                    f"\t- val_dice: {val_summary['dice']:.4f}\n"
+                    f"\t- time: {epoch_time:.1f}s\n"
                 )
 
                 if bad_epochs >= patience:

@@ -223,7 +223,6 @@ class SpectralReducer:
         x_fit, y_fit = self._collect_pixels(samples, num_classes, show_progress=show_progress)
         if x_fit.size == 0:
             raise RuntimeError("failed to collect fit pixels for spectral reducer")
-
         x_fit = self._prepare_features(x_fit, fit=True)
 
         if self.mode == "supervised_pca":

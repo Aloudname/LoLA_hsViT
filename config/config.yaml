@@ -23,9 +23,9 @@ data:
     precious_class: 1 # used in pipeline.dataset sampling rules for small-target emphasis.
     advanced:
       use_weighted_sampler: true # enable weighted sampler for train dataloader.
-      rho: 0.40 # interpolation factor between original distribution and balanced target.
-      pg_min_ratio: 0.15 # minimum rare-class target ratio used by weighting.
-      hard_bg_ratio: 0.20 # target ratio for hard background patches.
+      rho: 0.40 # ⭐ interpolation factor between original distribution and balanced target.
+      pg_min_ratio: 0.15 # ⭐ minimum rare-class target ratio used by weighting.
+      hard_bg_ratio: 0.20 # ⭐ target ratio for hard background patches.
       weight_caps: [0.5, 8.0] # clamp range for patch sampling weights.
   split:
     train: 0.70 # used in pipeline.dataset._split_subjects.
@@ -105,8 +105,8 @@ model:
 
 train:
   epochs: 10 # used in pipeline.trainer.Trainer.fit.
-  batch_size: 32 # used in train dataloader.
-  eval_batch_size: 32 # used in eval/test dataloaders.
+  batch_size: 16 # ⭐ used in train dataloader.
+  eval_batch_size: 16 # ⭐ used in eval/test dataloaders.
   num_workers: 2 # used in dataloader worker setup.
   lr: 0.0003 # used in optimizer construction.
   weight_decay: 0.0001 # used in optimizer construction.
@@ -216,7 +216,7 @@ runtime:
   progress_bar: true # used in pipeline.dataset and pipeline.trainer to toggle tqdm progress bars.
 
 visualization:
-  tsne_enabled: true
+  tsne_enabled: false
   num_seg_examples: 4 # used in pipeline.visualize.show_segmentation.
   tsne_max_points: 3000 # used in pipeline.visualize.plot_tsne.
   spectral_max_points_per_class: 2000 # used in pipeline.visualize.plot_spectral.
