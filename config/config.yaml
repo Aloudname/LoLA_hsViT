@@ -32,11 +32,26 @@ data:
     eval: 0.20 # used in pipeline.dataset._split_subjects.
     test: 0.10 # used in pipeline.dataset._split_subjects.
     seed: 350234 # used in pipeline.dataset and pipeline.core for deterministic behavior.
+  # on-disk diff + SNV before SpectralReducer; set hsi_bands to (raw_bands - hsi_diff_order) when enabled.
+  spectral_alignment:
+    enabled: false # pipeline.dataset.ensure_spectral_alignment_on_disk
+    version_tag: "v1"
+    manifest_basename_hsi: ".hsi_spectral_diff_manifest.json"
+    manifest_basename_rgb: ".rgb_spectral_diff_manifest.json"
+    hsi_diff_order: 1
+    snv: true
+    snv_eps: 1.0e-6
+    process_rgb: false # if true, overwrites *_Merged_rgb.png (enable only with care)
+    rgb_pad_mode: "repeat_last"
+    rgb_snv: false
+    viz_random_patients: 16 # pipeline.core._collect_patient_band_diff_shift viz subset
+    similarity_bootstrap_iters: 2000 # bootstrap over bands for cosine CIs (patient_band_diff_similarity.json)
+    similarity_random_seed: 137 # added to data.split.seed in pipeline.core for bootstrap RNG
   preprocess:
     mode: "none" # used in pipeline.dataset.SpectralReducer; options: none, supervised_pca, lda_pca, kernel_lda, pca_nca.
     output_dim: 8 # final reduced HSI channels fed into HSIAdapter / vit backbone pipeline.
     max_fit_pixels: 500000 # pixel budget for reducer fitting from real train split only.
-    snv: true # standard normal variate per pixel; suppresses illumination/amplitude drift common in medical HSI.
+    snv: true # per-pixel SNV in SpectralReducer; set false when spectral_alignment.enabled and spectral_alignment.snv are true (avoid double SNV).
     derivative_order: 1 # spectral derivative order before supervised compression; 1 is usually a strong default.
     savgol_window: 7 # Savitzky-Golay window length for smooth derivative estimation.
     savgol_polyorder: 2 # Savitzky-Golay polynomial order.
@@ -217,6 +232,7 @@ runtime:
 
 visualization:
   tsne_enabled: false
+  anonymize_patients: true # pipeline.visualize.Visualizer: P001-style labels on patient figures
   num_seg_examples: 4 # used in pipeline.visualize.show_segmentation.
   tsne_max_points: 3000 # used in pipeline.visualize.plot_tsne.
   spectral_max_points_per_class: 2000 # used in pipeline.visualize.plot_spectral.

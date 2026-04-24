@@ -85,6 +85,17 @@ def _as_munch(config: Mapping[str, Any]) -> Munch:
     return config if isinstance(config, Munch) else Munch.fromDict(dict(config))
 
 
+def _config_section_plain(obj: Any) -> Dict[str, Any]:
+    """nested munch → plain dict for json/cache keys."""
+    if obj is None:
+        return {}
+    if isinstance(obj, Munch) and hasattr(obj, "toDict"):
+        return dict(obj.toDict())
+    if isinstance(obj, Mapping):
+        return dict(obj)
+    return {}
+
+
 def _safe_ratio_triplet(train_ratio: float, eval_ratio: float, test_ratio: float) -> Tuple[float, float, float]:
     """normalize split ratios to sum 1."""
     total = train_ratio + eval_ratio + test_ratio
@@ -157,7 +168,8 @@ class SpectralReducer:
     """fit/transform spectral channels for method-b preprocessing.
 
     modes:
-    - none: identity.
+    - none: when spectral_alignment (diff+SNV on disk) is active, passthrough only;
+      otherwise SNV / derivative / standardize per data.preprocess.
     - supervised_pca: pca on class-balanced train pixels.
     - lda_pca: pca first, then lda on pca features.
     - kernel_lda: random fourier feature projection + lda.
@@ -171,6 +183,7 @@ class SpectralReducer:
         max_fit_pixels: int,
         seed: int,
         preprocess_cfg: Optional[Mapping[str, Any]] = None,
+        spectral_alignment_cfg: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.mode = mode.lower()
         self.output_dim = output_dim
@@ -178,11 +191,27 @@ class SpectralReducer:
         self.seed = seed
 
         cfg = _as_munch(preprocess_cfg or {})
-        self.enable_snv = bool(getattr(cfg, "snv", self.mode == "pca_nca"))
-        self.derivative_order = max(0, int(getattr(cfg, "derivative_order", 1 if self.mode == "pca_nca" else 0)))
+        align = _as_munch(spectral_alignment_cfg or {})
+        self._spectral_alignment_enabled = bool(getattr(align, "enabled", False))
+        self._stage_a_snv = self._spectral_alignment_enabled and bool(getattr(align, "snv", False))
+
+        base_snv = bool(getattr(cfg, "snv", self.mode == "pca_nca"))
+        self.enable_snv = base_snv and not (self._spectral_alignment_enabled and self._stage_a_snv)
+
+        base_derivative = max(0, int(getattr(cfg, "derivative_order", 1 if self.mode == "pca_nca" else 0)))
+        self.derivative_order = 0 if self._spectral_alignment_enabled else base_derivative
+
         self.savgol_window = max(3, int(getattr(cfg, "savgol_window", 7)))
         self.savgol_polyorder = max(1, int(getattr(cfg, "savgol_polyorder", 2)))
         self.enable_standardize = bool(getattr(cfg, "standardize", self.mode == "pca_nca"))
+
+        self._none_identity = (
+            self.mode == "none"
+            and self._spectral_alignment_enabled
+            and self._stage_a_snv
+        )
+        if self._none_identity:
+            self.enable_standardize = False
         self.pca_whiten = bool(getattr(cfg, "pca_whiten", self.mode == "pca_nca"))
         self.pca_dim_override = max(0, int(getattr(cfg, "pca_dim", 0)))
         self.nca_max_fit_pixels = max(256, int(getattr(cfg, "nca_max_fit_pixels", min(max_fit_pixels, 40000))))
@@ -209,12 +238,17 @@ class SpectralReducer:
     ) -> None:
         """fit reducer from train split pixels."""
         if self.mode == "none":
+            if self._none_identity:
+                self.fitted = True
+                self.reference_projection_name = "Stage A (diff+SNV)"
+                self.reduced_projection_name = "Stage A (diff+SNV)"
+                return
             # simple norm for none-mode
             x_fit, _ = self._collect_pixels(samples, num_classes, show_progress=show_progress)
             if x_fit.size == 0:
                 raise RuntimeError("failed to collect fit pixels for none-mode normalization")
             _ = self._prepare_features(x_fit, fit=True)
-            
+
             self.fitted = True
             self.reference_projection_name = "Raw spectra"
             self.reduced_projection_name = "Normalized spectra"
@@ -492,6 +526,9 @@ class SpectralReducer:
             transformed image: (c, h, w) for reducer modes,
         """
         if self.mode == "none":
+            if self._none_identity:
+                h, w, c = image.shape
+                return np.asarray(image, dtype=np.float32).transpose(2, 0, 1)
             # do simple norm for none-mode
             h, w, c = image.shape
             x = image.reshape(-1, c).astype(np.float32)
@@ -621,6 +658,246 @@ def _discover_hsi_samples(config: Munch) -> List[SampleItem]:
         raise RuntimeError("no sample pairs found in configured directories")
 
     return samples
+
+
+def _hsi_diff_snv_array(
+    cube: np.ndarray,
+    hsi_diff_order: int,
+    snv: bool,
+    snv_eps: float,
+) -> np.ndarray:
+    """first-order diff along spectral axis (last), optional per-pixel SNV (same as SpectralReducer)."""
+    x = np.diff(np.asarray(cube, dtype=np.float64), axis=2, n=int(hsi_diff_order))
+    x = x.astype(np.float32)
+    if snv:
+        h, w, d = x.shape
+        flat = x.reshape(-1, d)
+        mean = flat.mean(axis=1, keepdims=True)
+        std = flat.std(axis=1, keepdims=True)
+        flat = (flat - mean) / np.maximum(std, float(snv_eps))
+        x = flat.reshape(h, w, d).astype(np.float32)
+    return x
+
+
+def _alignment_stat_sig(path: Path) -> Tuple[int, int]:
+    st = path.stat()
+    return (int(st.st_mtime_ns), int(st.st_size))
+
+
+def _spectral_alignment_cfg(config: Munch) -> Munch:
+    """spec §4: safe access to data.spectral_alignment."""
+    return _as_munch(getattr(config.data, "spectral_alignment", Munch()))
+
+
+def _hsi_spectral_diff_manifest_path(config: Munch) -> Path:
+    al = _spectral_alignment_cfg(config)
+    name = str(getattr(al, "manifest_basename_hsi", ".hsi_spectral_diff_manifest.json"))
+    return Path(config.path.hsi_dir) / name
+
+
+def _rgb_spectral_diff_manifest_path(config: Munch) -> Path:
+    al = _spectral_alignment_cfg(config)
+    name = str(getattr(al, "manifest_basename_rgb", ".rgb_spectral_diff_manifest.json"))
+    return Path(config.path.rgb_dir) / name
+
+
+def _spectral_alignment_key_digest(config_key: Mapping[str, Any]) -> str:
+    raw = json.dumps(config_key, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def ensure_spectral_alignment_on_disk(
+    config: Munch,
+    samples: Sequence[SampleItem],
+    show_progress: bool,
+) -> Dict[str, Any]:
+    """overwrite HSI cubes with diff [+ SNV] when enabled; optional RGB (process_rgb)."""
+    al = _spectral_alignment_cfg(config)
+    if not bool(getattr(al, "enabled", False)):
+        return {
+            "skipped": True,
+            "enabled": False,
+            "reason": "spectral_alignment.disabled",
+            "hsi_manifest": None,
+            "rgb_manifest": None,
+            "alignment_key": None,
+            "snv": bool(getattr(al, "snv", False)),
+            "snv_eps": float(getattr(al, "snv_eps", 1e-6)),
+            "rgb_snv": bool(getattr(al, "rgb_snv", False)),
+            "num_hsi_written": 0,
+            "num_rgb_written": 0,
+        }
+
+    out_bands = int(config.data.hsi_bands)
+    hsi_diff_order = max(1, int(getattr(al, "hsi_diff_order", 1)))
+    src_bands = out_bands + hsi_diff_order
+    snv = bool(getattr(al, "snv", True))
+    snv_eps = float(getattr(al, "snv_eps", 1e-6))
+    version_tag = str(getattr(al, "version_tag", "v1"))
+    process_rgb = bool(getattr(al, "process_rgb", False))
+    rgb_pad_mode = str(getattr(al, "rgb_pad_mode", "repeat_last"))
+    rgb_snv = bool(getattr(al, "rgb_snv", False))
+
+    manifest_path = _hsi_spectral_diff_manifest_path(config)
+    rgb_manifest_path = _rgb_spectral_diff_manifest_path(config)
+
+    config_key = {
+        "version_tag": version_tag,
+        "hsi_diff_order": hsi_diff_order,
+        "snv": snv,
+        "snv_eps": snv_eps,
+        "hsi_bands_out": out_bands,
+        "rgb_pad_mode": rgb_pad_mode,
+        "rgb_snv": rgb_snv,
+        "process_rgb": process_rgb,
+    }
+    alignment_key = _spectral_alignment_key_digest(config_key)
+
+    existing: Dict[str, Any] = {}
+    if manifest_path.exists():
+        try:
+            with manifest_path.open("r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+
+    per_sample_prev: Dict[str, Any] = {}
+    if existing.get("config_key") == config_key and existing.get("alignment_key") == alignment_key:
+        per_sample_prev = existing.get("per_sample", {}) or {}
+
+    fast_ok = (
+        existing.get("config_key") == config_key
+        and existing.get("alignment_key") == alignment_key
+    )
+    if fast_ok:
+        for sample in samples:
+            try:
+                cube = np.load(sample.hsi_path, mmap_mode="r")
+                if int(cube.shape[2]) != out_bands:
+                    fast_ok = False
+                    break
+                sig = _alignment_stat_sig(sample.hsi_path)
+                prev = per_sample_prev.get(sample.sample_id, {}).get("hsi_sig")
+                if prev is None or tuple(prev) != sig:
+                    fast_ok = False
+                    break
+            except OSError:
+                fast_ok = False
+                break
+        if fast_ok:
+            return {
+                "skipped": False,
+                "cache_hit": True,
+                "enabled": True,
+                "alignment_key": alignment_key,
+                "config_key": config_key,
+                "snv": snv,
+                "snv_eps": snv_eps,
+                "rgb_snv": rgb_snv,
+                "hsi_manifest": str(manifest_path),
+                "rgb_manifest": str(rgb_manifest_path) if process_rgb else None,
+                "num_hsi_written": 0,
+                "num_rgb_written": 0,
+            }
+
+    num_hsi_written = 0
+    num_rgb_written = 0
+    per_sample_out: Dict[str, Any] = {}
+
+    sample_iter = tqdm(
+        list(samples),
+        desc="spectral-align",
+        dynamic_ncols=True,
+        leave=False,
+        disable=not show_progress,
+    )
+    for sample in sample_iter:
+        cube = np.load(sample.hsi_path, mmap_mode="r")
+        if cube.ndim != 3:
+            raise ValueError(f"hsi must be HWC for {sample.sample_id}, got {cube.shape}")
+        c = int(cube.shape[2])
+        if c == out_bands:
+            pass
+        elif c == src_bands:
+            arr = np.asarray(cube, dtype=np.float32)
+            out = _hsi_diff_snv_array(arr, hsi_diff_order, snv, snv_eps)
+            tmp = sample.hsi_path.with_suffix(".npy.tmp_align")
+            np.save(tmp, out.astype(np.float32))
+            os.replace(tmp, sample.hsi_path)
+            num_hsi_written += 1
+        else:
+            raise ValueError(
+                f"{sample.sample_id}: hsi has {c} bands; expected {out_bands} (after alignment) "
+                f"or {src_bands} (raw before alignment). Check data.hsi_bands and spectral_alignment."
+            )
+        per_sample_out[sample.sample_id] = {"hsi_sig": list(_alignment_stat_sig(sample.hsi_path))}
+
+        if process_rgb and sample.rgb_path is not None and sample.rgb_path.exists():
+            rgb_bgr = cv2.imread(str(sample.rgb_path), cv2.IMREAD_COLOR)
+            if rgb_bgr is None:
+                continue
+            rgb = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            d = np.diff(rgb.astype(np.float64), axis=2, n=1).astype(np.float32)
+            if rgb_pad_mode == "zero_third":
+                rgb_out = np.concatenate([d, np.zeros_like(d[..., :1])], axis=2)
+            else:
+                rgb_out = np.concatenate([d, d[..., -1:]], axis=2)
+            if rgb_snv:
+                h, w, ch = rgb_out.shape
+                flat = rgb_out.reshape(-1, ch)
+                mean = flat.mean(axis=1, keepdims=True)
+                std = flat.std(axis=1, keepdims=True)
+                flat = (flat - mean) / np.maximum(std, snv_eps)
+                rgb_out = flat.reshape(h, w, ch)
+            rgb_u8 = np.clip(rgb_out * 255.0, 0.0, 255.0).astype(np.uint8)
+            rgb_u8_bgr = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR)
+            tmp_png = sample.rgb_path.with_suffix(".png.tmp_align")
+            cv2.imwrite(str(tmp_png), rgb_u8_bgr)
+            os.replace(tmp_png, sample.rgb_path)
+            num_rgb_written += 1
+            per_sample_out[sample.sample_id]["rgb_sig"] = list(_alignment_stat_sig(sample.rgb_path))
+
+    payload = {
+        "alignment_key": alignment_key,
+        "config_key": config_key,
+        "per_sample": per_sample_out,
+        "num_hsi_written": num_hsi_written,
+        "num_rgb_written": num_rgb_written,
+    }
+    try:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        with manifest_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+    except OSError as exc:
+        tprint(f"Warning: could not write spectral alignment manifest: {exc}")
+
+    if process_rgb:
+        try:
+            rgb_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            rgb_payload = {
+                "alignment_key": alignment_key,
+                "config_key": config_key,
+                "per_sample": per_sample_out,
+            }
+            with rgb_manifest_path.open("w", encoding="utf-8") as f:
+                json.dump(rgb_payload, f, indent=2, ensure_ascii=False)
+        except OSError as exc:
+            tprint(f"Warning: could not write RGB spectral alignment manifest: {exc}")
+
+    return {
+        "skipped": False,
+        "cache_hit": False,
+        "enabled": True,
+        "alignment_key": alignment_key,
+        "config_key": config_key,
+        "snv": snv,
+        "snv_eps": snv_eps,
+        "rgb_snv": rgb_snv,
+        "hsi_manifest": str(manifest_path),
+        "rgb_manifest": str(rgb_manifest_path) if process_rgb else None,
+        "num_hsi_written": num_hsi_written,
+        "num_rgb_written": num_rgb_written,
+    }
 
 
 def _split_subjects(samples: Sequence[SampleItem], config: Munch) -> Dict[str, List[SampleItem]]:
@@ -862,6 +1139,7 @@ def _build_cache_key(config: Munch, modality: str) -> str:
             "precious_class": int(getattr(sampling_cfg, "precious_class", 1)),
         },
         "preprocess": dict(config.data.preprocess),
+        "spectral_alignment": _config_section_plain(getattr(config.data, "spectral_alignment", None)),
     }
     return json.dumps(payload, sort_keys=True)
 
@@ -922,6 +1200,7 @@ def _prepare_none_mode_cache(
         "version_tag": str(getattr(cache_cfg, "version_tag", "v1")),
         "mode": str(cfg.data.preprocess.mode),
         "preprocess": dict(cfg.data.preprocess),
+        "spectral_alignment": _config_section_plain(getattr(cfg.data, "spectral_alignment", None)),
         "signature": _cache_signature(samples_by_split),
     }
     key_raw = json.dumps(key_payload, sort_keys=True)
@@ -974,12 +1253,17 @@ def _prepare_none_mode_cache(
             mean_=reducer.scaler.mean_.astype(np.float32),
             scale_=reducer.scaler.scale_.astype(np.float32),
         )
+    elif getattr(reducer, "_none_identity", False):
+        np.savez(stats_path, none_identity=np.array(True, dtype=np.bool_))
 
     def _process_one(sample: SampleItem) -> str:
         cube = np.load(sample.hsi_path).astype(np.float32)
         h, w, c = cube.shape
         flat = cube.reshape(-1, c)
-        norm_flat = reducer._prepare_features(flat, fit=False)
+        if getattr(reducer, "_none_identity", False):
+            norm_flat = flat
+        else:
+            norm_flat = reducer._prepare_features(flat, fit=False)
         out_path = norm_dir / f"{sample.sample_id}.npy"
         np.save(out_path, norm_flat.reshape(h, w, c).astype(np.float32))
         return str(out_path)
@@ -1054,6 +1338,17 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
     tprint(f"discovered samples:\n"
            f"\ttotal={len(all_samples)}, unique_patients={unique_patients}")
 
+    alignment_meta: Dict[str, Any] = ensure_spectral_alignment_on_disk(
+        cfg, all_samples, show_progress=show_progress
+    )
+    if not alignment_meta.get("skipped", True):
+        tprint(
+            "spectral alignment (on-disk diff [+ SNV]):\n"
+            f"\tcache_hit={alignment_meta.get('cache_hit', False)}, "
+            f"hsi_written={alignment_meta.get('num_hsi_written', 0)}, "
+            f"rgb_written={alignment_meta.get('num_rgb_written', 0)}"
+        )
+
     samples_by_split = _split_subjects(all_samples, cfg)
     tprint(
         "subject split:\n"
@@ -1077,12 +1372,14 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
     train_precious_repeat = max(1, int(getattr(sampling_cfg, "train_precious_repeat", 1)))
     precious_class = int(getattr(sampling_cfg, "precious_class", 1))
 
+    spectral_alignment_cfg = _config_section_plain(getattr(cfg.data, "spectral_alignment", None))
     reducer = SpectralReducer(
         mode=str(cfg.data.preprocess.mode),
         output_dim=int(cfg.data.preprocess.output_dim),
         max_fit_pixels=int(cfg.data.preprocess.max_fit_pixels),
         seed=seed,
         preprocess_cfg=dict(cfg.data.preprocess),
+        spectral_alignment_cfg=spectral_alignment_cfg,
     )
     if modality == "hsi":
         tprint(
@@ -1178,6 +1475,7 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
             "num_classes": num_classes,
             "cached_hsi_paths": cached_hsi_paths,
             "none_cache_meta": none_cache_meta,
+            "spectral_alignment": alignment_meta,
         },
     )
 

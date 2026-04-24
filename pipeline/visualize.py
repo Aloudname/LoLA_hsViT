@@ -12,15 +12,32 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
 from pipeline.analyzer import MetricsBundle
+from pipeline.stats_utils import format_anonymous_patient_id
 
 
 class Visualizer:
     """figure writer for metrics, features, and segmentation outputs."""
 
-    def __init__(self, output_dir: str, class_names: Sequence[str]) -> None:
+    def __init__(
+        self,
+        output_dir: str,
+        class_names: Sequence[str],
+        anonymize_patients: bool = False,
+    ) -> None:
         self.output_dir = Path(output_dir)
         self.class_names = list(class_names)
+        self.anonymize_patients = bool(anonymize_patients)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _patient_display_id(
+        self,
+        raw_patient_id: str,
+        patient_anon_order: Optional[Sequence[str]],
+    ) -> str:
+        """P### when anonymize_patients and patient_anon_order is provided."""
+        if not self.anonymize_patients or patient_anon_order is None:
+            return str(raw_patient_id)
+        return format_anonymous_patient_id(str(raw_patient_id), patient_anon_order)
 
     def plot_training_curves(self, history: Mapping[str, Sequence[float]]) -> None:
         """plot train/eval loss and metric curves."""
@@ -577,6 +594,7 @@ class Visualizer:
         patient_ids: Sequence[str],
         selected_patients: Sequence[str],
         title: str = "patient spectral domain shift",
+        patient_anon_order: Optional[Sequence[str]] = None,
     ) -> None:
         """Plot per-class cross-patient shift with 90% clouds, raw vs norm (3x2)."""
         raw_pts = np.asarray(raw_points_2d, dtype=np.float32)
@@ -651,7 +669,11 @@ class Visualizer:
                     ax.text(0.5, 0.5, "insufficient points", transform=ax.transAxes, ha="center", va="center")
 
         legend_handles = [
-            Patch(facecolor=color_map[pid], edgecolor="none", label=str(pid))
+            Patch(
+                facecolor=color_map[pid],
+                edgecolor="none",
+                label=self._patient_display_id(str(pid), patient_anon_order),
+            )
             for pid in selected_patients
             if pid in color_map
         ]
@@ -748,6 +770,7 @@ class Visualizer:
         patient_ids: Sequence[str],
         selected_patients: Sequence[str],
         title: str = "cross-patient divergence heatmaps",
+        patient_anon_order: Optional[Sequence[str]] = None,
     ) -> None:
         x = np.asarray(features_hd, dtype=np.float64)
         y = np.asarray(labels, dtype=np.int64)
@@ -824,8 +847,9 @@ class Visualizer:
                 im = ax.imshow(mat, cmap=cmap, vmin=0.0, vmax=max(vmax, 1e-8))
                 ax.set_title(f"{cls_name} - {name}")
                 ax.set_xticks(np.arange(n_pat)); ax.set_yticks(np.arange(n_pat))
-                ax.set_xticklabels(selected_patients, rotation=45, ha="right", fontsize=7)
-                ax.set_yticklabels(selected_patients, fontsize=7)
+                xlabs = [self._patient_display_id(str(p), patient_anon_order) for p in selected_patients]
+                ax.set_xticklabels(xlabs, rotation=45, ha="right", fontsize=7)
+                ax.set_yticklabels(xlabs, fontsize=7)
                 fig.colorbar(im, ax=ax, shrink=0.8, pad=0.02)
         fig.suptitle(title, fontsize=12, y=0.995)
         fig.tight_layout(rect=(0.0, 0.03, 1.0, 0.98))
@@ -875,6 +899,7 @@ class Visualizer:
         band_stats_by_class: Mapping[str, Mapping[str, Mapping[str, np.ndarray]]],
         patient_order: Sequence[str],
         title: str = "patient-wise band shift",
+        patient_anon_order: Optional[Sequence[str]] = None,
     ) -> None:
         """
         For each foreground class, plot per-patient (band, mean) scatter+line with +/-2sigma range.
@@ -922,7 +947,11 @@ class Visualizer:
             ax.grid(alpha=0.25)
 
         legend_handles = [
-            Patch(facecolor=colors[pid], edgecolor="none", label=str(pid))
+            Patch(
+                facecolor=colors[pid],
+                edgecolor="none",
+                label=self._patient_display_id(str(pid), patient_anon_order),
+            )
             for pid in patient_order
             if pid in colors
         ]
@@ -941,12 +970,123 @@ class Visualizer:
         fig.tight_layout(rect=(0.0, 0.07, 1.0, 0.97))
         self._save_fig(fig, "data/patient_wise_band_shift.png")
 
+    def plot_patient_wise_band_diff_shift(
+        self,
+        band_stats_by_class: Mapping[str, Mapping[str, Mapping[str, np.ndarray]]],
+        patient_order: Sequence[str],
+        title: str = "patient-wise Stage A band statistics",
+        patient_anon_order: Optional[Sequence[str]] = None,
+    ) -> None:
+        """Mean ±2σ per band on on-disk Stage A (diff [+ SNV]) cubes."""
+        if not band_stats_by_class:
+            return
+        class_keys = [name for name in self.class_names[1:] if name in band_stats_by_class]
+        if not class_keys:
+            class_keys = list(band_stats_by_class.keys())
+        if not class_keys:
+            return
+
+        fig, axes = plt.subplots(1, len(class_keys), figsize=(6.0 * len(class_keys), 4.7))
+        if len(class_keys) == 1:
+            axes = [axes]
+        cmap = plt.get_cmap("tab10")
+        colors = {pid: cmap(i % 10) for i, pid in enumerate(patient_order)}
+
+        for ax, cls_name in zip(axes, class_keys):
+            cls_stats = band_stats_by_class.get(cls_name, {})
+            if not cls_stats:
+                ax.text(0.5, 0.5, "insufficient data", transform=ax.transAxes, ha="center", va="center")
+                ax.axis("off")
+                continue
+            for pid in patient_order:
+                rows = cls_stats.get(pid, None)
+                if rows is None:
+                    continue
+                mean = np.asarray(rows.get("mean", []), dtype=np.float32)
+                std = np.asarray(rows.get("std", []), dtype=np.float32)
+                if mean.size == 0 or std.size != mean.size:
+                    continue
+                x = np.arange(mean.size, dtype=np.int32)
+                c = colors[pid]
+                ax.scatter(x, mean, s=9, color=c, alpha=0.75)
+                ax.plot(x, mean, linestyle="--", linewidth=1.1, color=c, alpha=0.9)
+                low = mean - 2.0 * std
+                high = mean + 2.0 * std
+                ax.fill_between(x, low, high, color=c, alpha=0.10)
+            ax.set_title(cls_name)
+            ax.set_xlabel("band index (Stage A)")
+            ax.set_ylabel("mean response")
+            ax.grid(alpha=0.25)
+
+        legend_handles = [
+            Patch(
+                facecolor=colors[pid],
+                edgecolor="none",
+                label=self._patient_display_id(str(pid), patient_anon_order),
+            )
+            for pid in patient_order
+            if pid in colors
+        ]
+        if legend_handles:
+            fig.legend(
+                handles=legend_handles,
+                loc="lower center",
+                bbox_to_anchor=(0.5, -0.02),
+                ncol=min(8, len(legend_handles)),
+                frameon=False,
+                fontsize=8.5,
+                title="patient",
+                title_fontsize=9,
+            )
+        fig.suptitle(title, fontsize=12, y=0.995)
+        fig.tight_layout(rect=(0.0, 0.07, 1.0, 0.97))
+        self._save_fig(fig, "data/patient_wise_band_diff_shift.png")
+
+    def plot_band_diff_similarity_summary(
+        self,
+        similarity_matrix: np.ndarray,
+        patient_labels: Sequence[str],
+        title: str = "Stage A mean-spectrum similarity",
+        patient_anon_order: Optional[Sequence[str]] = None,
+        rel_path: str = "data/patient_band_diff_similarity.png",
+    ) -> None:
+        """Heatmap of pairwise cosine similarity and marginal histogram."""
+        mat = np.asarray(similarity_matrix, dtype=np.float64)
+        if mat.ndim != 2 or mat.shape[0] < 2 or mat.shape[0] != mat.shape[1]:
+            return
+        n = mat.shape[0]
+        labels = [self._patient_display_id(str(patient_labels[i]), patient_anon_order) for i in range(n)]
+
+        fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.8))
+        ax0, ax1 = axes[0], axes[1]
+        im = ax0.imshow(mat, cmap="RdYlGn", vmin=-1.0, vmax=1.0, aspect="auto")
+        ax0.set_xticks(np.arange(n))
+        ax0.set_yticks(np.arange(n))
+        ax0.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+        ax0.set_yticklabels(labels, fontsize=7)
+        ax0.set_title("cosine similarity (mean spectra)")
+        fig.colorbar(im, ax=ax0, shrink=0.85, pad=0.02)
+        triu = mat[np.triu_indices(n, k=1)]
+        triu = triu[np.isfinite(triu)]
+        if triu.size > 0:
+            ax1.hist(triu, bins=30, color="#4e79a7", alpha=0.85, edgecolor="white")
+            ax1.axvline(float(np.mean(triu)), color="#e15759", linestyle="--", label=f"mean={np.mean(triu):.3f}")
+            ax1.legend(frameon=False, fontsize=8)
+        ax1.set_xlabel("pairwise cosine")
+        ax1.set_ylabel("count")
+        ax1.set_title("upper-triangle distribution")
+        ax1.grid(alpha=0.25)
+        fig.suptitle(title, fontsize=12, y=1.02)
+        fig.tight_layout()
+        self._save_fig(fig, rel_path)
+
     def plot_patient_clustering(
         self,
         embedding_2d: np.ndarray,
         patient_ids: Sequence[str],
         cluster_ids: Sequence[int],
         title: str = "patient clustering",
+        patient_anon_order: Optional[Sequence[str]] = None,
     ) -> None:
         """Plot patient-level clustering scatter."""
         z = np.asarray(embedding_2d, dtype=np.float32)
@@ -967,7 +1107,8 @@ class Visualizer:
             color = cmap(cid % 10)
             ax.scatter(z[idx, 0], z[idx, 1], s=64, color=color, alpha=0.85, label=f"cluster {cid}", edgecolors="black", linewidths=0.4)
             for i in idx.tolist():
-                ax.annotate(pids[i], (z[i, 0], z[i, 1]), xytext=(4, 4), textcoords="offset points", fontsize=8)
+                lbl = self._patient_display_id(pids[i], patient_anon_order)
+                ax.annotate(lbl, (z[i, 0], z[i, 1]), xytext=(4, 4), textcoords="offset points", fontsize=8)
         ax.set_title(title)
         ax.set_xlabel("PC1")
         ax.set_ylabel("PC2")

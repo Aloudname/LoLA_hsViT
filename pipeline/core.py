@@ -24,6 +24,7 @@ from model import HSIAdapter, RGBViT, UNet
 from pipeline.dataset import build_dataloaders
 from pipeline.trainer import Trainer, TrainerResult
 from pipeline.analyzer import Analyzer, MetricsBundle
+from pipeline.stats_utils import bootstrap_cosine_similarity_summary, format_anonymous_patient_id, pairwise_cosine_matrix
 
 @dataclass
 class PipelineResult:
@@ -61,7 +62,11 @@ class Pipeline:
             ignore_index=None,
             small_target_class=1,
         )
-        self.visualizer = Visualizer(str(self.output_dir), class_names=list(self.config.data.class_names))
+        self.visualizer = Visualizer(
+            str(self.output_dir),
+            class_names=list(self.config.data.class_names),
+            anonymize_patients=bool(getattr(self.config.visualization, "anonymize_patients", False)),
+        )
 
     def run(self) -> PipelineResult:
         """execute full training/eval/test workflow."""
@@ -293,6 +298,9 @@ class Pipeline:
         stats_for_json = copy.deepcopy(prepared.stats)
 
         if prepared.modality == "hsi":
+            global_patient_ids_sorted = sorted(
+                {str(s.patient_id) for split in prepared.samples_by_split.values() for s in split}
+            )
             tprint("visualization: spectral reducer comparison")
             reducer_payload = self._collect_reducer_points(
                 prepared=prepared,
@@ -330,6 +338,7 @@ class Pipeline:
                     patient_ids=point_patient_ids,
                     selected_patients=selected_patients,
                     title=f"{self.model_key} patient spectral shift",
+                    patient_anon_order=global_patient_ids_sorted,
                 )
                 self.visualizer.plot_patient_distance_distribution(
                     features_hd=norm_features_hd,
@@ -344,6 +353,7 @@ class Pipeline:
                     patient_ids=point_patient_ids,
                     selected_patients=selected_patients,
                     title=f"{self.model_key} patient MMD/Bhattacharyya",
+                    patient_anon_order=global_patient_ids_sorted,
                 )
                 shift_stats = self._compute_patient_shift_stats(
                     raw_features_hd=raw_features_hd,
@@ -368,6 +378,7 @@ class Pipeline:
                         band_stats_by_class=band_stats_viz,
                         patient_order=viz_patient_ids,
                         title=f"{self.model_key} patient-wise band shift",
+                        patient_anon_order=global_patient_ids_sorted,
                     )
                     band_data_path = data_dir / "patient_wise_band_shift_data.npz"
                     self._save_patient_band_shift_npz(
@@ -390,11 +401,79 @@ class Pipeline:
                             patient_ids=cluster_payload["patient_ids"],
                             cluster_ids=cluster_payload["cluster_ids"],
                             title=f"{self.model_key} patient clustering",
+                            patient_anon_order=global_patient_ids_sorted,
                         )
                 stats_for_json["patient_shift_analysis"] = shift_stats
 
+            sa_m = getattr(self.config.data, "spectral_alignment", Munch())
+            if bool(getattr(sa_m, "enabled", False)):
+                tprint("visualization: Stage A (on-disk diff [+ SNV]) band curves and similarity")
+                tgt = int(getattr(sa_m, "viz_random_patients", 16))
+                diff_payload = self._collect_patient_band_diff_shift(prepared=prepared, target_patients=tgt)
+                if diff_payload is not None:
+                    band_diff_all, all_diff_patient_ids, band_diff_viz, viz_diff_patient_ids = diff_payload
+                    self.visualizer.plot_patient_wise_band_diff_shift(
+                        band_stats_by_class=band_diff_viz,
+                        patient_order=viz_diff_patient_ids,
+                        title=f"{self.model_key} Stage A patient-wise band statistics",
+                        patient_anon_order=global_patient_ids_sorted,
+                    )
+                    diff_npz = data_dir / "patient_wise_band_diff_shift_data.npz"
+                    self._save_patient_band_diff_shift_npz(
+                        path=diff_npz,
+                        band_stats_all=band_diff_all,
+                        all_patient_ids=all_diff_patient_ids,
+                    )
+                    mean_arr = np.asarray(band_diff_all["mean"], dtype=np.float64)
+                    pid_to_idx = {p: i for i, p in enumerate(all_diff_patient_ids)}
+                    plabs = [p for p in viz_diff_patient_ids if p in pid_to_idx]
+                    n_boot = int(getattr(sa_m, "similarity_bootstrap_iters", 2000))
+                    seed_sim = int(self.config.data.split.seed) + int(getattr(sa_m, "similarity_random_seed", 137))
+                    sim_json: Dict[str, Any] = {"classes": {}, "n_bootstrap": n_boot}
+                    if len(plabs) < 2:
+                        sim_json["note"] = "insufficient viz patients for pairwise Stage A similarity"
+                    else:
+                        for ci, cname in enumerate(band_diff_all["class_names"]):
+                            curves = np.stack([mean_arr[ci, pid_to_idx[p], :] for p in plabs], axis=0)
+                            sim_mat = pairwise_cosine_matrix(curves)
+                            safe_name = "".join(
+                                ch if ch.isalnum() or ch in "-_" else "_" for ch in str(cname)
+                            )
+                            self.visualizer.plot_band_diff_similarity_summary(
+                                similarity_matrix=sim_mat,
+                                patient_labels=plabs,
+                                title=f"{self.model_key} Stage A cosine similarity ({cname})",
+                                patient_anon_order=global_patient_ids_sorted,
+                                rel_path=f"data/patient_band_diff_similarity_{safe_name}.png",
+                            )
+                            boot = bootstrap_cosine_similarity_summary(
+                                curves,
+                                n_bootstrap=n_boot,
+                                seed=seed_sim + ci,
+                                patient_labels=plabs,
+                            )
+                            if bool(getattr(self.config.visualization, "anonymize_patients", False)):
+                                for row in boot.get("pairwise", []):
+                                    pi = row.get("patient_id_i")
+                                    pj = row.get("patient_id_j")
+                                    if isinstance(pi, str) and isinstance(pj, str):
+                                        row["patient_display_i"] = format_anonymous_patient_id(
+                                            pi, global_patient_ids_sorted
+                                        )
+                                        row["patient_display_j"] = format_anonymous_patient_id(
+                                            pj, global_patient_ids_sorted
+                                        )
+                            sim_json["classes"][str(cname)] = boot
+                    with (data_dir / "patient_band_diff_similarity.json").open("w", encoding="utf-8") as f:
+                        json.dump(sim_json, f, indent=2, ensure_ascii=False, default=str)
+
         # keep runtime JSON compact and remove huge cache path mapping
         stats_for_json.pop("cached_hsi_paths", None)
+        _sam = stats_for_json.get("spectral_alignment")
+        if isinstance(_sam, dict) and "per_sample" in _sam:
+            _sam = dict(_sam)
+            _sam.pop("per_sample", None)
+            stats_for_json["spectral_alignment"] = _sam
         with (data_dir / "sampling_stats.json").open("w", encoding="utf-8") as f:
             json.dump(stats_for_json, f, indent=2, ensure_ascii=False)
 
@@ -1036,6 +1115,147 @@ class Pipeline:
             "count": count_arr,                      # [C, P]
         }
         return band_stats_all, patient_pool, band_stats_by_class_viz, selected_patients_viz
+
+    def _collect_patient_band_diff_shift(
+        self,
+        prepared: Any,
+        target_patients: int = 16,
+    ) -> Optional[Tuple[Dict[str, Any], List[str], Dict[str, Dict[str, Dict[str, np.ndarray]]], List[str]]]:
+        """
+        Per-patient band mean/median/std on **on-disk** cubes (Stage A: diff [+ SNV]).
+        Same layout as _collect_patient_band_shift; uses a different RNG stream for viz subset.
+        """
+        all_samples: List[Any] = []
+        for split_name in ("train", "eval", "test"):
+            all_samples.extend(list(prepared.samples_by_split.get(split_name, [])))
+        if not all_samples:
+            return None
+
+        by_patient: Dict[str, List[Any]] = {}
+        for sample in all_samples:
+            by_patient.setdefault(str(sample.patient_id), []).append(sample)
+        patient_pool = sorted(by_patient.keys())
+        if not patient_pool:
+            return None
+
+        rng = np.random.default_rng(int(self.config.data.split.seed) + 139)
+        target_patients = int(np.clip(target_patients, 7, 16))
+        if len(patient_pool) > target_patients:
+            chosen_idx = rng.choice(len(patient_pool), size=target_patients, replace=False)
+            selected_patients_viz = [patient_pool[int(i)] for i in sorted(chosen_idx)]
+        else:
+            selected_patients_viz = patient_pool
+
+        num_classes = int(self.config.data.num_classes)
+        class_names = [
+            self.config.data.class_names[i] if i < len(self.config.data.class_names) else str(i)
+            for i in range(num_classes)
+        ]
+        fg_class_names = [class_names[i] for i in range(1, num_classes)]
+        n_cls = len(fg_class_names)
+        n_pat = len(patient_pool)
+        mean_arr: List[np.ndarray] = []
+        median_arr: List[np.ndarray] = []
+        std_arr: List[np.ndarray] = []
+        count_arr = np.zeros((n_cls, n_pat), dtype=np.int32)
+        band_stats_by_class_viz: Dict[str, Dict[str, Dict[str, np.ndarray]]] = {}
+        n_bands = None
+        for cls_idx in range(1, num_classes):
+            cls_name = class_names[cls_idx]
+            by_patient_stats: Dict[str, Dict[str, np.ndarray]] = {}
+            cls_means: List[np.ndarray] = []
+            cls_medians: List[np.ndarray] = []
+            cls_stds: List[np.ndarray] = []
+            for pid_idx, pid in enumerate(patient_pool):
+                rows: List[np.ndarray] = []
+                for sample in by_patient.get(pid, []):
+                    cube = np.load(sample.hsi_path).astype(np.float32)
+                    mask = np.load(sample.mask_path).astype(np.int64)
+                    if cube.ndim != 3 or mask.ndim != 2:
+                        continue
+                    if cube.shape[:2] == mask.shape:
+                        cube_hwc = cube
+                    elif cube.shape[1:] == mask.shape:
+                        cube_hwc = np.moveaxis(cube, 0, -1)
+                    else:
+                        continue
+                    m = mask == cls_idx
+                    if not np.any(m):
+                        continue
+                    rows.append(cube_hwc[m])
+                if not rows:
+                    if n_bands is None:
+                        cls_means.append(np.array([], dtype=np.float32))
+                        cls_medians.append(np.array([], dtype=np.float32))
+                        cls_stds.append(np.array([], dtype=np.float32))
+                    else:
+                        cls_means.append(np.full((n_bands,), np.nan, dtype=np.float32))
+                        cls_medians.append(np.full((n_bands,), np.nan, dtype=np.float32))
+                        cls_stds.append(np.full((n_bands,), np.nan, dtype=np.float32))
+                    continue
+                arr = np.concatenate(rows, axis=0).astype(np.float32)
+                if n_bands is None:
+                    n_bands = int(arr.shape[1])
+                mean_v = arr.mean(axis=0)
+                med_v = np.median(arr, axis=0)
+                std_v = arr.std(axis=0)
+                count_arr[cls_idx - 1, pid_idx] = int(arr.shape[0])
+                cls_means.append(mean_v)
+                cls_medians.append(med_v)
+                cls_stds.append(std_v)
+                by_patient_stats[pid] = {"mean": mean_v, "median": med_v, "std": std_v}
+            if n_bands is None:
+                return None
+            for i in range(len(cls_means)):
+                if cls_means[i].size == 0:
+                    cls_means[i] = np.full((n_bands,), np.nan, dtype=np.float32)
+                    cls_medians[i] = np.full((n_bands,), np.nan, dtype=np.float32)
+                    cls_stds[i] = np.full((n_bands,), np.nan, dtype=np.float32)
+            mean_arr.append(np.stack(cls_means, axis=0))
+            median_arr.append(np.stack(cls_medians, axis=0))
+            std_arr.append(np.stack(cls_stds, axis=0))
+            band_stats_by_class_viz[cls_name] = {
+                pid: by_patient_stats[pid] for pid in selected_patients_viz if pid in by_patient_stats
+            }
+
+        if not mean_arr:
+            return None
+        band_stats_all = {
+            "class_names": fg_class_names,
+            "mean": np.stack(mean_arr, axis=0),
+            "median": np.stack(median_arr, axis=0),
+            "std": np.stack(std_arr, axis=0),
+            "count": count_arr,
+        }
+        return band_stats_all, patient_pool, band_stats_by_class_viz, selected_patients_viz
+
+    def _save_patient_band_diff_shift_npz(
+        self,
+        path: Path,
+        band_stats_all: Mapping[str, Any],
+        all_patient_ids: Sequence[str],
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            str(path),
+            class_names=np.asarray(band_stats_all["class_names"], dtype="U32"),
+            patient_ids=np.asarray(list(all_patient_ids), dtype="U64"),
+            mean=np.asarray(band_stats_all["mean"], dtype=np.float32),
+            median=np.asarray(band_stats_all["median"], dtype=np.float32),
+            std=np.asarray(band_stats_all["std"], dtype=np.float32),
+            count=np.asarray(band_stats_all["count"], dtype=np.int32),
+        )
+
+    def _load_patient_band_diff_shift_npz(self, path: Path) -> Dict[str, Any]:
+        with np.load(str(path), allow_pickle=False) as f:
+            return {
+                "class_names": [str(v) for v in f["class_names"].tolist()],
+                "patient_ids": [str(v) for v in f["patient_ids"].tolist()],
+                "mean": np.asarray(f["mean"], dtype=np.float64),
+                "median": np.asarray(f["median"], dtype=np.float64),
+                "std": np.asarray(f["std"], dtype=np.float64),
+                "count": np.asarray(f["count"], dtype=np.int64),
+            }
 
     def _export_onnx(self, trainer: Trainer, in_channels: int) -> Optional[str]:
         """export best model to onnx."""
