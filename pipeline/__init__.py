@@ -2,7 +2,7 @@ from pipeline.analyzer import Analyzer, MetricsBundle
 from pipeline.core import Pipeline, PipelineResult
 from pipeline.dataset import (RGBDataset, NpyHSIDataset,
                             generate_synthetic_dataset,
-                            build_dataloaders, prepare_data)
+                            build_dataloaders, prepare_data, build_diffed_dataset)
 from pipeline.monitor import (monitor, tprint)
 from pipeline.monitor import (monitor, tprint)
 from pipeline.trainer import Trainer, TrainerResult
@@ -19,6 +19,7 @@ __all__ = [
     "RGBDataset",
     "build_dataloaders",
     "prepare_data",
+    "build_diffed_dataset",
     "generate_synthetic_dataset",
     
     "Trainer",

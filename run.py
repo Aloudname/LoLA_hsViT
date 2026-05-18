@@ -10,7 +10,7 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 
 import io, sys, copy, json, argparse
 
-from pipeline import Pipeline, generate_synthetic_dataset
+from pipeline import Pipeline, build_diffed_dataset, generate_synthetic_dataset
 from config import load_config, _to_munch, merge_args, tprint
 
 
@@ -58,9 +58,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--models", '-m', nargs="+", default=None, help=f"models to run: {', '.join(VALID_MODELS)}")
     parser.add_argument("--epochs", '-e', type=int, default=None, help="override train.epochs")
     parser.add_argument("--output-dir", '-o', type=str, default=None, help="override path.output_dir")
-    parser.add_argument("--seed", '-s', type=int, default=None, help="override runtime and split seed")
+    parser.add_argument("--seed", type=int, default=None, help="override runtime and split seed")
+    parser.add_argument("--analysis", "-a", action="store_true", help="run dataset analysis-only workflow (no training)")
+    parser.add_argument("--debias", "-d", action="store_true", help="build debiased_dir by zscore+GS+diff from raw data, then exit")
 
-    parser.add_argument("--set", action="append", default=[], help="extra override as key=value, supports dotted key")
+    parser.add_argument("--set", '-s', action="append", default=[], help="extra override as key=value, supports dotted key")
 
     # for short debugging
     parser.add_argument("--generate-synthetic", '-gg', action="store_true", help="generate synthetic fisher/rgb dataset before run")
@@ -164,9 +166,26 @@ def _run(run_log_path, output_root, args, config):
 
     if args.generate_synthetic:
         _fake_data(config, args)
+    if args.debias:
+        tprint("run mode: debias (-d)")
+        meta = build_diffed_dataset(config)
+        tprint(
+            "debias done:\n"
+            f"\tsource_hsi={meta.get('source_hsi_dir')}\n"
+            f"\ttarget_diffed={meta.get('diffed_dir')}\n"
+            f"\thsi_written={meta.get('num_hsi_written', 0)}, labels_copied={meta.get('num_labels_copied', 0)}"
+        )
+        output_root.mkdir(parents=True, exist_ok=True)
+        summary_path = output_root / "run_summary.json"
+        with summary_path.open("w", encoding="utf-8") as f:
+            json.dump([{"mode": "debias", "meta": meta}], f, indent=2, ensure_ascii=False)
+        tprint(f"all done, summary saved to: {summary_path}")
+        return
         
     # none: read config.
     models = args.models or list(config.experiments.default_models)
+    if args.analysis:
+        models = ["hsi"]
     tag_key = args.tag or str(config.data.preprocess.mode)
     for m in models:
         if m not in VALID_MODELS:
@@ -174,6 +193,7 @@ def _run(run_log_path, output_root, args, config):
 
     summary: List[Dict[str, Any]] = []
     tprint(f"run queue: {models}")
+    analysis_stamp = datetime.now().strftime("%Y%m%d_%H%M%S") if args.analysis else None
 
     for idx, model_key in enumerate(models, start=1):
         tprint(f"[{idx}/{len(models)}] start model: {model_key}")
@@ -187,7 +207,13 @@ def _run(run_log_path, output_root, args, config):
             f"\tpreprocess={run_cfg.data.preprocess.mode}\n"
             f"\tpretrained_weights={bool(run_cfg.model.get('pretrained_weights', True))}\n"
         )
-        pipeline = Pipeline(run_cfg, model_key=model_key)
+        exp_name = f"analysis_{analysis_stamp}" if args.analysis else None
+        pipeline = Pipeline(run_cfg, model_key=model_key, experiment_name=exp_name)
+        if args.analysis:
+            result = pipeline.run_analysis()
+            summary.append(result)
+            tprint(f"[{idx}/{len(models)}] done analysis: {model_key}")
+            continue
         result = pipeline.run()
 
         summary.append(

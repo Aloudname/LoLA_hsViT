@@ -85,7 +85,13 @@ class Analyzer:
             "precision_mean": float(np.mean(precision[fg_range] if fg_range else precision)),
             "recall_mean": float(np.mean(recall[fg_range] if fg_range else recall)),
             "f1_mean": float(np.mean(f1[fg_range] if fg_range else f1)),
+            "pg_precision": float(precision[self.small_target_class])
+            if 0 <= self.small_target_class < self.num_classes
+            else 0.0,
             "small_target_recall": float(recall[self.small_target_class])
+            if 0 <= self.small_target_class < self.num_classes
+            else 0.0,
+            "pg_f1": float(f1[self.small_target_class])
             if 0 <= self.small_target_class < self.num_classes
             else 0.0,
         }
@@ -128,7 +134,9 @@ class Analyzer:
             f"  precision_mean: {s['precision_mean']:.4f}",
             f"  recall_mean: {s['recall_mean']:.4f}",
             f"  f1_mean: {s['f1_mean']:.4f}",
+            f"  pg_precision: {s['pg_precision']:.4f}",
             f"  small_target_recall: {s['small_target_recall']:.4f}",
+            f"  pg_f1: {s['pg_f1']:.4f}",
         ]
         return "\n".join(lines)
 

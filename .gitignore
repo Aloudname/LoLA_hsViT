@@ -12,6 +12,7 @@ pretrained/
 docs/
 
 # test file
+diff.ipynb
 test.ipynb
 
 # pretrained

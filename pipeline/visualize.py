@@ -341,6 +341,14 @@ class Visualizer:
         pca_features = pca_features[non_bg]
         lda_features = lda_features[non_bg]
         labels = labels[non_bg]
+        pca_features, lda_features, labels = self._filter_projection_outliers(
+            pca_features,
+            lda_features,
+            labels,
+            mad_z_thresh=6.0,
+        )
+        if labels.shape[0] < 10:
+            return
         active_classes = sorted(np.unique(labels).tolist())
         class_names = [self.class_names[idx] if idx < len(self.class_names) else f"class_{idx}" for idx in active_classes]
         cls_to_local = {cls_idx: i for i, cls_idx in enumerate(active_classes)}
@@ -560,6 +568,46 @@ class Visualizer:
         fig.tight_layout(rect=(0.0, 0.04, 1.0, 0.96))
         self._save_fig(fig, f"features/{title.lower().replace(' ', '_')}.png")
 
+    def _filter_projection_outliers(
+        self,
+        pca_features: np.ndarray,
+        lda_features: np.ndarray,
+        labels: np.ndarray,
+        mad_z_thresh: float = 6.0,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Remove extreme outliers before plotting projections.
+        Uses robust z-score (median/MAD) in each feature space and keeps intersection.
+        """
+        pca_features = np.asarray(pca_features, dtype=np.float32)
+        lda_features = np.asarray(lda_features, dtype=np.float32)
+        labels = np.asarray(labels, dtype=np.int64)
+        if pca_features.shape[0] == 0 or lda_features.shape[0] == 0:
+            return pca_features, lda_features, labels
+
+        n = min(pca_features.shape[0], lda_features.shape[0], labels.shape[0])
+        pca_features = pca_features[:n]
+        lda_features = lda_features[:n]
+        labels = labels[:n]
+        if n < 20:
+            return pca_features, lda_features, labels
+
+        def _robust_keep_mask(x: np.ndarray) -> np.ndarray:
+            if x.ndim != 2 or x.shape[0] == 0:
+                return np.zeros((x.shape[0],), dtype=bool)
+            med = np.median(x, axis=0)
+            mad = np.median(np.abs(x - med), axis=0)
+            scale = np.maximum(mad * 1.4826, 1e-6)
+            rz = np.abs((x - med) / scale)
+            max_rz = np.max(rz, axis=1)
+            return max_rz <= float(mad_z_thresh)
+
+        keep = _robust_keep_mask(pca_features) & _robust_keep_mask(lda_features)
+        # Keep all points if threshold is too strict for small datasets.
+        if np.count_nonzero(keep) < max(10, int(0.35 * n)):
+            return pca_features, lda_features, labels
+        return pca_features[keep], lda_features[keep], labels[keep]
+
     def _select_best_2d_by_fisher(self, points: np.ndarray, labels: np.ndarray) -> np.ndarray:
         points = np.asarray(points, dtype=np.float32)
         labels = np.asarray(labels, dtype=np.int64)
@@ -596,7 +644,7 @@ class Visualizer:
         title: str = "patient spectral domain shift",
         patient_anon_order: Optional[Sequence[str]] = None,
     ) -> None:
-        """Plot per-class cross-patient shift with 90% clouds, raw vs norm (3x2)."""
+        """Plot per-class cross-patient shift with 90% clouds, before vs after (3x2)."""
         raw_pts = np.asarray(raw_points_2d, dtype=np.float32)
         norm_pts = np.asarray(norm_points_2d, dtype=np.float32)
         y = np.asarray(labels, dtype=np.int64)
@@ -626,7 +674,7 @@ class Visualizer:
             cls_name = self.class_names[cls_idx] if cls_idx < len(self.class_names) else f"class_{cls_idx}"
             for col, pts in enumerate([raw_pts, norm_pts]):
                 ax = axes[row, col]
-                col_name = "raw" if col == 0 else "norm"
+                col_name = "before" if col == 0 else "after"
                 ax.set_title(f"{cls_name} ({col_name})")
                 ax.set_xlabel("proj-dim1")
                 ax.set_ylabel("proj-dim2")
@@ -1079,6 +1127,187 @@ class Visualizer:
         fig.suptitle(title, fontsize=12, y=1.02)
         fig.tight_layout()
         self._save_fig(fig, rel_path)
+
+    def plot_patient_wise_band_shift_before_after(
+        self,
+        before_by_class: Mapping[str, Mapping[str, Mapping[str, np.ndarray]]],
+        after_by_class: Mapping[str, Mapping[str, Mapping[str, np.ndarray]]],
+        patient_order: Sequence[str],
+        title: str = "patient-wise band shift before vs after Stage A",
+        patient_anon_order: Optional[Sequence[str]] = None,
+    ) -> None:
+        """Merged panel: each class has before/after subplots with same patient colors."""
+        class_keys = [name for name in self.class_names[1:] if name in after_by_class or name in before_by_class]
+        if not class_keys or not patient_order:
+            return
+        n_cls = len(class_keys)
+        fig, axes = plt.subplots(n_cls, 2, figsize=(12.0, 4.2 * n_cls), squeeze=False)
+        cmap = plt.get_cmap("tab10")
+        colors = {pid: cmap(i % 10) for i, pid in enumerate(patient_order)}
+        for r, cls_name in enumerate(class_keys):
+            for cidx, (pack, subtitle, xlabel) in enumerate(
+                [
+                    (before_by_class.get(cls_name, {}), "before Stage A (raw backup)", "band index"),
+                    (after_by_class.get(cls_name, {}), "after Stage A", "band index"),
+                ]
+            ):
+                ax = axes[r, cidx]
+                if not pack:
+                    ax.text(0.5, 0.5, "insufficient data", transform=ax.transAxes, ha="center", va="center")
+                    ax.axis("off")
+                    continue
+                for pid in patient_order:
+                    rows = pack.get(pid)
+                    if rows is None:
+                        continue
+                    mean = np.asarray(rows.get("mean", []), dtype=np.float32)
+                    std = np.asarray(rows.get("std", []), dtype=np.float32)
+                    if mean.size == 0 or std.size != mean.size:
+                        continue
+                    x = np.arange(mean.size, dtype=np.int32)
+                    cc = colors[pid]
+                    ax.plot(x, mean, linestyle="--", linewidth=1.0, color=cc, alpha=0.9)
+                    ax.fill_between(x, mean - 2.0 * std, mean + 2.0 * std, color=cc, alpha=0.08)
+                ax.set_title(f"{cls_name} | {subtitle}")
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel("mean response")
+                ax.grid(alpha=0.25)
+        handles = [
+            Patch(facecolor=colors[pid], edgecolor="none", label=self._patient_display_id(str(pid), patient_anon_order))
+            for pid in patient_order
+        ]
+        if handles:
+            fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, -0.01), ncol=min(8, len(handles)), frameon=False, fontsize=8.5, title="patient", title_fontsize=9)
+        fig.suptitle(title, fontsize=12, y=0.995)
+        fig.tight_layout(rect=(0.0, 0.06, 1.0, 0.97))
+        self._save_fig(fig, "data/patient_wise_band_shift_before_after.png")
+
+    def plot_band_similarity_before_after(
+        self,
+        sim_before_by_class: Mapping[str, np.ndarray],
+        sim_after_by_class: Mapping[str, np.ndarray],
+        patient_labels: Sequence[str],
+        title: str = "pairwise cosine before vs after Stage A",
+    ) -> None:
+        """Merged histogram panels for class-wise pairwise cosine distributions."""
+        class_keys = [name for name in self.class_names[1:] if name in sim_after_by_class or name in sim_before_by_class]
+        if not class_keys:
+            class_keys = sorted(set(sim_before_by_class.keys()) | set(sim_after_by_class.keys()))
+        if not class_keys:
+            return
+        fig, axes = plt.subplots(1, len(class_keys), figsize=(5.2 * len(class_keys), 4.4), squeeze=False)
+        for ax, cls_name in zip(axes[0], class_keys):
+            mb = np.asarray(sim_before_by_class.get(cls_name, np.empty((0, 0))), dtype=np.float64)
+            ma = np.asarray(sim_after_by_class.get(cls_name, np.empty((0, 0))), dtype=np.float64)
+            vals_b = mb[np.triu_indices(mb.shape[0], k=1)] if mb.ndim == 2 and mb.shape[0] > 1 else np.empty((0,))
+            vals_a = ma[np.triu_indices(ma.shape[0], k=1)] if ma.ndim == 2 and ma.shape[0] > 1 else np.empty((0,))
+            vals_b = vals_b[np.isfinite(vals_b)]
+            vals_a = vals_a[np.isfinite(vals_a)]
+            if vals_b.size == 0 and vals_a.size == 0:
+                ax.text(0.5, 0.5, "insufficient pairs", transform=ax.transAxes, ha="center", va="center")
+                ax.axis("off")
+                continue
+            bins = np.linspace(0.8, 1.0, 31)
+            if vals_b.size > 0:
+                ax.hist(vals_b, bins=bins, alpha=0.55, color="#4e79a7", label=f"before (mean={np.mean(vals_b):.3f})")
+            if vals_a.size > 0:
+                ax.hist(vals_a, bins=bins, alpha=0.55, color="#e15759", label=f"after (mean={np.mean(vals_a):.3f})")
+            ax.set_title(f"{cls_name}")
+            ax.set_xlabel("pairwise cosine")
+            ax.set_ylabel("count")
+            ax.grid(alpha=0.25)
+            ax.legend(frameon=False, fontsize=8)
+        fig.suptitle(f"{title} (n_patients={len(patient_labels)})", fontsize=12, y=0.995)
+        fig.tight_layout(rect=(0.0, 0.02, 1.0, 0.97))
+        self._save_fig(fig, "data/patient_band_similarity_before_after.png")
+
+    def plot_patient_embedding_before_after(
+        self,
+        embedding_before: np.ndarray,
+        embedding_after: np.ndarray,
+        patient_ids: Sequence[str],
+        title: str = "patient embedding before vs after Stage A",
+        patient_anon_order: Optional[Sequence[str]] = None,
+    ) -> None:
+        """Arrow plot for patient-level movement from before to after embedding."""
+        zb = np.asarray(embedding_before, dtype=np.float32)
+        za = np.asarray(embedding_after, dtype=np.float32)
+        if zb.ndim != 2 or za.ndim != 2 or zb.shape != za.shape or zb.shape[1] != 2 or zb.shape[0] == 0:
+            return
+        if len(patient_ids) != zb.shape[0]:
+            return
+        fig, ax = plt.subplots(1, 1, figsize=(7.6, 6.2))
+        ax.scatter(zb[:, 0], zb[:, 1], c="#4e79a7", s=26, alpha=0.8, label="before")
+        ax.scatter(za[:, 0], za[:, 1], c="#e15759", s=26, alpha=0.8, label="after")
+        for i, pid in enumerate(patient_ids):
+            ax.annotate("", xy=(za[i, 0], za[i, 1]), xytext=(zb[i, 0], zb[i, 1]), arrowprops=dict(arrowstyle="->", color="#7f7f7f", alpha=0.45, lw=0.9))
+            ax.text(za[i, 0], za[i, 1], self._patient_display_id(str(pid), patient_anon_order), fontsize=7, alpha=0.85)
+        ax.set_title(title)
+        ax.set_xlabel("PC1")
+        ax.set_ylabel("PC2")
+        ax.grid(alpha=0.25)
+        ax.legend(frameon=False)
+        fig.tight_layout()
+        self._save_fig(fig, "data/patient_embedding_before_after.png")
+
+    def plot_fourier_before_after(
+        self,
+        spectra_before_by_class: Mapping[str, np.ndarray],
+        spectra_after_by_class: Mapping[str, np.ndarray],
+        patient_labels: Sequence[str],
+        title: str = "Fourier analysis before vs after Stage A",
+    ) -> None:
+        """Compare FFT energy profiles of mean spectra before/after Stage A."""
+        class_keys = [name for name in self.class_names[1:] if name in spectra_before_by_class or name in spectra_after_by_class]
+        if not class_keys:
+            class_keys = sorted(set(spectra_before_by_class.keys()) | set(spectra_after_by_class.keys()))
+        if not class_keys:
+            return
+
+        def _fft_summary(curves: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+            x = np.asarray(curves, dtype=np.float64)
+            n_bands = int(x.shape[1])
+            freqs = np.fft.rfftfreq(n_bands, d=1.0)
+            mags = []
+            for v in x:
+                vv = v - np.mean(v)
+                m = np.abs(np.fft.rfft(vv))
+                if m.size > 0:
+                    m[0] = 0.0
+                mags.append(m)
+            mag = np.asarray(mags, dtype=np.float64)
+            mean_mag = np.nanmean(mag, axis=0)
+            mean_mag = mean_mag / np.maximum(np.nanmax(mean_mag), 1e-12)
+            en = mean_mag**2
+            cume = np.cumsum(en) / np.maximum(np.sum(en), 1e-12)
+            k = int(np.searchsorted(cume, 0.9))
+            k = int(np.clip(k, 1, max(1, len(freqs) - 1)))
+            split = float(freqs[k]) if freqs.size > 0 else 0.0
+            return freqs, mean_mag, split
+
+        fig, axes = plt.subplots(1, len(class_keys), figsize=(5.4 * len(class_keys), 4.4), squeeze=False)
+        for ax, cls_name in zip(axes[0], class_keys):
+            cb = np.asarray(spectra_before_by_class.get(cls_name, np.empty((0, 0))), dtype=np.float64)
+            ca = np.asarray(spectra_after_by_class.get(cls_name, np.empty((0, 0))), dtype=np.float64)
+            if cb.ndim != 2 or ca.ndim != 2 or cb.shape[0] < 2 or ca.shape[0] < 2 or cb.shape[1] < 8 or ca.shape[1] < 8:
+                ax.text(0.5, 0.5, "insufficient spectra", transform=ax.transAxes, ha="center", va="center")
+                ax.axis("off")
+                continue
+            fb, mb, sb = _fft_summary(cb)
+            fa, ma, sa = _fft_summary(ca)
+            ax.plot(fb, mb, color="#4e79a7", linewidth=1.8, label=f"before |FFT| (split={sb:.3f})")
+            ax.plot(fa, ma, color="#e15759", linewidth=1.8, label=f"after |FFT| (split={sa:.3f})")
+            ax.axvline(sb, color="#4e79a7", linestyle="--", linewidth=1.0, alpha=0.8)
+            ax.axvline(sa, color="#e15759", linestyle="--", linewidth=1.0, alpha=0.8)
+            ax.set_title(f"{cls_name} Fourier profile")
+            ax.set_xlabel("normalized frequency")
+            ax.set_ylabel("normalized amplitude")
+            ax.set_ylim(0.0, 1.05)
+            ax.grid(alpha=0.25)
+            ax.legend(frameon=False, fontsize=8)
+        fig.suptitle(f"{title} (n_patients={len(patient_labels)})", fontsize=12, y=0.995)
+        fig.tight_layout(rect=(0.0, 0.02, 1.0, 0.97))
+        self._save_fig(fig, "data/patient_fourier_before_after.png")
 
     def plot_patient_clustering(
         self,

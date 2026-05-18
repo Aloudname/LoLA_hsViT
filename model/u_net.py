@@ -43,27 +43,27 @@ class UNet(nn.Module):
 
     def __init__(self, config: Munch) -> None:
         super().__init__()
-        in_channels = int(config.data.preprocess.get("output_dim")) if config.data.preprocess.get("mode") != "none" else int(config.data.get("hsi_bands"))
-        num_classes = int(config.data.get("num_classes"))
-        base_channels = int(config.model.get("base_channels", 32))
+        self.in_channels = int(config.data.preprocess.get("output_dim")) if config.data.preprocess.get("mode") != "none" else int(config.data.get("hsi_bands"))
+        self.num_classes = int(config.data.get("num_classes"))
+        self.base_channels = int(config.model.get("base_channels", 32))
 
-        self.enc1 = ConvBlock(in_channels, base_channels)
-        self.enc2 = ConvBlock(base_channels, base_channels * 2)
-        self.enc3 = ConvBlock(base_channels * 2, base_channels * 4)
+        self.enc1 = ConvBlock(self.in_channels, self.base_channels)
+        self.enc2 = ConvBlock(self.base_channels, self.base_channels * 2)
+        self.enc3 = ConvBlock(self.base_channels * 2, self.base_channels * 4)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
-        self.bottleneck = ConvBlock(base_channels * 4, base_channels * 8)
+        self.bottleneck = ConvBlock(self.base_channels * 4, self.base_channels * 8)
 
-        self.up3 = nn.ConvTranspose2d(base_channels * 8, base_channels * 4, kernel_size=2, stride=2)
-        self.dec3 = ConvBlock(base_channels * 8, base_channels * 4)
+        self.up3 = nn.ConvTranspose2d(self.base_channels * 8, self.base_channels * 4, kernel_size=2, stride=2)
+        self.dec3 = ConvBlock(self.base_channels * 8, self.base_channels * 4)
 
-        self.up2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2, kernel_size=2, stride=2)
-        self.dec2 = ConvBlock(base_channels * 4, base_channels * 2)
+        self.up2 = nn.ConvTranspose2d(self.base_channels * 4, self.base_channels * 2, kernel_size=2, stride=2)
+        self.dec2 = ConvBlock(self.base_channels * 4, self.base_channels * 2)
 
-        self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=2, stride=2)
-        self.dec1 = ConvBlock(base_channels * 2, base_channels)
+        self.up1 = nn.ConvTranspose2d(self.base_channels * 2, self.base_channels, kernel_size=2, stride=2)
+        self.dec1 = ConvBlock(self.base_channels * 2, self.base_channels)
 
-        self.head = nn.Conv2d(base_channels, num_classes, kernel_size=1)
+        self.head = nn.Conv2d(self.base_channels, self.num_classes, kernel_size=1)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         """extract final decoder feature map before segmentation head."""

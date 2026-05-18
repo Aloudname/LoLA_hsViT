@@ -84,6 +84,12 @@ class CompositeSegLoss(nn.Module):
         self.tversky_alpha = float(_cfg_get(config, "loss.tversky_alpha", 0.3))
         self.tversky_beta = float(_cfg_get(config, "loss.tversky_beta", 0.7))
         self.label_smoothing = float(_cfg_get(config, "loss.label_smoothing", 0.0))
+        self.pg_recall_enabled = bool(_cfg_get(config, "loss.pg_recall.enabled", False))
+        self.pg_class_index = int(_cfg_get(config, "loss.pg_recall.class_index", 1))
+        self.pg_recall_weight = float(_cfg_get(config, "loss.pg_recall.weight", 0.0))
+        self.boundary_enabled = bool(_cfg_get(config, "loss.boundary.enabled", False))
+        self.boundary_width = max(1, int(_cfg_get(config, "loss.boundary.width", 1)))
+        self.boundary_weight = float(_cfg_get(config, "loss.boundary.weight", 0.0))
         self.class_weights = self._build_class_weights()
 
     def _build_class_weights(self) -> torch.Tensor:
@@ -189,6 +195,51 @@ class CompositeSegLoss(nn.Module):
         fg_weights = class_weights[fg_idx]
         return 1.0 - self._masked_class_mean(fg_tversky, fg_mask, fg_weights)
 
+    def _pg_recall_loss(self, probs, targets_one_hot) -> torch.Tensor:
+        if not self.pg_recall_enabled or self.pg_recall_weight <= 0:
+            return probs.new_tensor(0.0)
+        if self.pg_class_index < 0 or self.pg_class_index >= probs.shape[1]:
+            return probs.new_tensor(0.0)
+        pg_target = targets_one_hot[:, self.pg_class_index]
+        pos_mask = pg_target > 0.5
+        if not pos_mask.any():
+            return probs.new_tensor(0.0)
+        pg_prob = probs[:, self.pg_class_index]
+        # Penalize false negatives on PG pixels to favor recall.
+        fn_loss = (1.0 - pg_prob)[pos_mask]
+        return fn_loss.mean()
+
+    def _boundary_mask(self, targets: torch.Tensor) -> torch.Tensor:
+        one_hot = F.one_hot(targets.long(), num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+        if self.num_classes > 1:
+            one_hot = one_hot[:, 1:, :, :]
+        # Morphological gradient on one-hot maps to approximate class boundaries.
+        pad = self.boundary_width
+        kernel = 2 * pad + 1
+        max_pool = F.max_pool2d(one_hot, kernel_size=kernel, stride=1, padding=pad)
+        min_pool = -F.max_pool2d(-one_hot, kernel_size=kernel, stride=1, padding=pad)
+        grad = (max_pool - min_pool).sum(dim=1, keepdim=True)
+        return grad > 0.0
+
+    def _boundary_loss(self, logits, targets, class_weights: torch.Tensor = None) -> torch.Tensor:
+        if not self.boundary_enabled or self.boundary_weight <= 0:
+            return logits.new_tensor(0.0)
+        boundary_mask = self._boundary_mask(targets)
+        if not boundary_mask.any():
+            return logits.new_tensor(0.0)
+        if class_weights is None:
+            class_weights = self.class_weights.to(logits.device)
+        per_pixel_ce = F.cross_entropy(
+            logits,
+            targets.long(),
+            weight=class_weights,
+            reduction="none",
+            label_smoothing=self.label_smoothing,
+        )
+        boundary_weights = boundary_mask.squeeze(1).float()
+        denom = boundary_weights.sum().clamp_min(1.0)
+        return (per_pixel_ce * boundary_weights).sum() / denom
+
     def compute(self, logits, targets) -> Tuple[torch.Tensor, Dict[str, float]]:
         if logits.ndim != 4:
             raise ValueError(f"Expected logits with shape [B, C, H, W], got {tuple(logits.shape)}")
@@ -209,12 +260,16 @@ class CompositeSegLoss(nn.Module):
         focal_loss = self._standard_focal_loss(logits, targets.long(), class_weights)
         dice_loss = self._dice_loss(probs, targets_one_hot, class_weights)
         tversky_loss = self._tversky_loss(probs, targets_one_hot, class_weights)
+        pg_recall_loss = self._pg_recall_loss(probs, targets_one_hot)
+        boundary_loss = self._boundary_loss(logits, targets, class_weights)
 
         total = (
             self.ce_weight * ce_loss
             + self.focal_weight * focal_loss
             + self.dice_weight * dice_loss
             + self.tversky_weight * tversky_loss
+            + self.pg_recall_weight * pg_recall_loss
+            + self.boundary_weight * boundary_loss
         )
 
         loss_dict = {
@@ -222,6 +277,8 @@ class CompositeSegLoss(nn.Module):
             "focal": float(focal_loss.detach().cpu().item()),
             "dice": float(dice_loss.detach().cpu().item()),
             "tversky": float(tversky_loss.detach().cpu().item()),
+            "pg_recall": float(pg_recall_loss.detach().cpu().item()),
+            "boundary": float(boundary_loss.detach().cpu().item()),
             "total": float(total.detach().cpu().item()),
         }
         return total, loss_dict
@@ -369,7 +426,9 @@ class Trainer:
         self.rare_class_indices = [int(idx) for idx in self.rare_class_indices if 0 <= int(idx) < self.num_classes]
 
         self.criterion = CompositeSegLoss(config)
-        self.stage1_criterion = SpectralDiscriminativeLoss(config)
+        self.preprocess_mode = str(_cfg_get(config, "data.preprocess.mode", "none")).lower()
+        self.enable_stage1_supervision = self.preprocess_mode == "none"
+        self.stage1_criterion = SpectralDiscriminativeLoss(config) if self.enable_stage1_supervision else None
         self.optimizer = self._build_optimizer()
         self.scheduler = None
         self.scheduler_mode = "none"
@@ -395,8 +454,13 @@ class Trainer:
         self.oom_skip_batch = bool(_cfg_get(config, "train.memory.oom_skip_batch", True))
         self.empty_cache_steps = max(0, int(_cfg_get(config, "train.memory.empty_cache_steps", 0)))
         self.staged_cfg = _cfg_get(config, "train.staged", {})
-        self.staged_enabled = bool(_cfg_get(config, "train.staged.enabled", False))
+        self.staged_enabled = bool(_cfg_get(config, "train.staged.enabled", False)) and self.enable_stage1_supervision
         self.stage_definitions = list(_cfg_get(config, "train.staged.stages", [])) if self.staged_enabled else []
+        if bool(_cfg_get(config, "train.staged.enabled", False)) and not self.enable_stage1_supervision:
+            tprint(
+                "trainer: preprocess.mode != none, disable staged spectral supervision; "
+                "fallback to single-stage segmentation training."
+            )
         self.early_stop_cfg = _cfg_get(config, "train.early_stop", {})
 
         self.history = {
@@ -420,6 +484,8 @@ class Trainer:
             "val_fg_distribution_gap": [],
             "train_fg_dominant_ratio": [],
             "val_fg_dominant_ratio": [],
+            "train_boundary_dice": [],
+            "val_boundary_dice": [],
             "train_per_class_dice": [],
             "val_per_class_dice": [],
             "train_loss_components": [],
@@ -471,6 +537,92 @@ class Trainer:
 
     def _autocast_context(self):
         return torch.cuda.amp.autocast(enabled=self.use_amp and self.device.type == "cuda")
+
+    def _safe_metric(self, mapping: Mapping[str, Any], key: str, default: float = float("nan")) -> float:
+        try:
+            return float(mapping.get(key, default))
+        except (TypeError, ValueError, AttributeError):
+            return float(default)
+
+    def _build_stage_epoch_log(
+        self,
+        epoch: int,
+        stage_name: str,
+        train_metrics: Mapping[str, Any],
+        val_metrics: Mapping[str, Any],
+        epoch_time: float,
+    ) -> str:
+        train_summary = train_metrics.get("summary", {})
+        val_summary = val_metrics.get("summary", {})
+        train_loss_components = train_metrics.get("loss_components", {})
+        val_loss_components = val_metrics.get("loss_components", {})
+
+        lines = [
+            f"Epoch {epoch}",
+            f"\t- stage: {stage_name}",
+            f"\t- lr: {self._current_lr():.6e}",
+        ]
+
+        stage_key = str(stage_name).lower()
+        if stage_key == "spectral_pretrain":
+            lines.extend(
+                [
+                    f"\t- train_stage1_total: {self._safe_metric(train_loss_components, 'stage1_total'):.4f}",
+                    f"\t- val_stage1_total: {self._safe_metric(val_loss_components, 'stage1_total'):.4f}",
+                    f"\t- train_stage1_intra: {self._safe_metric(train_loss_components, 'stage1_intra'):.4f}",
+                    f"\t- val_stage1_intra: {self._safe_metric(val_loss_components, 'stage1_intra'):.4f}",
+                    f"\t- train_stage1_inter: {self._safe_metric(train_loss_components, 'stage1_inter'):.4f}",
+                    f"\t- val_stage1_inter: {self._safe_metric(val_loss_components, 'stage1_inter'):.4f}",
+                    f"\t- train_stage1_focal: {self._safe_metric(train_loss_components, 'stage1_focal'):.4f}",
+                    f"\t- val_stage1_focal: {self._safe_metric(val_loss_components, 'stage1_focal'):.4f}",
+                ]
+            )
+        elif stage_key == "segmentation_train":
+            lines.extend(
+                [
+                    f"\t- train_composite_total: {self._safe_metric(train_loss_components, 'composite_total', train_metrics.get('loss', float('nan'))):.4f}",
+                    f"\t- val_composite_total: {self._safe_metric(val_loss_components, 'composite_total', val_metrics.get('loss', float('nan'))):.4f}",
+                    f"\t- train_dice: {self._safe_metric(train_summary, 'dice'):.4f}",
+                    f"\t- val_dice: {self._safe_metric(val_summary, 'dice'):.4f}",
+                    f"\t- train_rare_dice: {self._safe_metric(train_summary, 'rare_dice'):.4f}",
+                    f"\t- val_rare_dice: {self._safe_metric(val_summary, 'rare_dice'):.4f}",
+                    f"\t- train_min_fg_dice: {self._safe_metric(train_summary, 'min_fg_dice'):.4f}",
+                    f"\t- val_min_fg_dice: {self._safe_metric(val_summary, 'min_fg_dice'):.4f}",
+                    f"\t- train_pg_recall: {self._safe_metric(train_summary, 'pg_recall'):.4f}",
+                    f"\t- val_pg_recall: {self._safe_metric(val_summary, 'pg_recall'):.4f}",
+                    f"\t- train_boundary_dice: {self._safe_metric(train_summary, 'boundary_dice'):.4f}",
+                    f"\t- val_boundary_dice: {self._safe_metric(val_summary, 'boundary_dice'):.4f}",
+                ]
+            )
+        elif stage_key == "joint_finetune":
+            lines.extend(
+                [
+                    f"\t- train_total: {self._safe_metric(train_loss_components, 'total', train_metrics.get('loss', float('nan'))):.4f}",
+                    f"\t- val_total: {self._safe_metric(val_loss_components, 'total', val_metrics.get('loss', float('nan'))):.4f}",
+                    f"\t- train_composite_total: {self._safe_metric(train_loss_components, 'composite_total'):.4f}",
+                    f"\t- val_composite_total: {self._safe_metric(val_loss_components, 'composite_total'):.4f}",
+                    f"\t- train_stage1_total: {self._safe_metric(train_loss_components, 'stage1_total'):.4f}",
+                    f"\t- val_stage1_total: {self._safe_metric(val_loss_components, 'stage1_total'):.4f}",
+                    f"\t- train_dice: {self._safe_metric(train_summary, 'dice'):.4f}",
+                    f"\t- val_dice: {self._safe_metric(val_summary, 'dice'):.4f}",
+                    f"\t- train_pg_recall: {self._safe_metric(train_summary, 'pg_recall'):.4f}",
+                    f"\t- val_pg_recall: {self._safe_metric(val_summary, 'pg_recall'):.4f}",
+                    f"\t- train_boundary_dice: {self._safe_metric(train_summary, 'boundary_dice'):.4f}",
+                    f"\t- val_boundary_dice: {self._safe_metric(val_summary, 'boundary_dice'):.4f}",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"\t- train_loss: {self._safe_metric(train_metrics, 'loss'):.4f}",
+                    f"\t- val_loss: {self._safe_metric(val_metrics, 'loss'):.4f}",
+                    f"\t- train_dice: {self._safe_metric(train_summary, 'dice'):.4f}",
+                    f"\t- val_dice: {self._safe_metric(val_summary, 'dice'):.4f}",
+                ]
+            )
+
+        lines.append(f"\t- time: {epoch_time:.1f}s")
+        return "\n".join(lines) + "\n"
 
     def _resolve_stage_scheduler_cfg(self, stage_cfg: Optional[Mapping[str, Any]] = None):
         if stage_cfg is not None and isinstance(stage_cfg, Mapping) and "scheduler" in stage_cfg:
@@ -652,6 +804,36 @@ class Trainer:
         conf = torch.bincount(index, minlength=self.num_classes * self.num_classes)
         return conf.view(self.num_classes, self.num_classes).cpu()
 
+    def _predict_from_probs(self, probs: torch.Tensor) -> torch.Tensor:
+        if not bool(_cfg_get(self.config, "inference.class_thresholds.enabled", False)):
+            return torch.argmax(probs, dim=1)
+        pg_class = int(_cfg_get(self.config, "inference.class_thresholds.pg_class_index", 1))
+        pg_threshold = float(_cfg_get(self.config, "inference.class_thresholds.pg_threshold", 0.5))
+        preds = torch.argmax(probs, dim=1)
+        if pg_class < 0 or pg_class >= probs.shape[1]:
+            return preds
+        pg_mask = probs[:, pg_class] >= pg_threshold
+        preds = preds.clone()
+        preds[pg_mask] = pg_class
+        return preds
+
+    def _boundary_dice(self, preds: torch.Tensor, targets: torch.Tensor, width: int = 2) -> float:
+        one_hot = F.one_hot(targets.long(), num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+        if self.num_classes > 1:
+            one_hot = one_hot[:, 1:, :, :]
+        pad = max(1, int(width))
+        kernel = 2 * pad + 1
+        max_pool = F.max_pool2d(one_hot, kernel_size=kernel, stride=1, padding=pad)
+        min_pool = -F.max_pool2d(-one_hot, kernel_size=kernel, stride=1, padding=pad)
+        boundary = (max_pool - min_pool).sum(dim=1) > 0.0
+        if not boundary.any():
+            return 1.0
+        pred_boundary = (preds == targets) & boundary
+        inter = pred_boundary.float().sum().item()
+        pred_mass = boundary.float().sum().item()
+        gt_mass = boundary.float().sum().item()
+        return float((2.0 * inter + 1e-8) / (pred_mass + gt_mass + 1e-8))
+
     def _metrics_from_confusion(self, confusion):
         confusion = confusion.to(torch.float64)
         tp = torch.diag(confusion)
@@ -725,10 +907,20 @@ class Trainer:
             "fg_dominant_ratio": fg_dominant_ratio,
             "pixel_accuracy": float(tp.sum().item() / total.item()),
         }
+        pg_idx = next((idx for idx, name in enumerate(self.class_names) if str(name).lower() == "pg"), None)
+        if pg_idx is not None and 0 <= pg_idx < self.num_classes:
+            summary["pg_recall"] = float(recall[pg_idx].item())
+            summary["pg_precision"] = float(precision[pg_idx].item())
+            summary["pg_f1"] = float(dice[pg_idx].item())
+        else:
+            summary["pg_recall"] = 0.0
+            summary["pg_precision"] = 0.0
+            summary["pg_f1"] = 0.0
         return {"summary": summary, "per_class": per_class, "pred_ratio": pred_ratio.tolist(), "true_ratio": true_ratio.tolist()}
 
     def _batch_dice(self, outputs, targets):
-        preds = torch.argmax(outputs, dim=1)
+        probs = F.softmax(outputs, dim=1)
+        preds = self._predict_from_probs(probs)
         confusion = self._confusion_matrix(preds, targets)
         metrics = self._metrics_from_confusion(confusion)
         return float(metrics["summary"]["dice"])
@@ -740,11 +932,12 @@ class Trainer:
         epoch_confusion = torch.zeros((self.num_classes, self.num_classes), dtype=torch.int64)
         total_loss = 0.0
         num_batches = 0
+        boundary_dice_total = 0.0
         running_loss_components = {}
         optimizer_steps = 0
 
         loss_weights = (stage_cfg or {}).get("loss_weights", {}) if isinstance(stage_cfg, Mapping) else {}
-        w_stage1 = float(loss_weights.get("stage1", 0.0))
+        w_stage1 = float(loss_weights.get("stage1", 0.0)) if self.enable_stage1_supervision else 0.0
         w_comp = float(loss_weights.get("composite", 1.0))
 
         an_epoch = tqdm(train_loader, desc=f"Training", total=len(train_loader))
@@ -772,7 +965,11 @@ class Trainer:
                     composite_total = main_loss + self.aux_loss_weight * aux_loss
                     spectral_features = aux_outputs.get("spectral_features", None)
                     spectral_logits = aux_outputs.get("spectral_logits", None)
-                    stage1_total, stage1_loss_dict = self.stage1_criterion.compute(spectral_features, spectral_logits, targets)
+                    if self.enable_stage1_supervision and self.stage1_criterion is not None:
+                        stage1_total, stage1_loss_dict = self.stage1_criterion.compute(spectral_features, spectral_logits, targets)
+                    else:
+                        stage1_total = targets.new_tensor(0.0, dtype=torch.float32)
+                        stage1_loss_dict = {"stage1_intra": 0.0, "stage1_inter": 0.0, "stage1_focal": 0.0, "stage1_total": 0.0}
                     total_batch_loss = w_comp * composite_total + w_stage1 * stage1_total
             except RuntimeError as exc:
                 if self.device.type == "cuda" and self.oom_skip_batch and "out of memory" in str(exc).lower():
@@ -808,8 +1005,10 @@ class Trainer:
                     if self.device.type == "cuda" and self.empty_cache_steps > 0 and (optimizer_steps % self.empty_cache_steps == 0):
                         torch.cuda.empty_cache()
 
-            preds = torch.argmax(logits.detach(), dim=1)
+            probs = F.softmax(logits.detach(), dim=1)
+            preds = self._predict_from_probs(probs)
             epoch_confusion += self._confusion_matrix(preds.cpu(), targets.detach().cpu())
+            boundary_dice_total += self._boundary_dice(preds.detach().cpu(), targets.detach().cpu(), width=self.criterion.boundary_width)
             total_loss += float(total_batch_loss.detach().cpu().item())
             num_batches += 1
 
@@ -829,6 +1028,7 @@ class Trainer:
         metrics = self._metrics_from_confusion(epoch_confusion)
         avg_loss_components = {k: v / max(1, num_batches) for k, v in running_loss_components.items()}
         metrics["loss"] = avg_loss
+        metrics["summary"]["boundary_dice"] = float(boundary_dice_total / max(1, num_batches))
         metrics["loss_components"] = avg_loss_components
         metrics["optimizer_steps"] = optimizer_steps
         return metrics
@@ -841,10 +1041,11 @@ class Trainer:
         epoch_confusion = torch.zeros((self.num_classes, self.num_classes), dtype=torch.int64)
         total_loss = 0.0
         num_batches = 0
+        boundary_dice_total = 0.0
         running_loss_components = {}
 
         loss_weights = (stage_cfg or {}).get("loss_weights", {}) if isinstance(stage_cfg, Mapping) else {}
-        w_stage1 = float(loss_weights.get("stage1", 0.0))
+        w_stage1 = float(loss_weights.get("stage1", 0.0)) if self.enable_stage1_supervision else 0.0
         w_comp = float(loss_weights.get("composite", 1.0))
 
         for step, batch in enumerate(val_loader):
@@ -881,11 +1082,17 @@ class Trainer:
                 composite_total = main_loss + self.aux_loss_weight * aux_loss
                 spectral_features = aux_outputs.get("spectral_features", None)
                 spectral_logits = aux_outputs.get("spectral_logits", None)
-                stage1_total, stage1_loss_dict = self.stage1_criterion.compute(spectral_features, spectral_logits, targets)
+                if self.enable_stage1_supervision and self.stage1_criterion is not None:
+                    stage1_total, stage1_loss_dict = self.stage1_criterion.compute(spectral_features, spectral_logits, targets)
+                else:
+                    stage1_total = targets.new_tensor(0.0, dtype=torch.float32)
+                    stage1_loss_dict = {"stage1_intra": 0.0, "stage1_inter": 0.0, "stage1_focal": 0.0, "stage1_total": 0.0}
                 total_batch_loss = w_comp * composite_total + w_stage1 * stage1_total
 
-            preds = torch.argmax(logits, dim=1)
+            probs = F.softmax(logits, dim=1)
+            preds = self._predict_from_probs(probs)
             epoch_confusion += self._confusion_matrix(preds.cpu(), targets.cpu())
+            boundary_dice_total += self._boundary_dice(preds.detach().cpu(), targets.detach().cpu(), width=self.criterion.boundary_width)
             total_loss += float(total_batch_loss.detach().cpu().item())
             num_batches += 1
 
@@ -902,6 +1109,7 @@ class Trainer:
         metrics = self._metrics_from_confusion(epoch_confusion)
         avg_loss_components = {k: v / max(1, num_batches) for k, v in running_loss_components.items()}
         metrics["loss"] = avg_loss
+        metrics["summary"]["boundary_dice"] = float(boundary_dice_total / max(1, num_batches))
         metrics["loss_components"] = avg_loss_components
         return metrics
 
@@ -1024,6 +1232,8 @@ class Trainer:
                 self.history["val_fg_distribution_gap"].append(float(val_summary["fg_distribution_gap"]))
                 self.history["train_fg_dominant_ratio"].append(float(train_summary["fg_dominant_ratio"]))
                 self.history["val_fg_dominant_ratio"].append(float(val_summary["fg_dominant_ratio"]))
+                self.history["train_boundary_dice"].append(float(train_summary.get("boundary_dice", 0.0)))
+                self.history["val_boundary_dice"].append(float(val_summary.get("boundary_dice", 0.0)))
                 self.history["train_per_class_dice"].append({k: float(v["dice"]) for k, v in train_metrics["per_class"].items()})
                 self.history["val_per_class_dice"].append({k: float(v["dice"]) for k, v in val_metrics["per_class"].items()})
                 self.history["train_loss_components"].append(train_metrics.get("loss_components", {}))
@@ -1041,8 +1251,16 @@ class Trainer:
                     metric_value = float(val_summary["dice"])
                 elif metric_name in {"train_stage1_total", "stage1_total"}:
                     metric_value = float(train_metrics.get("loss_components", {}).get("stage1_total", float("inf")))
+                elif metric_name in {"val_stage1_total", "eval_stage1_total"}:
+                    metric_value = float(val_metrics.get("loss_components", {}).get("stage1_total", float("inf")))
                 elif metric_name in {"val_loss", "eval_loss"}:
                     metric_value = float(val_metrics["loss"])
+                elif metric_name in {"pg_recall", "val_pg_recall", "eval_pg_recall"}:
+                    metric_value = float(val_summary.get("pg_recall", 0.0))
+                elif metric_name in {"pg_f1", "val_pg_f1", "eval_pg_f1"}:
+                    metric_value = float(val_summary.get("pg_f1", 0.0))
+                elif metric_name in {"boundary_dice", "val_boundary_dice", "eval_boundary_dice"}:
+                    metric_value = float(val_summary.get("boundary_dice", 0.0))
                 else:
                     metric_value = float(val_summary.get("dice", 0.0))
 
@@ -1058,7 +1276,16 @@ class Trainer:
                     bad_epochs += 1
 
                 if early_enabled:
-                    early_target = float(val_summary["dice"]) if early_metric in {"eval_dice", "val_dice"} else float(val_metrics["loss"])
+                    if early_metric in {"eval_dice", "val_dice"}:
+                        early_target = float(val_summary["dice"])
+                    elif early_metric in {"pg_recall", "val_pg_recall", "eval_pg_recall"}:
+                        early_target = float(val_summary.get("pg_recall", 0.0))
+                    elif early_metric in {"pg_f1", "val_pg_f1", "eval_pg_f1"}:
+                        early_target = float(val_summary.get("pg_f1", 0.0))
+                    elif early_metric in {"boundary_dice", "val_boundary_dice", "eval_boundary_dice"}:
+                        early_target = float(val_summary.get("boundary_dice", 0.0))
+                    else:
+                        early_target = float(val_metrics["loss"])
                     if early_mode == "max":
                         early_improved = early_target > (early_best + early_min_delta)
                     else:
@@ -1074,16 +1301,7 @@ class Trainer:
                         return TrainerResult(history=self.history, best_epoch=best_epoch or global_epoch, best_metric=float(self.best_val_dice))
 
                 epoch_time = time.time() - epoch_start
-                print(
-                    f"Epoch {global_epoch}\n"
-                    f"\t- stage: {stage_name}\n"
-                    f"\t- lr: {self._current_lr():.6e}\n"
-                    f"\t- train_loss: {train_metrics['loss']:.4f}\n"
-                    f"\t- val_loss: {val_metrics['loss']:.4f}\n"
-                    f"\t- train_dice: {train_summary['dice']:.4f}\n"
-                    f"\t- val_dice: {val_summary['dice']:.4f}\n"
-                    f"\t- time: {epoch_time:.1f}s\n"
-                )
+                print(self._build_stage_epoch_log(global_epoch, stage_name, train_metrics, val_metrics, epoch_time))
 
                 if bad_epochs >= patience:
                     break
@@ -1102,6 +1320,7 @@ class Trainer:
 
         probabilities = []
         predictions = []
+        argmax_predictions = []
         targets_all = []
         image_samples = []
 
@@ -1114,7 +1333,8 @@ class Trainer:
                 probs = F.softmax(logits, dim=1)
 
             probabilities.append(probs.detach().cpu().numpy())
-            predictions.append(torch.argmax(probs, dim=1).detach().cpu().numpy())
+            argmax_predictions.append(torch.argmax(probs, dim=1).detach().cpu().numpy())
+            predictions.append(self._predict_from_probs(probs).detach().cpu().numpy())
             if targets is not None:
                 targets_all.append(targets.detach().cpu().numpy())
             if keep_images > 0 and len(image_samples) < keep_images:
@@ -1123,6 +1343,7 @@ class Trainer:
         result = {
             "probabilities": np.concatenate(probabilities, axis=0) if probabilities else np.empty((0, self.num_classes, 0, 0)),
             "predictions": np.concatenate(predictions, axis=0) if predictions else np.empty((0, 0, 0), dtype=np.int64),
+            "argmax_predictions": np.concatenate(argmax_predictions, axis=0) if argmax_predictions else np.empty((0, 0, 0), dtype=np.int64),
         }
         if targets_all:
             result["targets"] = np.concatenate(targets_all, axis=0)
@@ -1136,7 +1357,13 @@ class Trainer:
             result["metrics"] = self._metrics_from_confusion(torch.from_numpy(confusion))
         result["prob_maps"] = result["probabilities"]
         result["pred_masks"] = result["predictions"]
+        result["pred_masks_argmax"] = result["argmax_predictions"]
         result["gt_masks"] = result.get("targets", np.empty((0, 0, 0), dtype=np.int64))
+        result["threshold_policy"] = {
+            "enabled": bool(_cfg_get(self.config, "inference.class_thresholds.enabled", False)),
+            "pg_class_index": int(_cfg_get(self.config, "inference.class_thresholds.pg_class_index", 1)),
+            "pg_threshold": float(_cfg_get(self.config, "inference.class_thresholds.pg_threshold", 0.5)),
+        }
         result["image_samples"] = image_samples[:keep_images] if keep_images > 0 else []
         result["features"] = np.empty((0, 0), dtype=np.float32)
         result["feature_labels"] = np.empty((0,), dtype=np.int64)

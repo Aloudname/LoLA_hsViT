@@ -3,6 +3,7 @@ from __future__ import annotations
 from tqdm import tqdm
 from munch import Munch
 from pathlib import Path
+from collections import OrderedDict
 from scipy.linalg import eig
 from dataclasses import dataclass
 from sklearn.decomposition import PCA
@@ -13,7 +14,6 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.neighbors import NeighborhoodComponentsAnalysis
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from pipeline.monitor import tprint
 import os, cv2, json, torch, shutil, hashlib, warnings, itertools, numpy as np
@@ -167,13 +167,20 @@ def _should_keep_patch(
 class SpectralReducer:
     """fit/transform spectral channels for method-b preprocessing.
 
+    Unified HSI order in ``prepare_data`` (``pipeline/dataset.prepare_data``):
+    1) ``ensure_spectral_alignment_on_disk`` (when ``data.spectral_alignment.enabled``): optional
+       spectral diff along bands, pad back to ``data.hsi_bands``, optional per-pixel SNV **on disk**
+       (manifest v2: per-file SHA256 so aligned cubes are not rewritten on later runs).
+    2) ``SpectralReducer.fit`` / ``transform``: never re-applies diff; when Stage A applied SNV on
+       disk, ``enable_snv`` is false and ``derivative_order`` is 0. When Stage A SNV is on disk,
+       ``enable_standardize`` is forced off so global z-score is not stacked on top of SNV
+       (same contract as ``mode=none`` identity path).
+
     modes:
-    - none: when spectral_alignment (diff+SNV on disk) is active, passthrough only;
-      otherwise SNV / derivative / standardize per data.preprocess.
-    - supervised_pca: pca on class-balanced train pixels.
-    - lda_pca: pca first, then lda on pca features.
-    - kernel_lda: random fourier feature projection + lda.
-    - pca_nca: optional spectral normalization/derivative, then pca + neighborhood components analysis.
+    - none: identity transform when Stage A diff+SNV is on disk; else SNV / derivative /
+      standardize per ``data.preprocess``.
+    - supervised_pca / lda_pca / kernel_lda / pca_nca: fit on pixels already Stage A when
+       alignment is enabled (see above); then PCA / LDA / NCA as configured.
     """
 
     def __init__(
@@ -210,7 +217,7 @@ class SpectralReducer:
             and self._spectral_alignment_enabled
             and self._stage_a_snv
         )
-        if self._none_identity:
+        if self._spectral_alignment_enabled and self._stage_a_snv:
             self.enable_standardize = False
         self.pca_whiten = bool(getattr(cfg, "pca_whiten", self.mode == "pca_nca"))
         self.pca_dim_override = max(0, int(getattr(cfg, "pca_dim", 0)))
@@ -243,7 +250,8 @@ class SpectralReducer:
                 self.reference_projection_name = "Stage A (diff+SNV)"
                 self.reduced_projection_name = "Stage A (diff+SNV)"
                 return
-            # simple norm for none-mode
+
+            # none without full Stage A on disk: SNV / derivative / standardize only (no duplicate diff).
             x_fit, _ = self._collect_pixels(samples, num_classes, show_progress=show_progress)
             if x_fit.size == 0:
                 raise RuntimeError("failed to collect fit pixels for none-mode normalization")
@@ -254,6 +262,11 @@ class SpectralReducer:
             self.reduced_projection_name = "Normalized spectra"
             return
 
+        # --- Discriminative / projection modes (never reached when mode == "none").
+        # Pixels come from ``SampleItem.hsi_path`` after ``ensure_spectral_alignment_on_disk``:
+        # when ``spectral_alignment.enabled``, cubes are already diff [+ SNV] on disk.
+        # ``_prepare_features`` then skips SNV + spectral derivative in that case; with Stage A SNV,
+        # ``enable_standardize`` is already false (see __init__).
         x_fit, y_fit = self._collect_pixels(samples, num_classes, show_progress=show_progress)
         if x_fit.size == 0:
             raise RuntimeError("failed to collect fit pixels for spectral reducer")
@@ -625,6 +638,23 @@ def _discover_hsi_samples(config: Munch) -> List[SampleItem]:
     hsi_dir = Path(config.path.hsi_dir)
     label_dir = Path(config.path.label_dir)
     rgb_dir = Path(config.path.rgb_dir)
+    return _discover_hsi_samples_from_dirs(hsi_dir=hsi_dir, label_dir=label_dir, rgb_dir=rgb_dir)
+
+
+def _require_config_path(cfg: Munch, key: str) -> Path:
+    """Read required path from config and fail loudly when missing/empty."""
+    try:
+        value = getattr(cfg.path, key)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"missing required config path: path.{key}") from exc
+    text = str(value).strip()
+    if not text:
+        raise RuntimeError(f"empty required config path: path.{key}")
+    return Path(text).resolve()
+
+
+def _discover_hsi_samples_from_dirs(hsi_dir: Path, label_dir: Path, rgb_dir: Path) -> List[SampleItem]:
+    """discover paired hsi and mask files from explicit directories."""
 
     if not hsi_dir.exists():
         raise FileNotFoundError(f"hsi_dir not found: {hsi_dir}")
@@ -660,23 +690,382 @@ def _discover_hsi_samples(config: Munch) -> List[SampleItem]:
     return samples
 
 
-def _hsi_diff_snv_array(
+def _prepare_diffed_hsi_to_dir(
+    config: Munch,
+    raw_samples: Sequence[SampleItem],
+    show_progress: bool,
+) -> Dict[str, Any]:
+    """
+    Build debiased HSI dataset in ``path.diffed_dir`` from raw ``path.hsi_dir``.
+    Fixed processing order:
+      1) patient-level z-score normalization
+      2) Savitzky-Golay smoothing
+      3) first-order spectral difference
+    No in-place overwrite of raw files, no hash mapping.
+    """
+    out_bands = int(config.data.hsi_bands)
+    raw_hsi_dir = _require_config_path(config, "hsi_dir")
+    diffed_dir = _require_config_path(config, "diffed_dir")
+    if raw_hsi_dir == diffed_dir:
+        raise RuntimeError(
+            "strict safety mode: path.hsi_dir and path.diffed_dir must be different "
+            f"(both resolve to: {raw_hsi_dir})"
+        )
+    diffed_dir.mkdir(parents=True, exist_ok=True)
+
+    sentinel_path = diffed_dir / ".stagea_meta.json"
+    n_written = 0
+    n_labels_copied = 0
+    pre_cfg = _as_munch(getattr(config.data, "preprocess", Munch()))
+    smooth_window = int(getattr(pre_cfg, "savgol_window", 11))
+    smooth_polyorder = int(getattr(pre_cfg, "savgol_polyorder", 3))
+    patient_stats = _collect_patient_zscore_stats(raw_samples, out_bands, show_progress=show_progress)
+    iterator = tqdm(
+        list(raw_samples),
+        desc="zscore+savgol+diff->diffed_dir",
+        dynamic_ncols=True,
+        leave=False,
+        disable=not show_progress,
+    )
+    for sample in iterator:
+        cube = np.load(sample.hsi_path).astype(np.float32)
+        if cube.ndim != 3:
+            raise ValueError(f"hsi must be HWC for {sample.sample_id}, got {cube.shape}")
+        if int(cube.shape[2]) != out_bands:
+            raise ValueError(
+                f"{sample.sample_id}: hsi has {cube.shape[2]} bands; expected raw width=data.hsi_bands={out_bands}"
+            )
+        pid = str(sample.patient_id)
+        if pid not in patient_stats:
+            raise RuntimeError(f"missing patient z-score stats for patient_id={pid!r}")
+        mean, std = patient_stats[pid]
+        out = _hsi_patient_zscore_savgol_diff_array(
+            cube,
+            patient_mean=mean,
+            patient_std=std,
+            smooth_window=smooth_window,
+            smooth_polyorder=smooth_polyorder,
+        )
+        out_hsi = diffed_dir / f"{sample.sample_id}.npy"
+        tmp_hsi = diffed_dir / f"{sample.sample_id}_tmp_diffed.npy"
+        np.save(tmp_hsi, out.astype(np.float32))
+        os.replace(tmp_hsi, out_hsi)
+        n_written += 1
+
+        out_gt = diffed_dir / f"{sample.sample_id}_gt.npy"
+        if sample.mask_path.exists():
+            shutil.copy2(sample.mask_path, out_gt)
+            n_labels_copied += 1
+    iterator.close()
+    sentinel_payload = {
+        "stage": "stage_a_patient_zscore_savgol_diff",
+        "mode": "generated_from_raw",
+        "source_hsi_dir": str(raw_hsi_dir),
+        "source_label_dir": str(Path(str(config.path.label_dir)).resolve()),
+        "diffed_dir": str(diffed_dir),
+        "num_hsi_written": int(n_written),
+        "num_labels_copied": int(n_labels_copied),
+        "pipeline": [
+            "patient_level_zscore",
+            f"savgol(window={smooth_window},polyorder={smooth_polyorder})",
+            "first_order_difference",
+            "zero_pad_to_same_bands",
+        ],
+        "output_bands": int(out_bands),
+    }
+    with sentinel_path.open("w", encoding="utf-8") as f:
+        json.dump(sentinel_payload, f, ensure_ascii=False, indent=2)
+    return {
+        "enabled": True,
+        "mode": "generated_from_raw",
+        "source_hsi_dir": str(raw_hsi_dir),
+        "source_label_dir": str(config.path.label_dir),
+        "diffed_dir": str(diffed_dir),
+        "num_hsi_written": int(n_written),
+        "num_labels_copied": int(n_labels_copied),
+        "pipeline": [
+            "patient_level_zscore",
+            f"savgol(window={smooth_window},polyorder={smooth_polyorder})",
+            "first_order_difference",
+            "zero_pad_to_same_bands",
+        ],
+        "output_bands": int(out_bands),
+        "sentinel_path": str(sentinel_path),
+    }
+
+
+def _apply_classwise_patient_mean_align(
+    diffed_dir: Path,
+    samples: Sequence[SampleItem],
+    num_classes: int,
+    show_progress: bool,
+) -> Dict[str, Any]:
+    """
+    Supervised class-wise patient mean alignment on already diffed cubes.
+    For each foreground class c:
+      x <- x - mean_patient(c) + mean_global(c)
+    """
+    sums_global: Dict[int, np.ndarray] = {}
+    counts_global: Dict[int, int] = {}
+    sums_patient: Dict[Tuple[str, int], np.ndarray] = {}
+    counts_patient: Dict[Tuple[str, int], int] = {}
+    n_bands: Optional[int] = None
+
+    iter1 = tqdm(list(samples), desc="classwise-align pass1", dynamic_ncols=True, leave=False, disable=not show_progress)
+    for s in iter1:
+        hsi_path = diffed_dir / f"{s.sample_id}.npy"
+        gt_path = diffed_dir / f"{s.sample_id}_gt.npy"
+        if not hsi_path.exists() or not gt_path.exists():
+            continue
+        cube = np.load(hsi_path).astype(np.float32)
+        mask = np.load(gt_path).astype(np.int64)
+        if cube.ndim != 3 or mask.ndim != 2:
+            continue
+        if cube.shape[:2] != mask.shape and cube.shape[1:] == mask.shape:
+            cube = np.moveaxis(cube, 0, -1)
+        if cube.shape[:2] != mask.shape:
+            continue
+        if n_bands is None:
+            n_bands = int(cube.shape[-1])
+        pid = str(s.patient_id)
+        for cls_idx in range(1, int(num_classes)):
+            m = (mask == cls_idx)
+            if not np.any(m):
+                continue
+            rows = cube[m]
+            k = (pid, cls_idx)
+            sums_patient[k] = rows.sum(axis=0) if k not in sums_patient else (sums_patient[k] + rows.sum(axis=0))
+            counts_patient[k] = int(counts_patient.get(k, 0) + rows.shape[0])
+            sums_global[cls_idx] = rows.sum(axis=0) if cls_idx not in sums_global else (sums_global[cls_idx] + rows.sum(axis=0))
+            counts_global[cls_idx] = int(counts_global.get(cls_idx, 0) + rows.shape[0])
+    iter1.close()
+
+    if n_bands is None:
+        return {"classwise_align": True, "classwise_align_applied": False, "classwise_align_reason": "no_valid_rows"}
+
+    mean_global: Dict[int, np.ndarray] = {}
+    mean_patient: Dict[Tuple[str, int], np.ndarray] = {}
+    for cls_idx, ssum in sums_global.items():
+        cnt = max(1, int(counts_global.get(cls_idx, 0)))
+        mean_global[cls_idx] = (ssum / float(cnt)).astype(np.float32)
+    for k, ssum in sums_patient.items():
+        cnt = max(1, int(counts_patient.get(k, 0)))
+        mean_patient[k] = (ssum / float(cnt)).astype(np.float32)
+
+    aligned_samples = 0
+    iter2 = tqdm(list(samples), desc="classwise-align pass2", dynamic_ncols=True, leave=False, disable=not show_progress)
+    for s in iter2:
+        hsi_path = diffed_dir / f"{s.sample_id}.npy"
+        gt_path = diffed_dir / f"{s.sample_id}_gt.npy"
+        if not hsi_path.exists() or not gt_path.exists():
+            continue
+        cube = np.load(hsi_path).astype(np.float32)
+        mask = np.load(gt_path).astype(np.int64)
+        moved = False
+        if cube.ndim != 3 or mask.ndim != 2:
+            continue
+        if cube.shape[:2] != mask.shape and cube.shape[1:] == mask.shape:
+            cube = np.moveaxis(cube, 0, -1)
+            moved = True
+        if cube.shape[:2] != mask.shape:
+            continue
+        pid = str(s.patient_id)
+        changed = False
+        for cls_idx in range(1, int(num_classes)):
+            k = (pid, cls_idx)
+            if cls_idx not in mean_global or k not in mean_patient:
+                continue
+            m = (mask == cls_idx)
+            if not np.any(m):
+                continue
+            delta = (mean_global[cls_idx] - mean_patient[k]).astype(np.float32)
+            cube[m] = cube[m] + delta
+            changed = True
+        if changed:
+            out_arr = np.moveaxis(cube, -1, 0) if moved else cube
+            tmp = diffed_dir / f"{s.sample_id}_tmp_classalign.npy"
+            np.save(tmp, out_arr.astype(np.float32))
+            os.replace(tmp, hsi_path)
+            aligned_samples += 1
+    iter2.close()
+    return {
+        "classwise_align": True,
+        "classwise_align_applied": bool(aligned_samples > 0),
+        "classwise_align_aligned_samples": int(aligned_samples),
+    }
+
+
+def _diffed_dataset_ready(diffed_dir: Path) -> Tuple[bool, int]:
+    """
+    Check whether ``diffed_dir`` already contains valid processed pairs.
+    A pair is counted when both ``<sample>.npy`` and ``<sample>_gt.npy`` exist.
+    """
+    if not diffed_dir.exists() or not diffed_dir.is_dir():
+        return False, 0
+    sentinel_path = diffed_dir / ".stagea_meta.json"
+    if not sentinel_path.exists():
+        return False, 0
+    pair_count = 0
+    for gt_path in diffed_dir.glob("*_gt.npy"):
+        sample_id = gt_path.name[:-7]
+        if (diffed_dir / f"{sample_id}.npy").exists():
+            pair_count += 1
+    return pair_count > 0, int(pair_count)
+
+
+def _collect_patient_zscore_stats(
+    samples: Sequence[SampleItem],
+    raw_bands: int,
+    show_progress: bool,
+) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    """
+    Compute patient-level per-band mean/std on raw spectra.
+    Stats are aggregated over all pixels from all samples of each patient.
+    """
+    sums: Dict[str, np.ndarray] = {}
+    sums_sq: Dict[str, np.ndarray] = {}
+    counts: Dict[str, int] = {}
+
+    iterator = tqdm(
+        list(samples),
+        desc="patient-zscore-stats",
+        dynamic_ncols=True,
+        leave=False,
+        disable=not show_progress,
+    )
+    for sample in iterator:
+        cube = np.load(sample.hsi_path).astype(np.float32)
+        if cube.ndim != 3 or int(cube.shape[2]) != int(raw_bands):
+            raise ValueError(
+                f"{sample.sample_id}: expected HWC with {raw_bands} bands for patient stats, got {tuple(cube.shape)}"
+            )
+        rows = cube.reshape(-1, int(raw_bands)).astype(np.float64)
+        pid = str(sample.patient_id)
+        band_sum = rows.sum(axis=0)
+        band_sq_sum = np.square(rows).sum(axis=0)
+        if pid not in sums:
+            sums[pid] = band_sum
+            sums_sq[pid] = band_sq_sum
+            counts[pid] = int(rows.shape[0])
+        else:
+            sums[pid] += band_sum
+            sums_sq[pid] += band_sq_sum
+            counts[pid] = int(counts[pid] + rows.shape[0])
+    iterator.close()
+
+    out: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    for pid, band_sum in sums.items():
+        n = max(1, int(counts.get(pid, 0)))
+        mean = (band_sum / float(n)).astype(np.float32)
+        var = (sums_sq[pid] / float(n)) - np.square(mean.astype(np.float64))
+        std = np.sqrt(np.maximum(var, 1e-12)).astype(np.float32)
+        out[pid] = (mean, std)
+    return out
+
+
+def _hsi_patient_zscore_savgol_diff_array(
+    cube: np.ndarray,
+    patient_mean: np.ndarray,
+    patient_std: np.ndarray,
+    smooth_window: int = 11,
+    smooth_polyorder: int = 3,
+) -> np.ndarray:
+    """
+    Fixed debias chain:
+      patient-level z-score -> Savitzky-Golay smoothing -> first-order difference.
+    Then pad one zero band to keep band count unchanged.
+    """
+    if cube.ndim != 3:
+        raise ValueError(f"expected HWC cube, got shape={tuple(cube.shape)}")
+    raw_bands = int(cube.shape[2])
+    if patient_mean.shape[0] != raw_bands or patient_std.shape[0] != raw_bands:
+        raise ValueError(
+            f"patient stats mismatch: expected {raw_bands} bands, got mean={patient_mean.shape[0]}, std={patient_std.shape[0]}"
+        )
+    x = np.asarray(cube, dtype=np.float64)
+    x = (x - patient_mean.reshape(1, 1, -1)) / np.maximum(patient_std.reshape(1, 1, -1), 1e-6)
+
+    win = int(max(3, smooth_window))
+    if win % 2 == 0:
+        win += 1
+    if win > int(raw_bands):
+        win = int(raw_bands) if int(raw_bands) % 2 == 1 else int(raw_bands) - 1
+    poly = int(max(1, smooth_polyorder))
+    if win >= 3 and poly < win:
+        x = savgol_filter(x, window_length=win, polyorder=poly, axis=2, mode="interp")
+    d = np.diff(x, axis=2, n=1)
+    z = np.zeros_like(d[..., :1])
+    out = np.concatenate([d, z], axis=2)
+    if int(out.shape[2]) != raw_bands:
+        raise RuntimeError(
+            f"internal error: expected {raw_bands} bands after zero pad, got {out.shape[2]}"
+        )
+    return out.astype(np.float32)
+
+
+def _hsi_diff_pad_snv_array(
     cube: np.ndarray,
     hsi_diff_order: int,
     snv: bool,
     snv_eps: float,
+    pad_mode: str,
+    raw_bands: int,
+    smooth_window: int = 7,
+    smooth_polyorder: int = 2,
 ) -> np.ndarray:
-    """first-order diff along spectral axis (last), optional per-pixel SNV (same as SpectralReducer)."""
-    x = np.diff(np.asarray(cube, dtype=np.float64), axis=2, n=int(hsi_diff_order))
-    x = x.astype(np.float32)
+    """
+    Legacy helper kept for compatibility with non--d code paths.
+    Applies Savitzky-Golay smoothing + spectral diff, optional pad, optional per-pixel SNV.
+    """
+    if int(cube.shape[2]) != int(raw_bands):
+        raise ValueError(f"expected {raw_bands} spectral bands, got {cube.shape[2]}")
+    order = max(1, int(hsi_diff_order))
+    x = np.asarray(cube, dtype=np.float64)
+    win = int(max(3, smooth_window))
+    if win % 2 == 0:
+        win += 1
+    if win > int(raw_bands):
+        win = int(raw_bands) if int(raw_bands) % 2 == 1 else int(raw_bands) - 1
+    poly = int(max(1, smooth_polyorder))
+    if win >= 3 and poly < win:
+        x = savgol_filter(x, window_length=win, polyorder=poly, axis=2, mode="interp")
+    d = np.diff(x, axis=2, n=order)
+    need = int(raw_bands) - int(d.shape[2])
+    if need < 0:
+        raise ValueError("hsi_diff_order too large for hsi_bands")
+    pad_mode = str(pad_mode)
+    if need > 0:
+        if pad_mode == "repeat_last":
+            tail = d[..., -1:]
+            d = np.concatenate([d] + [tail] * need, axis=2)
+        elif pad_mode in ("zero_pad", "zero"):
+            z = np.zeros_like(d[..., :1])
+            d = np.concatenate([d] + [z] * need, axis=2)
+        else:
+            raise ValueError(f"unknown hsi_pad_mode={pad_mode!r}; use repeat_last or zero_pad")
+    out = d.astype(np.float32)
     if snv:
-        h, w, d = x.shape
-        flat = x.reshape(-1, d)
+        h, w, bands = out.shape
+        flat = out.reshape(-1, bands)
         mean = flat.mean(axis=1, keepdims=True)
         std = flat.std(axis=1, keepdims=True)
         flat = (flat - mean) / np.maximum(std, float(snv_eps))
-        x = flat.reshape(h, w, d).astype(np.float32)
-    return x
+        out = flat.reshape(h, w, bands).astype(np.float32)
+    if int(out.shape[2]) != int(raw_bands):
+        raise RuntimeError(f"internal error: expected {raw_bands} bands after pad, got {out.shape[2]}")
+    return out
+
+
+def _file_sha256(path: Path, chunk_size: int = 1 << 20) -> str:
+    """SHA256 of file bytes (stable across runs; used to detect already-aligned HSI)."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _alignment_stat_sig(path: Path) -> Tuple[int, int]:
@@ -711,7 +1100,11 @@ def ensure_spectral_alignment_on_disk(
     samples: Sequence[SampleItem],
     show_progress: bool,
 ) -> Dict[str, Any]:
-    """overwrite HSI cubes with diff [+ SNV] when enabled; optional RGB (process_rgb)."""
+    """
+    In-place HSI: raw cubes have ``data.hsi_bands`` channels (e.g. 96). Apply spectral diff + pad
+    back to the same width + optional per-pixel SNV. Idempotency: manifest v2 stores per-file
+    SHA256 of aligned bytes; matching hashes skip rewrites.
+    """
     al = _spectral_alignment_cfg(config)
     if not bool(getattr(al, "enabled", False)):
         return {
@@ -726,27 +1119,32 @@ def ensure_spectral_alignment_on_disk(
             "rgb_snv": bool(getattr(al, "rgb_snv", False)),
             "num_hsi_written": 0,
             "num_rgb_written": 0,
+            "num_hsi_skipped_unchanged": 0,
+            "manifest_format": None,
         }
 
     out_bands = int(config.data.hsi_bands)
     hsi_diff_order = max(1, int(getattr(al, "hsi_diff_order", 1)))
-    src_bands = out_bands + hsi_diff_order
     snv = bool(getattr(al, "snv", True))
     snv_eps = float(getattr(al, "snv_eps", 1e-6))
     version_tag = str(getattr(al, "version_tag", "v1"))
     process_rgb = bool(getattr(al, "process_rgb", False))
     rgb_pad_mode = str(getattr(al, "rgb_pad_mode", "repeat_last"))
     rgb_snv = bool(getattr(al, "rgb_snv", False))
+    hsi_pad_mode = str(getattr(al, "hsi_pad_mode", "repeat_last"))
+    hsi_backup_dir = Path(str(getattr(al, "hsi_raw_backup_dir", Path(config.path.hsi_dir) / ".stageA_raw_backup")))
 
     manifest_path = _hsi_spectral_diff_manifest_path(config)
     rgb_manifest_path = _rgb_spectral_diff_manifest_path(config)
 
     config_key = {
         "version_tag": version_tag,
+        "hsi_spectral_layout": "diff_pad_snv_same_dim_v1",
         "hsi_diff_order": hsi_diff_order,
+        "hsi_pad_mode": hsi_pad_mode,
         "snv": snv,
         "snv_eps": snv_eps,
-        "hsi_bands_out": out_bands,
+        "hsi_bands": out_bands,
         "rgb_pad_mode": rgb_pad_mode,
         "rgb_snv": rgb_snv,
         "process_rgb": process_rgb,
@@ -762,12 +1160,17 @@ def ensure_spectral_alignment_on_disk(
             existing = {}
 
     per_sample_prev: Dict[str, Any] = {}
-    if existing.get("config_key") == config_key and existing.get("alignment_key") == alignment_key:
+    if (
+        existing.get("config_key") == config_key
+        and existing.get("alignment_key") == alignment_key
+        and existing.get("manifest_format") == "v2"
+    ):
         per_sample_prev = existing.get("per_sample", {}) or {}
 
     fast_ok = (
         existing.get("config_key") == config_key
         and existing.get("alignment_key") == alignment_key
+        and existing.get("manifest_format") == "v2"
     )
     if fast_ok:
         for sample in samples:
@@ -776,9 +1179,11 @@ def ensure_spectral_alignment_on_disk(
                 if int(cube.shape[2]) != out_bands:
                     fast_ok = False
                     break
-                sig = _alignment_stat_sig(sample.hsi_path)
-                prev = per_sample_prev.get(sample.sample_id, {}).get("hsi_sig")
-                if prev is None or tuple(prev) != sig:
+                prev = per_sample_prev.get(sample.sample_id)
+                if not prev or not prev.get("hsi_aligned_sha256"):
+                    fast_ok = False
+                    break
+                if _file_sha256(sample.hsi_path) != str(prev["hsi_aligned_sha256"]):
                     fast_ok = False
                     break
             except OSError:
@@ -798,9 +1203,13 @@ def ensure_spectral_alignment_on_disk(
                 "rgb_manifest": str(rgb_manifest_path) if process_rgb else None,
                 "num_hsi_written": 0,
                 "num_rgb_written": 0,
+                "num_hsi_skipped_unchanged": len(samples),
+                "manifest_format": "v2",
+                "per_sample": per_sample_prev,
             }
 
     num_hsi_written = 0
+    num_hsi_skipped = 0
     num_rgb_written = 0
     per_sample_out: Dict[str, Any] = {}
 
@@ -816,21 +1225,42 @@ def ensure_spectral_alignment_on_disk(
         if cube.ndim != 3:
             raise ValueError(f"hsi must be HWC for {sample.sample_id}, got {cube.shape}")
         c = int(cube.shape[2])
-        if c == out_bands:
-            pass
-        elif c == src_bands:
+        if c != out_bands:
+            raise ValueError(
+                f"{sample.sample_id}: hsi has {c} bands; with spectral_alignment enabled, "
+                f"expect raw (or aligned) width == data.hsi_bands ({out_bands}). "
+                f"Legacy (out+diff_order) inputs are no longer supported."
+            )
+        cur_hash = _file_sha256(sample.hsi_path)
+        prev = per_sample_prev.get(sample.sample_id, {})
+        if prev.get("hsi_aligned_sha256") == cur_hash:
+            per_sample_out[sample.sample_id] = {
+                "hsi_raw_sha256": prev.get("hsi_raw_sha256"),
+                "hsi_aligned_sha256": prev.get("hsi_aligned_sha256"),
+                "hsi_raw_backup_path": prev.get("hsi_raw_backup_path"),
+            }
+            num_hsi_skipped += 1
+        else:
+            raw_fp = cur_hash
             arr = np.asarray(cube, dtype=np.float32)
-            out = _hsi_diff_snv_array(arr, hsi_diff_order, snv, snv_eps)
-            tmp = sample.hsi_path.with_suffix(".npy.tmp_align")
+            raw_backup_path = hsi_backup_dir / f"{sample.sample_id}__{raw_fp[:16]}.npy"
+            if not raw_backup_path.exists():
+                raw_backup_path.parent.mkdir(parents=True, exist_ok=True)
+                np.save(raw_backup_path, arr.astype(np.float32))
+            out = _hsi_diff_pad_snv_array(
+                arr, hsi_diff_order, snv, snv_eps, hsi_pad_mode, raw_bands=out_bands
+            )
+            # np.save appends .npy when suffix is missing/unknown, so temp path must end with .npy.
+            tmp = sample.hsi_path.with_name(f"{sample.hsi_path.stem}_spectral_align_tmp.npy")
             np.save(tmp, out.astype(np.float32))
             os.replace(tmp, sample.hsi_path)
             num_hsi_written += 1
-        else:
-            raise ValueError(
-                f"{sample.sample_id}: hsi has {c} bands; expected {out_bands} (after alignment) "
-                f"or {src_bands} (raw before alignment). Check data.hsi_bands and spectral_alignment."
-            )
-        per_sample_out[sample.sample_id] = {"hsi_sig": list(_alignment_stat_sig(sample.hsi_path))}
+            aligned_fp = _file_sha256(sample.hsi_path)
+            per_sample_out[sample.sample_id] = {
+                "hsi_raw_sha256": raw_fp,
+                "hsi_aligned_sha256": aligned_fp,
+                "hsi_raw_backup_path": str(raw_backup_path),
+            }
 
         if process_rgb and sample.rgb_path is not None and sample.rgb_path.exists():
             rgb_bgr = cv2.imread(str(sample.rgb_path), cv2.IMREAD_COLOR)
@@ -851,17 +1281,20 @@ def ensure_spectral_alignment_on_disk(
                 rgb_out = flat.reshape(h, w, ch)
             rgb_u8 = np.clip(rgb_out * 255.0, 0.0, 255.0).astype(np.uint8)
             rgb_u8_bgr = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR)
-            tmp_png = sample.rgb_path.with_suffix(".png.tmp_align")
+            # cv2.imwrite selects codec by extension; must end in .png (not .png.tmp_align).
+            tmp_png = sample.rgb_path.with_name(f"{sample.rgb_path.stem}_spectral_align_tmp.png")
             cv2.imwrite(str(tmp_png), rgb_u8_bgr)
             os.replace(tmp_png, sample.rgb_path)
             num_rgb_written += 1
             per_sample_out[sample.sample_id]["rgb_sig"] = list(_alignment_stat_sig(sample.rgb_path))
 
     payload = {
+        "manifest_format": "v2",
         "alignment_key": alignment_key,
         "config_key": config_key,
         "per_sample": per_sample_out,
         "num_hsi_written": num_hsi_written,
+        "num_hsi_skipped_unchanged": num_hsi_skipped,
         "num_rgb_written": num_rgb_written,
     }
     try:
@@ -875,6 +1308,7 @@ def ensure_spectral_alignment_on_disk(
         try:
             rgb_manifest_path.parent.mkdir(parents=True, exist_ok=True)
             rgb_payload = {
+                "manifest_format": "v2",
                 "alignment_key": alignment_key,
                 "config_key": config_key,
                 "per_sample": per_sample_out,
@@ -896,7 +1330,10 @@ def ensure_spectral_alignment_on_disk(
         "hsi_manifest": str(manifest_path),
         "rgb_manifest": str(rgb_manifest_path) if process_rgb else None,
         "num_hsi_written": num_hsi_written,
+        "num_hsi_skipped_unchanged": num_hsi_skipped,
         "num_rgb_written": num_rgb_written,
+        "manifest_format": "v2",
+        "per_sample": per_sample_out,
     }
 
 
@@ -1121,7 +1558,9 @@ def _build_cache_key(config: Munch, modality: str) -> str:
             "hsi": str(config.path.hsi_dir),
             "label": str(config.path.label_dir),
             "rgb": str(config.path.rgb_dir),
+            "diffed": str(config.path.diffed_dir),
         },
+        "diff_mode": "strict_read_diffed",
         "split": dict(config.data.split),
         "patch_size": int(config.data.patch_size),
         "stride": int(config.data.stride),
@@ -1163,153 +1602,31 @@ def _cache_signature(samples_by_split: Mapping[str, Sequence[SampleItem]]) -> Di
     return signature
 
 
-def _prepare_none_mode_cache(
-    cfg: Munch,
-    samples_by_split: Mapping[str, Sequence[SampleItem]],
-    reducer: SpectralReducer,
-    show_progress: bool,
-) -> Tuple[Dict[str, str], Dict[str, Any]]:
-    """
-    prepare cached none-mode normed cubes.
-    use multi-threading to speed up.
-    """
-    cache_cfg = _as_munch(getattr(getattr(cfg.data, "preprocess", Munch()), "cache", Munch()))
-    cache_enabled = bool(getattr(cache_cfg, "enabled", True))
-    if not cache_enabled:
-        return {}, {"enabled": False, "reason": "cache disabled"}
-
-    cached_root = Path(getattr(cfg.path, "cached_dir", "./cached_hsi"))
-    try:
-        cached_root.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        tprint(
-            "Warning: cached_dir is not writable\n"
-            f"\trequested={cached_root}\n"
-            f"\treason={exc}"
+def build_diffed_dataset(config: Munch) -> Dict[str, Any]:
+    """CLI helper: generate diffed HSI+labels to ``path.diffed_dir`` from raw directories."""
+    cfg = config
+    raw_hsi_dir = _require_config_path(cfg, "hsi_dir")
+    diffed_dir = _require_config_path(cfg, "diffed_dir")
+    if raw_hsi_dir == diffed_dir:
+        raise RuntimeError(
+            "strict safety mode: path.hsi_dir and path.diffed_dir must be different "
+            f"(both resolve to: {raw_hsi_dir})"
         )
-        raise RuntimeError(f"cached_dir is not writable: {cached_root}") from exc
-
-    manifest_path = cached_root / "cache_manifest.json"
-    norm_root = cached_root / "normed"
-    stats_root = cached_root / "stats"
-    norm_root.mkdir(parents=True, exist_ok=True)
-    stats_root.mkdir(parents=True, exist_ok=True)
-
-    key_payload = {
-        "seed": int(cfg.data.split.seed),
-        "version_tag": str(getattr(cache_cfg, "version_tag", "v1")),
-        "mode": str(cfg.data.preprocess.mode),
-        "preprocess": dict(cfg.data.preprocess),
-        "spectral_alignment": _config_section_plain(getattr(cfg.data, "spectral_alignment", None)),
-        "signature": _cache_signature(samples_by_split),
-    }
-    key_raw = json.dumps(key_payload, sort_keys=True)
-    cache_key = hashlib.sha256(key_raw.encode("utf-8")).hexdigest()[:20]
-
-    norm_dir = norm_root / cache_key
-    stats_dir = stats_root / cache_key
-    stats_dir.mkdir(parents=True, exist_ok=True)
-    stats_path = stats_dir / "train_stats.npz"
-    strict_manifest = bool(getattr(cache_cfg, "strict_manifest", True))
-
-    existing_manifest = {}
-    if manifest_path.exists():
-        with manifest_path.open("r", encoding="utf-8") as f:
-            existing_manifest = json.load(f)
-
-    all_samples = [s for split in samples_by_split.values() for s in split]
-    if strict_manifest:
-        # check if cache valid
-        matched = existing_manifest.get(cache_key, None)
-        if matched is not None and norm_dir.exists() and stats_path.exists():
-            all_ok = True
-            for sample in all_samples:
-                if not (norm_dir / f"{sample.sample_id}.npy").exists():
-                    all_ok = False
-                    break
-            if all_ok:
-                return (
-                    {sample.sample_id: str(norm_dir / f"{sample.sample_id}.npy") for sample in all_samples},
-                    {"enabled": True, "cache_key": cache_key, "cache_hit": True, "stats_path": str(stats_path)},
-                )
-
-    # collect train pixels for normed cube standardization
-    if reducer.enable_standardize and reducer.scaler is None:
-        train_samples = list(samples_by_split.get("train", []))
-        x_fit, _ = reducer._collect_pixels(train_samples, num_classes=int(cfg.data.num_classes), show_progress=show_progress)
-        if x_fit.size == 0:
-            raise RuntimeError("failed to collect train pixels for none-mode cache standardization")
-        reducer._prepare_features(x_fit, fit=True)
-
-    reserve_cores = max(1, int(getattr(cache_cfg, "reserve_cores", 2)))
-    user_workers = max(1, int(getattr(cache_cfg, "num_workers", 4)))
-    cpu_total = os.cpu_count() or 4
-    workers = max(1, min(user_workers, max(1, cpu_total - reserve_cores)))
-
-    norm_dir.mkdir(parents=True, exist_ok=True)
-    if reducer.scaler is not None:
-        np.savez(
-            stats_path,
-            mean_=reducer.scaler.mean_.astype(np.float32),
-            scale_=reducer.scaler.scale_.astype(np.float32),
-        )
-    elif getattr(reducer, "_none_identity", False):
-        np.savez(stats_path, none_identity=np.array(True, dtype=np.bool_))
-
-    def _process_one(sample: SampleItem) -> str:
-        cube = np.load(sample.hsi_path).astype(np.float32)
-        h, w, c = cube.shape
-        flat = cube.reshape(-1, c)
-        if getattr(reducer, "_none_identity", False):
-            norm_flat = flat
-        else:
-            norm_flat = reducer._prepare_features(flat, fit=False)
-        out_path = norm_dir / f"{sample.sample_id}.npy"
-        np.save(out_path, norm_flat.reshape(h, w, c).astype(np.float32))
-        return str(out_path)
-
-    cache_paths: Dict[str, str] = {}
-    try:
-        # context manager for thread pool
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_process_one, sample): sample for sample in all_samples}
-            # progress bar for threading
-            iterator = tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc="none-cache",
-                dynamic_ncols=True,
-                leave=False,
-                disable=not show_progress,
+    if diffed_dir.exists():
+        sentinel = diffed_dir / ".stagea_meta.json"
+        if sentinel.exists():
+            raise RuntimeError(
+                f"diffed_dir already has Stage A sentinel ({sentinel}); refusing to run -d twice."
             )
-            for future in iterator:
-                sample = futures[future]
-                cache_paths[sample.sample_id] = future.result()
-    except Exception as exc:
-        tprint(f"Warning: threaded none-mode cache failed, fallback to single-thread. reason={exc}")
-        cache_paths = {}
-        for sample in tqdm(
-            all_samples,
-            desc="none-cache-fallback",
-            dynamic_ncols=True,
-            leave=False,
-            disable=not show_progress,
-        ):
-            cache_paths[sample.sample_id] = _process_one(sample)
-
-    # update manifest
-    existing_manifest[cache_key] = {
-        "key_payload": key_payload,
-        "norm_dir": str(norm_dir),
-        "stats_path": str(stats_path),
-        "num_samples": len(all_samples),
-    }
-    with manifest_path.open("w", encoding="utf-8") as f:
-        json.dump(existing_manifest, f, indent=2, ensure_ascii=False)
-    return (
-        cache_paths,
-        {"enabled": True, "cache_key": cache_key, "cache_hit": False, "stats_path": str(stats_path), "workers": workers},
-    )
+        if any(diffed_dir.iterdir()):
+            raise RuntimeError(
+                f"diffed_dir is not empty ({diffed_dir}); treat as polluted and abort. "
+                "Please clean diffed_dir before running -d."
+            )
+    raw_samples = _discover_hsi_samples(cfg)
+    show_progress = bool(getattr(cfg.runtime, "progress_bar", True))
+    meta = _prepare_diffed_hsi_to_dir(cfg, raw_samples, show_progress=show_progress)
+    return meta
 
 
 def prepare_data(config: Munch, modality: str) -> PreparedData:
@@ -1333,21 +1650,56 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
                f"\tmodality={modality}")
         return _PREPARED_CACHE[cache_key]
 
-    all_samples = _discover_hsi_samples(cfg)
-    unique_patients = len({s.patient_id for s in all_samples})
-    tprint(f"discovered samples:\n"
-           f"\ttotal={len(all_samples)}, unique_patients={unique_patients}")
-
-    alignment_meta: Dict[str, Any] = ensure_spectral_alignment_on_disk(
-        cfg, all_samples, show_progress=show_progress
-    )
-    if not alignment_meta.get("skipped", True):
-        tprint(
-            "spectral alignment (on-disk diff [+ SNV]):\n"
-            f"\tcache_hit={alignment_meta.get('cache_hit', False)}, "
-            f"hsi_written={alignment_meta.get('num_hsi_written', 0)}, "
-            f"rgb_written={alignment_meta.get('num_rgb_written', 0)}"
+    alignment_meta: Dict[str, Any] = {
+        "enabled": True,
+        "mode": "read_diffed_only",
+        "diffed_dir": None,
+    }
+    if modality == "hsi":
+        raw_hsi_dir = _require_config_path(cfg, "hsi_dir")
+        diffed_dir = _require_config_path(cfg, "diffed_dir")
+        alignment_meta["diffed_dir"] = str(diffed_dir)
+        if raw_hsi_dir == diffed_dir:
+            raise RuntimeError(
+                "strict safety mode: path.hsi_dir and path.diffed_dir must be different "
+                f"(both resolve to: {raw_hsi_dir})"
+            )
+        has_diffed, ready_pairs = _diffed_dataset_ready(diffed_dir)
+        if not has_diffed:
+            raise RuntimeError(
+                "diffed dataset is not ready: require '.stagea_meta.json' and at least one "
+                f"HSI/GT pair in path.diffed_dir={diffed_dir}. Run `python run.py -d` first."
+            )
+        alignment_meta.update(
+            {
+                "mode": "read_diffed_only",
+                "source_hsi_dir": str(raw_hsi_dir),
+                "source_label_dir": str(_require_config_path(cfg, "label_dir")),
+                "ready_pairs": int(ready_pairs),
+            }
         )
+        tprint(
+            "spectral preprocess routing (strict):\n"
+            f"\tread-only from diffed_dir={diffed_dir}\n"
+            f"\tready_pairs={ready_pairs}\n"
+            "\tno in-pipeline debiasing; use `python run.py -d` to generate when needed"
+        )
+        all_samples = _discover_hsi_samples_from_dirs(
+            hsi_dir=diffed_dir,
+            label_dir=diffed_dir,
+            rgb_dir=Path(cfg.path.rgb_dir),
+        )
+        unique_patients = len({s.patient_id for s in all_samples})
+        tprint(
+            "discovered effective HSI samples:\n"
+            f"\ttotal={len(all_samples)}, unique_patients={unique_patients}"
+        )
+    else:
+        alignment_meta["enabled"] = False
+        all_samples = _discover_hsi_samples(cfg)
+        unique_patients = len({s.patient_id for s in all_samples})
+        tprint(f"discovered samples:\n"
+               f"\ttotal={len(all_samples)}, unique_patients={unique_patients}")
 
     samples_by_split = _split_subjects(all_samples, cfg)
     tprint(
@@ -1373,6 +1725,10 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
     precious_class = int(getattr(sampling_cfg, "precious_class", 1))
 
     spectral_alignment_cfg = _config_section_plain(getattr(cfg.data, "spectral_alignment", None))
+    if modality == "hsi":
+        # HSI branch always reads from diffed_dir (already diff+SNV), so Stage B should not repeat SNV/derivative.
+        spectral_alignment_cfg["enabled"] = True
+        spectral_alignment_cfg["snv"] = bool(getattr(_spectral_alignment_cfg(cfg), "snv", True))
     reducer = SpectralReducer(
         mode=str(cfg.data.preprocess.mode),
         output_dim=int(cfg.data.preprocess.output_dim),
@@ -1392,21 +1748,6 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
         reducer.mode = "none"
         reducer.fitted = True
         tprint("spectral reducer skipped for rgb modality")
-
-    cached_hsi_paths: Dict[str, str] = {}
-    none_cache_meta: Dict[str, Any] = {"enabled": False}
-    if modality == "hsi" and reducer.mode == "none":
-        cached_hsi_paths, none_cache_meta = _prepare_none_mode_cache(
-            cfg=cfg,
-            samples_by_split=samples_by_split,
-            reducer=reducer,
-            show_progress=show_progress,
-        )
-        tprint(
-            "none-mode cache:\n"
-            f"\tenabled={none_cache_meta.get('enabled', False)}, hit={none_cache_meta.get('cache_hit', False)}\n"
-            f"\tkey={none_cache_meta.get('cache_key', 'n/a')}"
-        )
 
     patches_by_split: Dict[str, List[PatchRecord]] = {}
     split_stats: Dict[str, Any] = {}
@@ -1473,8 +1814,6 @@ def prepare_data(config: Munch, modality: str) -> PreparedData:
             "split": split_stats,
             "class_names": list(cfg.data.class_names),
             "num_classes": num_classes,
-            "cached_hsi_paths": cached_hsi_paths,
-            "none_cache_meta": none_cache_meta,
             "spectral_alignment": alignment_meta,
         },
     )
@@ -1523,8 +1862,11 @@ class BasePatchDataset(Dataset):
 
         self.rng = np.random.default_rng(int(self.config.data.split.seed) + hash(split) % 1000)
 
-        self._cube_cache: Dict[str, np.ndarray] = {}
-        self._mask_cache: Dict[str, np.ndarray] = {}
+        # Bounded cache to avoid unbounded host RAM growth on large cohorts.
+        cache_ns = _as_munch(getattr(self.config.runtime, "dataset_cache", Munch()))
+        self.max_cached_samples = max(1, int(getattr(cache_ns, "max_items", 12)))
+        self._cube_cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
+        self._mask_cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
 
     def __len__(self) -> int:
         return len(self.records)
@@ -1554,17 +1896,19 @@ class BasePatchDataset(Dataset):
 
     def _load_sample(self, sample: SampleItem) -> Tuple[np.ndarray, np.ndarray]:
         """load image and mask for one sample."""
-        if sample.sample_id not in self._mask_cache:
-            self._mask_cache[sample.sample_id] = np.load(sample.mask_path).astype(np.int64)
+        sid = sample.sample_id
+        if sid in self._mask_cache:
+            self._mask_cache.move_to_end(sid)
+        else:
+            self._mask_cache[sid] = np.load(sample.mask_path).astype(np.int64)
+            while len(self._mask_cache) > self.max_cached_samples:
+                self._mask_cache.popitem(last=False)
 
-        if sample.sample_id not in self._cube_cache:
+        if sid in self._cube_cache:
+            self._cube_cache.move_to_end(sid)
+        else:
             if self.modality == "hsi":
-                cached_paths = self.prepared.stats.get("cached_hsi_paths", {})
-                cached_path = cached_paths.get(sample.sample_id, None)
-                if cached_path is not None and Path(cached_path).exists():
-                    cube = np.load(cached_path, mmap_mode="r")
-                else:
-                    cube = np.load(sample.hsi_path, mmap_mode="r")
+                cube = np.load(sample.hsi_path, mmap_mode="r")
             else:
                 if sample.rgb_path is None:
                     raise FileNotFoundError(f"rgb file not found for sample: {sample.sample_id}")
@@ -1573,9 +1917,11 @@ class BasePatchDataset(Dataset):
                     raise FileNotFoundError(f"failed to read rgb image: {sample.rgb_path}")
                 rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
                 cube = rgb.astype(np.float32) / 255.0
-            self._cube_cache[sample.sample_id] = cube
+            self._cube_cache[sid] = cube
+            while len(self._cube_cache) > self.max_cached_samples:
+                self._cube_cache.popitem(last=False)
 
-        return self._cube_cache[sample.sample_id], self._mask_cache[sample.sample_id]
+        return self._cube_cache[sid], self._mask_cache[sid]
 
     def _apply_augment(self, image: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """apply configured train-time augmentation to one patch."""
@@ -1662,6 +2008,13 @@ def build_dataloaders(config: Munch, modality: str) -> Tuple[Dict[str, DataLoade
     eval_bs = int(cfg.train.eval_batch_size)
     num_workers = int(cfg.train.num_workers)
     prefetch_factor = max(1, int(getattr(cfg.train, "prefetch_factor", 2)))
+    dl_cfg = _as_munch(getattr(cfg.runtime, "dataloader", Munch()))
+    max_workers = int(getattr(dl_cfg, "max_workers", 4))
+    prefetch_cap = int(getattr(dl_cfg, "prefetch_cap", 2))
+    persistent_workers_cfg = bool(getattr(dl_cfg, "persistent_workers", False))
+    if max_workers > 0:
+        num_workers = min(num_workers, max_workers)
+    prefetch_factor = max(1, min(prefetch_factor, prefetch_cap))
 
     runtime_device = str(getattr(cfg.runtime, "device", "auto")).lower()
     use_cuda = torch.cuda.is_available() and runtime_device != "cpu"
@@ -1669,7 +2022,7 @@ def build_dataloaders(config: Munch, modality: str) -> Tuple[Dict[str, DataLoade
     loader_kwargs: Dict[str, Any] = {
         "num_workers": num_workers,
         "pin_memory": bool(use_cuda),
-        "persistent_workers": num_workers > 0,
+        "persistent_workers": bool(num_workers > 0 and persistent_workers_cfg),
     }
     if num_workers > 0:
         loader_kwargs["prefetch_factor"] = prefetch_factor

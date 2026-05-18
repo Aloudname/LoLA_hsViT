@@ -1,73 +1,72 @@
 # central configuration for the refactored segmentation pipeline.
 
 path:
-  hsi_dir: "/data/chenhaoran/bishe/fisher" # used in pipeline.dataset._discover_hsi_samples to locate hsi .npy files.
-  label_dir: "/data/chenhaoran/bishe/fisher" # used in pipeline.dataset._discover_hsi_samples to locate *_gt.npy files.
+  hsi_dir: "/data/chenhaoran/bishe/fisher" # raw HSI source (always used as Stage A input when generation is needed).
+  label_dir: "/data/chenhaoran/bishe/fisher" # raw label source paired with raw HSI.
+  diffed_dir: "/data/chenhaoran/bishe/fisher_diffed" # processed diff+SNV dataset; required for -a and hsi training.
   rgb_dir: "/data/chenhaoran/bishe/rgb" # used in pipeline.dataset._discover_hsi_samples to locate rgb comparison images.
   output_dir: "./outputs" # used in pipeline.core.Pipeline to create timestamped experiment folders.
   pretrained_cache_dir: "./pretrained" # used in model.backbones.vit_timm via timm.create_model(cache_dir=...)
-  cached_dir: "/data/chenhaoran/bishe/fisher_normed" # used in pipeline.dataset，for normed data cache in preprocess.mode=none.
 
 data:
   num_classes: 4 # used in dataset/analyzer/trainer for segmentation label space.
   class_names: ["BG", "PG", "Tra", "TG"] # used in analyzer and visualize for reports.
-  hsi_bands: 96 # used in dataset synthetic generation and hsi input checks.
+  hsi_bands: 48 # used in dataset synthetic generation and hsi input checks.
   patch_size: 63 # used in pipeline.dataset._iter_patch_positions.
   stride: 32 # used in pipeline.dataset._iter_patch_positions.
-  foreground_ratio_threshold: 0.05 # used in pipeline.dataset._should_keep_patch.
+  foreground_ratio_threshold: 0.02 # used in pipeline.dataset._should_keep_patch.
   track_sample_ratio: 0.30 # used in pipeline.dataset._compute_tracking_stats.
   sampling:
-    train_fg_ratio_threshold: 0.05 # used in pipeline.dataset.prepare_data for stricter train patch keep threshold.
-    train_max_background_ratio: 0.96 # used in pipeline.dataset._should_keep_patch to suppress overly background-dominant train patches.
-    train_precious_repeat: 5 # used in pipeline.dataset._build_patch_records to oversample class-1 train patches.
+    train_fg_ratio_threshold: 0.02 # used in pipeline.dataset.prepare_data for stricter train patch keep threshold.
+    train_max_background_ratio: 0.99 # used in pipeline.dataset._should_keep_patch to suppress overly background-dominant train patches.
+    train_precious_repeat: 3 # used in pipeline.dataset._build_patch_records to oversample class-1 train patches.
     precious_class: 1 # used in pipeline.dataset sampling rules for small-target emphasis.
     advanced:
       use_weighted_sampler: true # enable weighted sampler for train dataloader.
-      rho: 0.40 # ⭐ interpolation factor between original distribution and balanced target.
-      pg_min_ratio: 0.15 # ⭐ minimum rare-class target ratio used by weighting.
-      hard_bg_ratio: 0.20 # ⭐ target ratio for hard background patches.
+      rho: 0.20 # ⭐ rho=(0,1), bigger rho means more balanced distribution.
+      pg_min_ratio: 0.10 # ⭐ minimum rare-class target ratio used by weighting.
+      hard_bg_ratio: 0.20 # ⭐ target ratio for pure background patches.
       weight_caps: [0.5, 8.0] # clamp range for patch sampling weights.
   split:
     train: 0.70 # used in pipeline.dataset._split_subjects.
     eval: 0.20 # used in pipeline.dataset._split_subjects.
     test: 0.10 # used in pipeline.dataset._split_subjects.
     seed: 350234 # used in pipeline.dataset and pipeline.core for deterministic behavior.
-  # on-disk diff + SNV before SpectralReducer; set hsi_bands to (raw_bands - hsi_diff_order) when enabled.
+  # Stage A parameters:
+  # debiasing is detached from training/analysis.
+  # only `python run.py -d` may read raw path.hsi_dir + path.label_dir and write path.diffed_dir.
+  # `python run.py -a` and `python run.py -m hsi` are read-only on path.diffed_dir.
   spectral_alignment:
-    enabled: false # pipeline.dataset.ensure_spectral_alignment_on_disk
+    enabled: true # parameter container for Stage A (`run.py -d`).
     version_tag: "v1"
-    manifest_basename_hsi: ".hsi_spectral_diff_manifest.json"
-    manifest_basename_rgb: ".rgb_spectral_diff_manifest.json"
-    hsi_diff_order: 1
-    snv: true
+    manifest_basename_hsi: ".hsi_diff_manifest.json"
+    manifest_basename_rgb: ".rgb_diff_manifest.json"
+    hsi_diff_order: 0
+    hsi_pad_mode: "repeat_last" # repeat_last | zero_pad — how to restore width after np.diff
+    snv: false
     snv_eps: 1.0e-6
-    process_rgb: false # if true, overwrites *_Merged_rgb.png (enable only with care)
+    classwise_align: false # optional supervised post-align in -d: shift each patient/class mean to global class mean.
+    process_rgb: false # ignored in new HSI-only diff pipeline (RGB is never processed).
     rgb_pad_mode: "repeat_last"
-    rgb_snv: false
+    rgb_snv: true
     viz_random_patients: 16 # pipeline.core._collect_patient_band_diff_shift viz subset
     similarity_bootstrap_iters: 2000 # bootstrap over bands for cosine CIs (patient_band_diff_similarity.json)
     similarity_random_seed: 137 # added to data.split.seed in pipeline.core for bootstrap RNG
   preprocess:
-    mode: "none" # used in pipeline.dataset.SpectralReducer; options: none, supervised_pca, lda_pca, kernel_lda, pca_nca.
+    mode: "lda_pca" # used in pipeline.dataset.SpectralReducer; options: none, supervised_pca, lda_pca, kernel_lda, pca_nca.
     output_dim: 8 # final reduced HSI channels fed into HSIAdapter / vit backbone pipeline.
     max_fit_pixels: 500000 # pixel budget for reducer fitting from real train split only.
-    snv: true # per-pixel SNV in SpectralReducer; set false when spectral_alignment.enabled and spectral_alignment.snv are true (avoid double SNV).
+    snv: true # per-pixel SNV in SpectralReducer.
     derivative_order: 1 # spectral derivative order before supervised compression; 1 is usually a strong default.
-    savgol_window: 7 # Savitzky-Golay window length for smooth derivative estimation.
-    savgol_polyorder: 2 # Savitzky-Golay polynomial order.
-    standardize: true # z-score each spectral feature across sampled training pixels before PCA/NCA.
+    savgol_window: 11 # Savitzky-Golay window length for smooth derivative estimation.
+    savgol_polyorder: 3 # Savitzky-Golay polynomial order.
+    standardize: true # z-score per band across pixels before PCA/LDA/NCA; ignored when spectral_alignment.enabled and spectral_alignment.snv (Stage A SNV only).
     pca_whiten: true # whiten PCA features before the discriminative stage.
     pca_dim: 24 # intermediate PCA dimension before NCA; should be > output_dim.
     nca_max_fit_pixels: 40000 # balanced pixel budget used specifically by NCA to keep fitting stable and efficient.
     nca_max_iter: 200 # max iterations for Neighborhood Components Analysis.
     nca_tol: 1.0e-5 # convergence tolerance for NCA.
     nca_init: "pca" # NCA initialization; pca is typically more stable than random.
-    cache:
-      enabled: true # cache none-mode normalized cubes and stats.
-      version_tag: "v1" # manual cache invalidation key.
-      num_workers: 4 # preprocessing workers for cache creation.
-      reserve_cores: 2 # keep cpu cores free for other users.
-      strict_manifest: true # require manifest consistency before using cache.
   synthetic:
     domain_shift_strength: 0.08 # medium difficulty: patient/sample spectral domain shift close to clinical acquisition variability.
     noise_std: 0.02 # medium difficulty: moderate sensor and per-pixel noise.
@@ -76,13 +75,13 @@ data:
 
 augment:
   enable_train_aug: true # used in pipeline.dataset.BasePatchDataset.__getitem__.
-  flip_prob: 0.10 # used in pipeline.dataset._apply_augment.
-  rotate_prob: 0.10 # used in pipeline.dataset._apply_augment.
-  noise_prob: 0.05 # used in pipeline.dataset._apply_augment.
-  noise_std: 0.01 # used in pipeline.dataset._apply_augment.
-  spectral_shift_prob: 0.05 # used in pipeline.dataset._apply_augment.
-  spectral_shift_std: 0.01 # used in pipeline.dataset._apply_augment.
-  band_drop_prob: 0.02 # used in pipeline.dataset._apply_augment.
+  flip_prob: 0.15 # stronger geometric regularization.
+  rotate_prob: 0.15 # stronger geometric regularization.
+  noise_prob: 0.10 # stronger stochastic perturbation.
+  noise_std: 0.015 # slightly stronger additive noise.
+  spectral_shift_prob: 0.10 # stronger spectral perturbation.
+  spectral_shift_std: 0.015 # slightly stronger spectral shift.
+  band_drop_prob: 0.04 # stronger band-level dropout.
 
 model:
   family: "hsi_adapter" # used in pipeline.core._build_model.
@@ -95,18 +94,20 @@ model:
   num_heads: 4 # used in multi-head attention layers.
   mlp_ratio: 4.0 # used in transformer feed-forward width.
   decoder_dim: 96 # used in decoder channels.
-  dropout: 0.05 # used in backbone and decoder.
+  dropout: 0.10 # increased dropout for stronger regularization.
   freeze_backbone: true # canonical freeze switch used in model.backbones.builder.
   unfreeze_last_n: 1 # canonical staged-unfreeze switch used in model.backbones.builder.
   spectral_encoder:
-    type: "spectral_transformer" # 'spectral_transformer' or 'simple'.
+    type: "spectral_multiscale" # 'spectral_multiscale' | 'spectral_transformer' | 'simple'.
     hidden_dim: 64 # used in model.hsi_adapter.SpectralTransformerEncoder, hidden dimension for spectral encoder.
     spectral_tokens: 12 # used in model.hsi_adapter.SpectralTransformerEncoder, number of spectral tokens.
     conv_depth: 2 # used in model.hsi_adapter.SpectralTransformerEncoder, number of convolutional layers.
     transformer_depth: 1 # used in model.hsi_adapter.SpectralTransformerEncoder, number of transformer layers.
     num_heads: 4 # used in model.hsi_adapter.SpectralTransformerEncoder, number of attention heads.
     kernel_size: 7 # used in model.hsi_adapter.SpectralTransformerEncoder, kernel size for convolutional layers.
-    dropout: 0.0 # used in model.hsi_adapter.SpectralTransformerEncoder, dropout rate for convolutional layers.
+    kernel_sizes: [3, 5, 9] # used in model.hsi_adapter.MultiScaleSpectralEncoder, multi-scale spectral kernels.
+    dilations: [1, 2] # used in model.hsi_adapter.MultiScaleSpectralEncoder, receptive-field expansion factors.
+    dropout: 0.05 # enable spectral encoder dropout regularization.
   backbone: # advanced backbone-only namespace (kept consistent with canonical model.* keys above).
     type: "timm_vit"
     grad_checkpointing: true # reduce activation memory in backbone blocks.
@@ -119,12 +120,12 @@ model:
   base_channels: 32 # used only in unet. embed_dim // 4.
 
 train:
-  epochs: 10 # used in pipeline.trainer.Trainer.fit.
-  batch_size: 16 # ⭐ used in train dataloader.
-  eval_batch_size: 16 # ⭐ used in eval/test dataloaders.
+  epochs: 30 # used in pipeline.trainer.Trainer.fit.
+  batch_size: 8 # ⭐ used in train dataloader.
+  eval_batch_size: 8 # ⭐ used in eval/test dataloaders.
   num_workers: 2 # used in dataloader worker setup.
   lr: 0.0003 # used in optimizer construction.
-  weight_decay: 0.0001 # used in optimizer construction.
+  weight_decay: 0.0003 # stronger L2 regularization for optimizer.
   grad_clip: 1.0 # canonical gradient clipping key used in pipeline.trainer.
   grad_accum_steps: 2 # used in trainer gradient accumulation.
   amp: true # canonical mixed precision key used in pipeline.trainer.
@@ -158,10 +159,10 @@ train:
           stage1: 1.0
           composite: 0.0
         transition:
-          metric: "train_stage1_total"
+          metric: "val_stage1_total"
           mode: "min"
-          patience: 3
-          min_delta: 1.0e-4
+          patience: 2
+          min_delta: 2.0e-3
         scheduler:
           name: "warmup_cosine"
           warmup_epochs: 0.5
@@ -209,13 +210,14 @@ train:
         max_epochs_guard: 8
 
 loss:
+  label_smoothing: 0.03 # CE label smoothing for better calibration and regularization.
   dice_weight: 0.40 # used in composite segmentation loss.
   focal_weight: 0.40 # used in composite segmentation loss.
   tversky_weight: 0.20 # used in composite segmentation loss.
   focal_gamma: 2.0 # used in focal loss.
   tversky_alpha: 0.85 # used in tversky loss.
   tversky_beta: 0.15 # used in tversky loss.
-  class_weights: [1.00, 3.00, 1.50, 1.50] # used in focal/cross-entropy weighting.
+  class_weights: [0.70, 4.00, 1.00, 1.00] # used in focal/cross-entropy weighting.
   stage1:
     lambda_intra: 1.0
     lambda_inter: 0.5
@@ -229,6 +231,12 @@ runtime:
   seed: 350234 # used in pipeline.core._seed_everything.
   device: "cuda" # used in pipeline.trainer device selection.
   progress_bar: true # used in pipeline.dataset and pipeline.trainer to toggle tqdm progress bars.
+  dataset_cache:
+    max_items: 12 # bound in-memory sample cache per worker to keep host RAM in ~20-25GB range.
+  dataloader:
+    max_workers: 4 # clamp dataloader worker fanout to prevent host RAM spikes.
+    prefetch_cap: 2 # upper bound for prefetch_factor under memory-constrained runs.
+    persistent_workers: false # disable worker persistence by default to release RAM between epochs.
 
 visualization:
   tsne_enabled: false
