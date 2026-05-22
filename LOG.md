@@ -560,3 +560,209 @@ $$
 |`boundary_dilation`|1|边界膨胀核大小|
 |`dice_absent_prior`|0.05|缺失类的先验权重|
 |`label_smoothing`|0.0|Label smoothing 系数（0-1）|
+
+
+### 4.18
+
+- 分析前期实验中的30% accuracy gap根因，确认问题不在模型容量或正则化强度，而在**受试者间的光谱域偏移（patient-level spectral domain shift）**：
+  - 不同受试者的同一组织类别，其原始光谱均值和方差存在系统性偏移，导致模型学到的特征与受试者身份耦合，而非与组织类别耦合；
+  - 传统的全局标准化（全局z-score）只能统一尺度，无法消除个体间的分布漂移。
+- 设计**Stage A 受试者级去偏管道**（`pipeline/dataset.py: _prepare_diffed_hsi_to_dir`），固定处理顺序为：
+  1. **受试者级z-score归一化**：按每位受试者所有像素分别计算各波段均值与标准差，逐受试者做`(x - μ_patient) / σ_patient`；
+  2. **Savitzky-Golay平滑**：对z-score归一化后的光谱曲线做多项式平滑，抑制高频噪声；
+  3. **一阶光谱差分**：沿波段方向计算`np.diff`，突出光谱变化率而非绝对值，进一步消除个体基线偏移；差分后尾部补零以保持波段数不变。
+- 此管道的设计意图：将原始光谱从"绝对值空间"映射到"变化率空间"，使不同受试者的同类组织在同一特征空间中可比。
+
+### 4.20
+
+- 实现Stage A去偏管道的工程化：
+  - 数据流改为严格单向：`raw hsi_dir → (run.py -d) → diffed_dir → (run.py -m hsi) → 训练`；
+  - `diffed_dir`目录受`.stagea_meta.json`哨兵文件保护，防止重复执行覆盖已有结果；
+  - 训练和数据分析模式（`-a`）变为只读`diffed_dir`，不再触碰原始数据；
+  - 标签文件（`_gt.npy`）从原始目录复制到`diffed_dir`，保证数据完整性。
+- 命令行接口：
+  ```bash
+  python run.py -d    # 执行Stage A去偏，生成diffed_dir后退出
+  python run.py -a    # 只读diffed_dir做数据集分析
+  python run.py -m hsi  # 正常训练（自动走diffed_dir）
+  ```
+- 新增`SpectralReducer`类（`pipeline/dataset.py`），作为统一的光谱降维与特征预处理层，支持多种模式：`none`, `supervised_pca`, `lda_pca`, `kernel_lda`, `pca_nca`。
+
+### 4.22
+
+- 完成**波段筛选（Spectral Reduction）**的多种有监督方法实现与对比：
+
+  **（1）LDA + PCA 模式（`lda_pca`）**
+  - 先经PCA降维至中间维度`pca_dim`，再经LDA投影至`num_classes - 1`维判别子空间；
+  - 最终输出通道 = PCA保留维 + LDA判别维，拼接后送入模型；
+  - 相较纯PCA，LDA利用类别标签信息，优化类间可分性。
+
+  **（2）Kernel PCA + LDA 模式（`kernel_lda`）**
+  - 用随机傅里叶特征（Random Fourier Features, RFF）近似RBF核映射至高维空间；
+  - 在核空间内做LDA，捕捉非线性光谱判别模式；
+  - RFF带宽参数 $\gamma$ 控制核宽度，$\gamma$ 越大核越窄、降维越激进。
+
+  **（3）PCA + NCA 模式（`pca_nca`）**
+  - 先经PCA（可选白化）降维至中间维度，再用邻域成分分析（Neighborhood Components Analysis）做有监督降维；
+  - NCA 直接优化 k-NN 分类的留一法误差，学到的嵌入空间具有更好的局部结构保持能力；
+  - 配置`nca_max_iter=200`, `nca_init="pca"`用于稳定训练。
+
+- 所有模式共享统一的前处理链（当Stage A未启用SNV时）：
+  ```
+  SNV → Savitzky-Golay导数 → z-score标准化 → PCA → 判别投影
+  ```
+  若Stage A已做SNV（配置`spectral_alignment.snv=true`），则跳过重复SNV和导数，避免信息过度压缩。
+
+### 4.23
+
+- 受试者级去偏效果验证：
+  - 实现了"去偏前 vs 去偏后"的可视化对比管线（`pipeline/core.py: _collect_stagea_before_after_band_stats`）：
+    - 逐患者逐类计算去偏前后各波段的均值/标准差曲线；
+    - 绘制患者光谱偏移的2D散点图（挑选最具判别力的两个特征维度）；
+    - 计算患者间的类内/类间余弦相似度（bootstrap）和MMD（Maximum Mean Discrepancy）/ Bhattacharyya距离；
+  - 实现了基于波段统计量的患者自然聚类（`_cluster_patients_from_band_shift_data`），用凝聚层次聚类（Ward linkage）将96位受试者按组织光谱特征自动分组，可视化患者亚群结构。
+- **结果**：经Stage A去偏后，同类组织在不同患者间的光谱曲线趋于一致，类间距离/类内距离比显著下降，验证了去偏管道的有效性。
+
+### 4.25
+
+- 完成**HSIAdapter 模型架构**设计与实现（`model/hsi_adapter.py: HSIAdapter`）：
+
+  **整体结构**
+  ```
+  Input [B, C_reduced, H, W]
+      ↓
+  Spectral Encoder (监督光谱编码)
+      ↓ [B, embed_dim, H, W]
+  LightSpectralTokens (空间→光谱Token化)
+      ↓ [B, N_tokens, embed_dim]
+  ViT Backbone (预训练视觉Transformer)
+      ↓ [B, N_tokens, embed_dim]
+  Token Refine + Fusion Gate (Token特征与光谱特征融合)
+      ↓ [B, decoder_dim, H, W]
+  Classifier → Logits [B, num_classes, H, W]
+  ```
+
+  **核心模块：**
+
+  - **光谱编码器（Spectral Encoder）**：三种可选结构——
+
+    | 类型 | 配置值 | 特点 |
+    |------|--------|------|
+    | Simple | `simple` | 1×1卷积堆叠，最轻量 |
+    | MultiScale | `spectral_multiscale` | 多尺度深度可分离卷积（kernel=3,5,9 × dil=1,2），通道门控融合 |
+    | DualScale | `spectral_dual_scale` | 短/长感受野双分支（kernel=3,11），自适应尺度门控 |
+    | Transformer | `spectral_transformer` | 1D卷积残差块+Spectral Transformer Block+注意力池化 |
+
+  - **LightSpectralTokens**：用自适应平均/最大池化将空间特征图压缩为固定分辨率（默认8×8）的Token序列，经LayerNorm后送入ViT Backbone。
+
+  - **Token-光谱融合门（Fusion Gate）**：Backbone输出的Token特征图经反卷积上采样后，与原始光谱特征拼接，过Sigmoid门控做加权融合：
+    $$
+    F_{\text{fused}} = F_{\text{spectral}} + \sigma(\text{Conv}([F_{\text{spectral}}, F_{\text{token}}])) \odot F_{\text{token}}
+    $$
+
+  - **辅助监督头**：光谱编码器输出和Token特征各挂一个辅助分类头（`spectral_aux_head`, `token_aux_head`），提供中间监督信号，促进特征学习。
+
+- 同时完成**LightAdapter**（`model/light_adapter.py`）作为轻量对照模型：
+  - Band-wise Self-Attention → 空间嵌入 → 光谱-空间简单门控融合 → ViT Backbone → UNetDecoder；
+  - 参数量约为HSIAdapter的40%。
+
+### 4.28
+
+- 建立**分阶段训练策略（Staged Training）**，将训练过程划分为三个阶段：
+
+  | 阶段 | 冻结项 | 可训练项 | 损失权重 | 触发切换指标 |
+  |------|--------|----------|----------|-------------|
+  | **Spectral Pretrain** | Backbone, Decoder | Spectral Encoder | stage1=1.0, composite=0 | `val_stage1_total` (min) |
+  | **Segmentation Train** | Spectral Encoder | Backbone, Decoder | stage1=0, composite=1.0 | `eval_dice` (max) |
+  | **Joint Finetune** | 无 | 全部 | stage1=0.2, composite=1.0 | `eval_dice` (max) |
+
+  - Stage 1 目标：仅用光谱判别损失（`stage1_loss`）预训练光谱编码器，使其学会提取类间可分的嵌入；
+  - Stage 1 损失设计为**中心损失 + 对比损失的组合**：
+    $$
+    \mathcal{L}_{\text{stage1}} = \lambda_{\text{intra}} \cdot \mathcal{L}_{\text{intra}} + \lambda_{\text{inter}} \cdot \mathcal{L}_{\text{inter}} + \lambda_{\text{focal}} \cdot \mathcal{L}_{\text{focal}}
+    $$
+    其中 $\mathcal{L}_{\text{intra}}$ 最小化类内嵌入方差，$\mathcal{L}_{\text{inter}}$ 最大化类间嵌入距离（margin=1.0），$\mathcal{L}_{\text{focal}}$ 为辅助分类损失。
+  - 每个阶段有独立的早停条件和学习率调度器，防止某一阶段过度训练。
+
+- 损失函数更新为三合一组合：
+  $$
+  \mathcal{L}_{\text{composite}} = w_{\text{focal}} \cdot \mathcal{L}_{\text{focal}} + w_{\text{dice}} \cdot \mathcal{L}_{\text{dice}} + w_{\text{tversky}} \cdot \mathcal{L}_{\text{tversky}}
+  $$
+  配置`focal_weight=0.40, dice_weight=0.40, tversky_weight=0.20`，Tversky Loss通过 $\alpha=0.85, \beta=0.15$ 强化对假阴性的惩罚（偏好召回PG）。
+
+### 5.2
+
+- 启动**系统对比试验**：在统一数据、统一随机种子的条件下，测试四种模型的消融效果：
+
+  | 模型 | 参数量（约） | 光谱前处理 | 主干网络 | 说明 |
+  |------|:-----------:|-----------|---------|------|
+  | **HSIAdapter** | ~5.2M (trainable) | LDA+PCA → 8ch | ViT-Small (frozen) | 完整模型，光谱编码+ViT主干 |
+  | **LightAdapter** | ~2.1M | LDA+PCA → 8ch | ViT-Small (frozen) | 轻量模型，Band Attention替代光谱编码器 |
+  | **RGB-ViT** | ~3.8M | 无（RGB三通道） | ViT-Small (frozen) | 对照组：仅用可见光RGB图像 |
+  | **UNet** | ~7.8M | 无（原始光谱全波段） | 无（纯CNN） | 对照组：经典语义分割架构 |
+
+  - 统一的训练配置：`patch_size=63, stride=32, epochs=30, batch_size=8, lr=3e-4`；
+  - 统一的数据划分：70%/20%/10%受试者级划分，`seed=350234`；
+  - 采用加权采样器（`use_weighted_sampler=true`），参数`rho=0.20, pg_min_ratio=0.10`。
+
+- 评估指标体系：
+  - **主要指标**：mIoU, Foreground Dice, Per-class F1（重点关注PG类的召回率和精确率）；
+  - **辅助指标**：Cohen's Kappa, Balanced Accuracy（BA）, ROC-AUC, 混淆矩阵；
+  - **效率指标**：参数量、单次推理时间、显存占用峰值。
+
+### 5.5
+
+- 对比试验初步结果与分析：
+
+  - **HSIAdapter** 在所有指标上均优于对照模型，尤其在PG（甲状旁腺）类的召回率上显著领先（recall ≈ 62% vs RGB-ViT ≈ 28%），验证了高光谱光谱编码器对小目标识别的重要性；
+  - **LightAdapter** 以HSIAdapter约40%的参数量取得了相近的mIoU（差距<3%），在显存受限的部署场景下是可行的替代方案；
+  - **RGB-ViT** 在三大类（TG, Tra, BG）上表现尚可（mIoU ≈ 55%），但对PG类几乎无判别力，说明可见光三通道信息不足以区分甲状旁腺与周围组织；
+  - **UNet** 参数量最大但泛化能力最差（明显的过拟合，train/eval gap > 25%），纯CNN架构缺乏全局上下文建模能力。
+  - 不同光谱前处理模式的消融：`lda_pca`> `kernel_lda`≈`pca_nca`> `supervised_pca`> `none`，有监督降维一致优于无监督PCA或原始光谱。
+
+- 完成训练曲线、混淆矩阵、ROC曲线、分割样例的自动可视化输出（`pipeline/visualize.py`），所有结果保存在`outputs/{model}_{tag}/`目录下。
+
+### 5.6
+
+- 实现**ONNX模型导出与推理部署**：
+
+  - 训练完成后自动将最优checkpoint导出为ONNX格式（`pipeline/core.py: _export_onnx`）：
+    ```python
+    torch.onnx.export(model_cpu, dummy, onnx_path,
+        input_names=["input"], output_names=["logits"],
+        opset_version=17,
+        dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}})
+    ```
+  - 同时生成模型部署说明文件`best_model_info.txt`，包含：
+    - 输入/输出张量的维度、数据类型、动态轴说明；
+    - 类别映射表（0: BG, 1: PG, 2: Tra, 3: TG）；
+    - 预处理契约（输入格式、标准化方式、通道数期望）；
+    - 滑窗推理契约（窗大小=patch_size, stride, overlap_ratio, 对数几率累积与融合方式）；
+    - ONNX Runtime Python调用示例代码。
+
+- **滑窗推理协议**（Sliding Window Inference Contract）：
+  ```
+  对于任意大小的输入HSI图像：
+  1. 以 patch_size × patch_size 窗口滑动，stride 控制重叠率；
+  2. 右/下边界做tail coverage保证全覆盖；
+  3. 各窗口logits累积到累加器，同时维护count map；
+  4. 最终 logits = logits_acc / count_map，argmax得预测标签图。
+  5. 若输入尺寸小于patch_size，先反射填充再裁剪回原尺寸。
+  ```
+
+- 配合此前完成的NVIDIA MONAI推理前端（StreamCat项目，3月13日记录），形成完整的"训练→ONNX导出→本地部署→HTTP推理服务"闭环：
+  - StreamCat 项目地址：https://github.com/Aloudname/StreamCat.git
+  - 支持流式视频帧/单张/批次HSI数据输入、本地`localhost:8000`部署、快速HTTP响应。
+
+- 初步推理性能：在NVIDIA RTX 3090上，单张700×700的HSI图像（经LDA+PCA降至8通道）的滑窗推理耗时约0.8秒（含I/O和预处理），满足术中实时性要求。
+
+### 5.8
+
+- 系统整理全部实验结果，开始论文初稿基本完成（`docs/基于高光谱的术中甲状旁腺识别算法研究.docx`），论文结构如下：
+  1. 引言：术中甲状旁腺识别的临床需求与技术挑战；
+  2. 数据采集与预处理：112名受试者、163组高光谱数据，Stage A受试者级去偏管道；
+  3. 波段筛选方法：PCA、LDA+PCA、Kernel PCA+LDA、PCA+NCA的多方案对比；
+  4. HSIAdapter模型架构：光谱编码器 + LightSpectralTokens + ViT Backbone + 融合门控；
+  5. 对比试验：HSIAdapter vs LightAdapter vs RGB-ViT vs UNet；
+  6. 模型推理与部署：ONNX导出 + 滑窗推理 + StreamCat前端。
+- 论文中所有实验结果均来自`outputs/`目录下的`result_metrics.json`文件和自动生成的可视化图表。
